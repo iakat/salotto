@@ -281,10 +281,11 @@ func (s *Server) BufferEmpty(network, window string) bool {
 	return from > newest
 }
 
-// matchWindows returns the known windows of network whose name matches every
-// token in arg, using ZNC's rule: split on commas, then on spaces, then match
-// each token case-insensitively with '*' and '?' wildcards. A token with no
-// wildcard matches the window name exactly (case-insensitively).
+// matchWindows returns the known windows of network whose name matches any
+// token in arg, using ZNC's rule (CClient::MatchChans, src/Client.cpp:1147):
+// split on commas, then on spaces, union the per-token matches and de-duplicate.
+// Matching is case-insensitive with '*' and '?' wildcards; a token with no
+// wildcard matches the window name exactly.
 //
 // There is no FindChans to port: our window space is "status" plus channel
 // names, so exact/glob matching is the whole rule. ZNC's nick-aware lookup and
