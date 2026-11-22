@@ -386,6 +386,10 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleClearUserBindHost()
 	case ircline.IsVerb(rest, "SHOWBINDHOST"):
 		return c.handleShowBindHost()
+	case ircline.IsVerb(rest, "ATTACH"):
+		return c.handleAttach(rest)
+	case ircline.IsVerb(rest, "DETACH"):
+		return c.handleDetach(rest)
 	default:
 		return c.forward(line)
 	}

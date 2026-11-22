@@ -2,6 +2,8 @@ package facade
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -60,19 +62,24 @@ func (ws *windowState) client(sub *Subscriber) *clientWindows {
 	return cw
 }
 
-func (ws *windowState) attach(sub *Subscriber, key string) {
+func (ws *windowState) attach(sub *Subscriber, key string) bool {
 	ws.mu.Lock()
-	ws.client(sub).attached[key] = true
+	cw := ws.client(sub)
+	was := cw.attached[key]
+	cw.attached[key] = true
 	ws.known[key] = true
 	ws.mu.Unlock()
+	return !was
 }
 
-func (ws *windowState) detach(sub *Subscriber, key string) {
+func (ws *windowState) detach(sub *Subscriber, key string) bool {
 	ws.mu.Lock()
-	if cw := ws.clients[sub]; cw != nil {
-		delete(cw.attached, key)
-	}
+	cw := ws.client(sub)
+	was := cw.attached[key]
+	cw.attached[key] = false
+	ws.known[key] = true
 	ws.mu.Unlock()
+	return was
 }
 
 func (ws *windowState) mute(sub *Subscriber, key string, muted bool) {
@@ -146,15 +153,87 @@ func (ws *windowState) forget(sub *Subscriber) {
 	ws.mu.Unlock()
 }
 
-// AttachWindow records that sub wants delivery for a window. The cursor is not
-// reset: detaching and re-attaching resumes where the client stopped.
-func (s *Server) AttachWindow(sub *Subscriber, network, window string) {
-	s.windows.attach(sub, windowKey(network, window))
+func (ws *windowState) knownWindows(network string) []string {
+	prefix := network + "/"
+	ws.mu.Lock()
+	names := make([]string, 0, len(ws.known))
+	for key := range ws.known {
+		if strings.HasPrefix(key, prefix) {
+			names = append(names, key[len(prefix):])
+		}
+	}
+	ws.mu.Unlock()
+	sort.Strings(names)
+	return names
 }
 
-// DetachWindow stops delivery for a window and freezes its cursor.
-func (s *Server) DetachWindow(sub *Subscriber, network, window string) {
-	s.windows.detach(sub, windowKey(network, window))
+// AttachWindow records that sub wants delivery for a window. The cursor is not
+// reset: detaching and re-attaching resumes where the client stopped. It
+// reports whether the attachment was new.
+func (s *Server) AttachWindow(sub *Subscriber, network, window string) bool {
+	return s.windows.attach(sub, windowKey(network, window))
+}
+
+// DetachWindow stops delivery for a window and freezes its cursor. It reports
+// whether the window was attached.
+func (s *Server) DetachWindow(sub *Subscriber, network, window string) bool {
+	return s.windows.detach(sub, windowKey(network, window))
+}
+
+// matchWindows returns the known windows of network whose name matches every
+// token in arg, using ZNC's rule: split on commas, then on spaces, then match
+// each token case-insensitively with '*' and '?' wildcards. A token with no
+// wildcard matches the window name exactly (case-insensitively).
+//
+// There is no FindChans to port: our window space is "status" plus channel
+// names, so exact/glob matching is the whole rule. ZNC's nick-aware lookup and
+// query namespace do not exist here.
+func (s *Server) matchWindows(network, arg string) []string {
+	seen := make(map[string]bool)
+	for _, tok := range strings.FieldsFunc(arg, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	}) {
+		for _, name := range s.windows.knownWindows(network) {
+			if wildMatch(tok, name) {
+				seen[name] = true
+			}
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// wildMatch is ZNC's CString::WildCmp (src/ZNCString.cpp:175): '*' matches any
+// run, '?' matches one byte, everything else compares case-insensitively.
+func wildMatch(pattern, name string) bool {
+	wild := strings.ToLower(pattern)
+	str := strings.ToLower(name)
+	p, s := 0, 0
+	star, mark := -1, 0
+	for s < len(str) {
+		if p < len(wild) && (wild[p] == str[s] || wild[p] == '?') {
+			p++
+			s++
+		} else if p < len(wild) && wild[p] == '*' {
+			star = p
+			mark = s
+			p++
+		} else if star >= 0 {
+			p = star + 1
+			mark++
+			s = mark
+		} else {
+			return false
+		}
+	}
+	for p < len(wild) && wild[p] == '*' {
+		p++
+	}
+	return p == len(wild)
 }
 
 // MuteWindow suppresses live delivery for a window without forgetting its
