@@ -12,12 +12,15 @@ import (
 type Subscriber struct {
 	w io.Writer
 
-	mu     sync.Mutex
-	buf    []byte
-	out    []byte
-	n      int
-	outN   int
-	closed bool
+	mu       sync.Mutex
+	buf      []byte
+	out      []byte
+	scratch  []byte
+	n        int
+	outN     int
+	nick     string
+	extended bool
+	closed   bool
 
 	wake    chan struct{}
 	done    chan struct{}
@@ -35,24 +38,59 @@ func NewSubscriber(w io.Writer, bufSize int) *Subscriber {
 		bufSize = 4096
 	}
 	return &Subscriber{
-		w:    w,
-		buf:  make([]byte, bufSize),
-		out:  make([]byte, bufSize),
-		wake: make(chan struct{}, 1),
-		done: make(chan struct{}),
+		w:       w,
+		buf:     make([]byte, bufSize),
+		out:     make([]byte, bufSize),
+		scratch: make([]byte, 0, bufSize),
+		wake:    make(chan struct{}, 1),
+		done:    make(chan struct{}),
 	}
 }
 
-// Write copies one framed IRC line (already CRLF-terminated by the caller) into
-// the buffer. It returns false if the line does not fit; the caller drops the
-// client. Write does not allocate.
-func (s *Subscriber) Write(line []byte) bool {
+// SetIdentity records the nick and extended-join state of the attached client.
+// It is called before replay and whenever the client changes either.
+func (s *Subscriber) SetIdentity(nick string, extendedJoin bool) {
 	s.mu.Lock()
-	if s.closed || s.n+len(line) > len(s.buf) {
+	s.nick = nick
+	s.extended = extendedJoin
+	s.mu.Unlock()
+}
+
+// Write copies one framed IRC line (already CRLF-terminated by the caller) into
+// the buffer without rewriting it. It returns false if the line does not fit;
+// the caller drops the client. Write does not allocate.
+func (s *Subscriber) Write(line []byte) bool {
+	return s.WriteFrom(line, "")
+}
+
+// WriteFrom copies one framed IRC line into the buffer, rewriting the upstream
+// identity to this client's own nick when upstreamNick is non-empty. Lines that
+// need no rewrite are copied byte-for-byte. A rewrite is spliced through the
+// subscriber's scratch buffer, so the steady state does not allocate.
+func (s *Subscriber) WriteFrom(line []byte, upstreamNick string) bool {
+	s.mu.Lock()
+	if s.closed {
 		s.mu.Unlock()
 		return false
 	}
-	s.n += copy(s.buf[s.n:], line)
+
+	out, changed, drop := rewriteLine(s.scratch[:0], line, s.nick, upstreamNick, s.extended)
+	if drop {
+		s.scratch = out[:0]
+		s.mu.Unlock()
+		return true
+	}
+	if changed {
+		s.scratch = out
+	} else {
+		out = line
+	}
+
+	if s.n+len(out) > len(s.buf) {
+		s.mu.Unlock()
+		return false
+	}
+	s.n += copy(s.buf[s.n:], out)
 	s.mu.Unlock()
 
 	select {
@@ -151,15 +189,22 @@ func (h *Hub) Remove(s *Subscriber) {
 	h.mu.Unlock()
 }
 
-// Broadcast copies line into every subscriber's buffer. A subscriber whose
-// buffer is full is removed and closed, and the dropped counter increments. No
-// socket is written here and no subscriber can block the broadcast.
+// Broadcast copies line into every subscriber's buffer without identity
+// rewriting. See BroadcastFrom for the normal upstream path.
 func (h *Hub) Broadcast(line []byte) {
+	h.BroadcastFrom(line, "")
+}
+
+// BroadcastFrom copies line into every subscriber's buffer, rewriting the
+// upstream nick to each subscriber's own nick. A subscriber whose buffer is
+// full is removed and closed, and the dropped counter increments. No socket is
+// written here and no subscriber can block the broadcast.
+func (h *Hub) BroadcastFrom(line []byte, upstreamNick string) {
 	h.mu.Lock()
 	i := 0
 	for i < h.n {
 		s := h.subs[i]
-		if s.Write(line) {
+		if s.WriteFrom(line, upstreamNick) {
 			i++
 			continue
 		}

@@ -53,6 +53,13 @@ These are the things that were exercised while building this POC:
 - A plain TCP client sent `CAP LS 302`, `CAP END`, `NICK` and `USER`, received
   the 001/002/003/004/005 registration numerics, and then received the whole
   ring as a `BATCH +replay ...`/`BATCH -replay ...` replay with `time=` tags.
+- The replay and the live stream are rewritten per attached client. Numerics
+  are addressed to that client's own nick, a line from the upstream identity
+  carries the client's nick in its prefix, the `353` names list contains the
+  client's nick, and an extended-join `JOIN <chan> <account> :<realname>` is
+  stripped to `JOIN <chan>` for clients that did not negotiate
+  `extended-join`. A stock client therefore rebuilds `#hermes` with itself in
+  the nick list instead of discarding the replayed state.
 - `GET /stats` returned the documented `key=value` text over plain HTTP.
 - SIGTERM cancelled the upstream context, closed the listeners, waited for the
   goroutines, logged each phase, and exited cleanly.
@@ -70,7 +77,14 @@ These are the things that were exercised while building this POC:
   except by the jump in the replayed `time=` stamps.
 - A slow client is dropped rather than buffered indefinitely.
 - There is one upstream connection per network, shared by all attached
-  clients.
+  clients. Every attached client shares that same upstream identity, so two
+  clients using different nicks both see themselves as the same upstream user
+  after rewriting. A message sent by one client appears to the other as if it
+  came from that shared identity (with the other client's own nick), not from
+  the first client's nick.
+- An upstream `NICK` change is dropped rather than propagated. The facade
+  advances its cached upstream nick so later lines still rewrite correctly,
+  but clients only see their own nick.
 - There is no nicklist, topic or mode state on the server. Clients rebuild
   those from the replayed 353/332 numerics and the live stream, so a client
   that attaches late only knows about named users whose NAMES reply is still
@@ -106,10 +120,25 @@ clients_dropped_slow=0
 goroutines=9
 ```
 
-To watch the registration and ring replay without an IRC client:
+To watch the registration and ring replay without an IRC client (`nc` is not
+installed on the build host, so this uses a Python socket):
 
 ```sh
-printf 'CAP LS 302\r\nCAP END\r\nNICK x\r\nUSER x 0 * :x\r\n' | timeout 3 nc 127.0.0.1 6667
+python3 - <<'PY'
+import socket, time
+s = socket.create_connection(("127.0.0.1", 6667))
+s.sendall(b"CAP LS 302\r\nCAP END\r\nNICK x\r\nUSER x 0 * :x\r\n")
+s.settimeout(0.5)
+end = time.time() + 3
+while time.time() < end:
+    try:
+        data = s.recv(65535)
+    except socket.timeout:
+        continue
+    if not data:
+        break
+    print(data.decode(errors="replace"), end="")
+PY
 ```
 
 The beginning of the output from that command in the live run:

@@ -412,3 +412,141 @@ func TestMaxClients(t *testing.T) {
 		t.Fatalf("third client got %q, want ERROR :too many clients", line)
 	}
 }
+
+func registerWithCaps(t *testing.T, conn net.Conn, br *bufio.Reader, nick, caps string) []string {
+	t.Helper()
+	sendLines(t, conn,
+		"CAP LS 302",
+		"CAP REQ :"+caps,
+		"CAP END",
+		"NICK "+nick,
+		"USER "+nick+" 0 * :Test",
+	)
+	return collectUntil(t, conn, br, func(line string) bool {
+		return strings.Contains(line, " 376 ")
+	})
+}
+
+func withoutTags(line string) string {
+	if strings.HasPrefix(line, "@") {
+		if i := strings.IndexByte(line, ' '); i >= 0 {
+			return line[i+1:]
+		}
+	}
+	return line
+}
+
+func replayRewriteFixture(t *testing.T) (*fakeNet, int64) {
+	t.Helper()
+	fn := newFakeNet("libera")
+	ts := time.Date(2024, 2, 3, 4, 5, 6, 789000000, time.UTC).UnixNano()
+	for i, line := range []string{
+		":srv 001 up :Welcome",
+		":up!u@h JOIN #c * :real",
+		":srv 353 up @ #c :up alice +bob",
+		":srv 366 up #c :End",
+		":up!u@h PRIVMSG #c :hi",
+		":alice!a@h PRIVMSG #c :hello",
+	} {
+		fn.add(line, ts+int64(i)*int64(time.Second))
+	}
+	return fn, ts
+}
+
+func TestReplayAddressesClientAsItself(t *testing.T) {
+	fn, _ := replayRewriteFixture(t)
+	_, addr := startServer(t, testConfig(fn))
+	conn, br := dialClient(t, addr)
+	registerWithCaps(t, conn, br, "me", "server-time batch")
+	lines := collectReplay(t, conn, br)
+
+	var got001, gotJoin, got353, gotSelf, gotAlice string
+	for _, line := range lines {
+		rest := withoutTags(line)
+		switch {
+		case strings.Contains(rest, " 001 "):
+			got001 = rest
+		case strings.Contains(rest, " JOIN #c"):
+			gotJoin = rest
+		case strings.Contains(rest, " 353 "):
+			got353 = rest
+		case strings.Contains(rest, "PRIVMSG #c :hi"):
+			gotSelf = rest
+		case strings.Contains(rest, "PRIVMSG #c :hello"):
+			gotAlice = rest
+		}
+	}
+
+	if !strings.Contains(got001, " 001 me ") || strings.Contains(got001, " 001 up ") {
+		t.Fatalf("001 = %q, want target me", got001)
+	}
+	if gotJoin != ":me!u@h JOIN #c" {
+		t.Fatalf("JOIN = %q, want extended-join stripped and prefix rewritten", gotJoin)
+	}
+	if got353 != ":srv 353 me @ #c :me alice +bob" {
+		t.Fatalf("353 = %q, want target and names rewritten", got353)
+	}
+	if strings.Contains(got353, " up") || strings.Contains(got353, "@up") {
+		t.Fatalf("353 still contains upstream nick: %q", got353)
+	}
+	if gotSelf != ":me!u@h PRIVMSG #c :hi" {
+		t.Fatalf("self PRIVMSG = %q, want prefix rewritten", gotSelf)
+	}
+	if gotAlice != ":alice!a@h PRIVMSG #c :hello" {
+		t.Fatalf("alice PRIVMSG = %q, want unchanged", gotAlice)
+	}
+}
+
+func TestReplayKeepsExtendedJoinWhenNegotiated(t *testing.T) {
+	fn, _ := replayRewriteFixture(t)
+	_, addr := startServer(t, testConfig(fn))
+	conn, br := dialClient(t, addr)
+	registerWithCaps(t, conn, br, "me", "server-time batch extended-join")
+	lines := collectReplay(t, conn, br)
+
+	for _, line := range lines {
+		rest := withoutTags(line)
+		if strings.Contains(rest, " JOIN #c") {
+			if rest != ":me!u@h JOIN #c * :real" {
+				t.Fatalf("extended JOIN = %q, want account and realname kept", rest)
+			}
+			return
+		}
+	}
+	t.Fatal("no JOIN line in replay")
+}
+
+func TestLiveBroadcastRewritesUpstreamIdentity(t *testing.T) {
+	fn := newFakeNet("libera")
+	ts := time.Date(2024, 2, 3, 4, 5, 6, 789000000, time.UTC).UnixNano()
+	fn.add(":srv 001 up :Welcome", ts)
+
+	s, addr := startServer(t, testConfig(fn))
+	conn, br := dialClient(t, addr)
+	registerWithCaps(t, conn, br, "me", "server-time batch")
+	collectReplay(t, conn, br)
+	waitFor(t, 3*time.Second, func() bool { return s.Attached() == 1 }, "client attached")
+
+	s.Broadcast("libera", 2, []byte(":up!u@h PRIVMSG #c :live"), ts+int64(time.Second))
+	line := readClientLine(t, conn, br)
+	if rest := withoutTags(line); rest != ":me!u@h PRIVMSG #c :live" {
+		t.Fatalf("live line = %q, want upstream prefix rewritten to me", rest)
+	}
+}
+
+func TestOtherUserLineIsByteIdentical(t *testing.T) {
+	var buf bytes.Buffer
+	sub := NewSubscriber(&buf, 4096)
+	sub.SetIdentity("me", false)
+
+	line := []byte(":alice!a@h PRIVMSG #c :hello\r\n")
+	if !sub.WriteFrom(line, "up") {
+		t.Fatal("WriteFrom rejected the line")
+	}
+	if err := sub.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), line) {
+		t.Fatalf("third-party line changed: got %q, want %q", buf.Bytes(), line)
+	}
+}

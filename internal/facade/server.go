@@ -53,6 +53,56 @@ type stampSource interface {
 type networkEntry struct {
 	name string
 	net  Network
+	nick *nickCache
+}
+
+type nickCache struct {
+	mu   sync.RWMutex
+	nick string
+}
+
+func (n *nickCache) get() string {
+	n.mu.RLock()
+	v := n.nick
+	n.mu.RUnlock()
+	return v
+}
+
+func (n *nickCache) set(v string) {
+	n.mu.Lock()
+	n.nick = v
+	n.mu.Unlock()
+}
+
+func (ne *networkEntry) knownNick() string {
+	if v := ne.nick.get(); v != "" {
+		return v
+	}
+	if src, ok := ne.net.(upstreamNickSource); ok {
+		if v := src.Nick(); v != "" {
+			ne.nick.set(v)
+			return v
+		}
+	}
+	return ""
+}
+
+// advanceNick returns the upstream nick to use for this line and the nick to
+// use for the following line. An upstream NICK change is dropped from the
+// client stream but still advances the cached identity.
+func (ne *networkEntry) advanceNick(un string, line []byte) (forLine, next string) {
+	if un == "" {
+		if v := detectUpstreamNick(line); v != "" {
+			ne.nick.set(v)
+			return v, v
+		}
+		return "", ""
+	}
+	if v, ok := upstreamNickChange(line, un); ok {
+		ne.nick.set(v)
+		return un, v
+	}
+	return un, un
 }
 
 // Server is the client-facing IRC facade.
@@ -122,7 +172,7 @@ func New(cfg Config) (*Server, error) {
 	sort.Strings(names)
 	s.nets = make([]networkEntry, 0, len(names))
 	for _, name := range names {
-		s.nets = append(s.nets, networkEntry{name: name, net: *cfg.Networks[name]})
+		s.nets = append(s.nets, networkEntry{name: name, net: *cfg.Networks[name], nick: &nickCache{}})
 	}
 
 	if s.cfg.Network == "" {
@@ -188,16 +238,31 @@ func (s *Server) refuse(conn net.Conn) {
 }
 
 // Broadcast fans a live upstream line out to every attached client with a time
-// tag. seq is currently informational; clients rebuild state from the stream.
+// tag, rewriting the upstream identity to each client's own nick. seq is
+// currently informational; clients rebuild state from the stream.
 func (s *Server) Broadcast(netName string, seq uint64, line []byte, ts int64) {
-	_ = netName
 	_ = seq
+
+	var un string
+	if ne := s.network(netName); ne != nil {
+		forLine, _ := ne.advanceNick(ne.knownNick(), line)
+		un = forLine
+	}
 
 	p := s.linePool.Get().(*[]byte)
 	b := appendLiveLine((*p)[:0], line, ts)
-	s.hub.Broadcast(b)
+	s.hub.BroadcastFrom(b, un)
 	*p = b
 	s.linePool.Put(p)
+}
+
+func (s *Server) network(name string) *networkEntry {
+	for i := range s.nets {
+		if s.nets[i].name == name {
+			return &s.nets[i]
+		}
+	}
+	return nil
 }
 
 // Attached returns the number of clients currently attached to the hub.
@@ -373,7 +438,15 @@ func (c *client) handleCapReq(args []byte) bool {
 		return c.send(":", c.srv.cfg.ServerName, " CAP * NAK :", string(req))
 	}
 	c.caps = mask
+	if c.registered {
+		c.sub.SetIdentity(c.nick, c.extendedJoin())
+	}
 	return c.send(":", c.srv.cfg.ServerName, " CAP * ACK :", string(ack[:ackN]))
+}
+
+func (c *client) extendedJoin() bool {
+	idx := capIndex([]byte("extended-join"))
+	return idx >= 0 && c.caps&(1<<uint(idx)) != 0
 }
 
 func (c *client) handleCapList() bool {
@@ -403,6 +476,7 @@ func (c *client) handleNick(line, rest []byte) bool {
 
 	if c.registered {
 		if changed {
+			c.sub.SetIdentity(c.nick, c.extendedJoin())
 			return c.forward(line)
 		}
 		return true
@@ -436,6 +510,7 @@ func (c *client) maybeRegister() bool {
 	}
 
 	c.registered = true
+	c.sub.SetIdentity(c.nick, c.extendedJoin())
 	if !c.sendRegistration() {
 		return false
 	}
@@ -478,6 +553,18 @@ func (c *client) replayNetwork(ne networkEntry) bool {
 		return false
 	}
 
+	un := ne.knownNick()
+	if un == "" {
+		ne.net.Replay(ne.net.Oldest(), func(seq uint64, line []byte) bool {
+			if v := detectUpstreamNick(line); v != "" {
+				ne.nick.set(v)
+				un = v
+				return false
+			}
+			return true
+		})
+	}
+
 	st, _ := ne.net.(stampSource)
 	buf := c.replayBuf
 	ok := true
@@ -488,8 +575,10 @@ func (c *client) replayNetwork(ne networkEntry) bool {
 				ts = v
 			}
 		}
+		forLine, next := ne.advanceNick(un, line)
+		un = next
 		buf = appendReplayLine(buf[:0], line, id, ts)
-		if !c.sub.Write(buf) {
+		if !c.sub.WriteFrom(buf, forLine) {
 			ok = false
 			return false
 		}
