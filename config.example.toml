@@ -1,0 +1,42 @@
+# salotto proof of concept.
+# The bouncer holds the upstream IRC connection for you, replays the ring buffer
+# to any client that connects, and then forwards the live stream. It does not
+# track channels, nicks, topics or modes; your IRC client rebuilds all of that
+# from the replayed lines and the stream that follows.
+
+# global
+listen = "127.0.0.1:6667"
+tls_listen = ""                 # optional, e.g. "127.0.0.1:6697"
+tls_cert = ""
+tls_key = ""
+server_name = "salotto"
+stats_listen = "127.0.0.1:6668"
+ring_segments = 8
+ring_segment_size = 262144
+max_clients = 32
+
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+tls = true
+nick = "mynick"
+realname = "mynick"
+pass = ""
+# SASL is optional; uncomment both lines and fill them in if the network needs it.
+# sasl_user = "mynick"
+# sasl_pass = "secret"
+# Channels joined after every successful (re)connect.
+channels = ["#chan1", "#chan2"]
+insecure_skip_verify = false
+
+[[network]]
+name = "freebnc"
+addr = "irc.freebnc.net:6697"
+tls = true
+nick = "mynick"
+realname = "mynick"
+pass = ""
+# sasl_user = "mynick"
+# sasl_pass = "secret"
+channels = []
+insecure_skip_verify = false

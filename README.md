@@ -54,6 +54,7 @@ Two decisions are worth knowing before reading anything else:
 
 Spec draft, nothing implemented. The milestone table in the spec starts with
 the frame codec and the ring, because those two carry the whole premise.
+A runnable proof of concept is documented in [`docs/POC.md`](docs/POC.md).
 
 ## Layout
 

@@ -1,0 +1,338 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+const (
+	// These match the clamps applied by internal/ring.New.
+	minRingSegments    = 2
+	minRingSegmentSize = 512
+)
+
+// Network describes one upstream IRC network.
+type Network struct {
+	Name               string
+	Addr               string
+	TLS                bool
+	Nick               string
+	RealName           string
+	Pass               string
+	SASLUser           string
+	SASLPass           string
+	Channels           []string
+	InsecureSkipVerify bool
+}
+
+// Config is the complete salottod configuration.
+type Config struct {
+	Listen          string
+	TLSListen       string
+	TLSCert         string
+	TLSKey          string
+	ServerName      string
+	StatsListen     string
+	RingSegments    int
+	RingSegmentSize int
+	MaxClients      int
+	Networks        []Network
+}
+
+// Default returns the built-in configuration. Networks are intentionally empty:
+// a valid configuration must add at least one [[network]] section.
+func Default() *Config {
+	return &Config{
+		Listen:          "127.0.0.1:6667",
+		ServerName:      "salotto",
+		StatsListen:     "127.0.0.1:6668",
+		RingSegments:    8,
+		RingSegmentSize: 262144,
+		MaxClients:      32,
+	}
+}
+
+// Load reads path, parses it over Default and validates the result.
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	cfg := Default()
+	if err := cfg.parse(string(data)); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// Validate checks the parts of the configuration that cannot be left empty or
+// below the ring's own hard limits.
+func (c *Config) Validate() error {
+	if len(c.Networks) == 0 {
+		return errors.New("at least one [[network]] is required")
+	}
+	if strings.TrimSpace(c.Listen) == "" {
+		return errors.New("listen must not be empty")
+	}
+	if c.RingSegments < minRingSegments {
+		return fmt.Errorf("ring_segments must be at least %d", minRingSegments)
+	}
+	if c.RingSegmentSize < minRingSegmentSize {
+		return fmt.Errorf("ring_segment_size must be at least %d", minRingSegmentSize)
+	}
+	if c.TLSListen != "" && c.TLSCert == "" {
+		return errors.New("tls_cert is required when tls_listen is set")
+	}
+	for i := range c.Networks {
+		n := &c.Networks[i]
+		if strings.TrimSpace(n.Name) == "" {
+			return fmt.Errorf("network %d: name must not be empty", i+1)
+		}
+		if strings.TrimSpace(n.Addr) == "" {
+			return fmt.Errorf("network %q: addr must not be empty", n.Name)
+		}
+		if strings.TrimSpace(n.Nick) == "" {
+			return fmt.Errorf("network %q: nick must not be empty", n.Name)
+		}
+	}
+	return nil
+}
+
+func (c *Config) parse(text string) error {
+	inNetwork := false
+	for lineNo, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(stripComment(raw))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[[") {
+			if !strings.HasSuffix(line, "]]") {
+				return fmt.Errorf("line %d: malformed section header %q", lineNo+1, line)
+			}
+			name := strings.TrimSpace(line[2 : len(line)-2])
+			if name != "network" {
+				return fmt.Errorf("line %d: unknown section [[%s]]", lineNo+1, name)
+			}
+			c.Networks = append(c.Networks, Network{})
+			inNetwork = true
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			return fmt.Errorf("line %d: expected key = value", lineNo+1)
+		}
+		key := strings.TrimSpace(line[:eq])
+		value := strings.TrimSpace(line[eq+1:])
+		if key == "" {
+			return fmt.Errorf("line %d: empty key", lineNo+1)
+		}
+
+		var err error
+		if inNetwork {
+			err = c.parseNetworkKey(&c.Networks[len(c.Networks)-1], key, value)
+		} else {
+			err = c.parseGlobalKey(key, value)
+		}
+		if err != nil {
+			return fmt.Errorf("line %d: %w", lineNo+1, err)
+		}
+	}
+	return nil
+}
+
+func (c *Config) parseGlobalKey(key, value string) error {
+	var err error
+	switch key {
+	case "listen":
+		c.Listen, err = parseString(value)
+	case "tls_listen":
+		c.TLSListen, err = parseString(value)
+	case "tls_cert":
+		c.TLSCert, err = parseString(value)
+	case "tls_key":
+		c.TLSKey, err = parseString(value)
+	case "server_name":
+		c.ServerName, err = parseString(value)
+	case "stats_listen":
+		c.StatsListen, err = parseString(value)
+	case "ring_segments":
+		c.RingSegments, err = parseInt(value)
+	case "ring_segment_size":
+		c.RingSegmentSize, err = parseInt(value)
+	case "max_clients":
+		c.MaxClients, err = parseInt(value)
+	default:
+		return fmt.Errorf("unknown key %q", key)
+	}
+	return err
+}
+
+func (c *Config) parseNetworkKey(n *Network, key, value string) error {
+	var err error
+	switch key {
+	case "name":
+		n.Name, err = parseString(value)
+	case "addr":
+		n.Addr, err = parseString(value)
+	case "tls":
+		n.TLS, err = parseBool(value)
+	case "nick":
+		n.Nick, err = parseString(value)
+	case "realname":
+		n.RealName, err = parseString(value)
+	case "pass":
+		n.Pass, err = parseString(value)
+	case "sasl_user":
+		n.SASLUser, err = parseString(value)
+	case "sasl_pass":
+		n.SASLPass, err = parseString(value)
+	case "channels":
+		n.Channels, err = parseStringList(value)
+	case "insecure_skip_verify":
+		n.InsecureSkipVerify, err = parseBool(value)
+	default:
+		return fmt.Errorf("unknown key %q in [[network]]", key)
+	}
+	return err
+}
+
+func stripComment(line string) string {
+	inQuote := false
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inQuote {
+			switch ch {
+			case '\\':
+				escaped = true
+			case '"':
+				inQuote = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inQuote = true
+		case '#':
+			return line[:i]
+		}
+	}
+	return line
+}
+
+func parseString(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if value[0] == '"' {
+		s, rest, err := readQuoted(value)
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(rest) != "" {
+			return "", errors.New("unexpected trailing characters after quoted string")
+		}
+		return s, nil
+	}
+	if value[0] == '[' {
+		return "", errors.New("expected a string, got a list")
+	}
+	if strings.ContainsAny(value, " \t") {
+		return "", errors.New("unquoted value contains whitespace")
+	}
+	return value, nil
+}
+
+func parseStringList(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value[0] != '[' {
+		return nil, errors.New("expected a list of quoted strings")
+	}
+
+	var out []string
+	i := 1
+	for {
+		for i < len(value) && (value[i] == ' ' || value[i] == '\t' || value[i] == ',') {
+			i++
+		}
+		if i >= len(value) {
+			return nil, errors.New("unterminated list")
+		}
+		if value[i] == ']' {
+			i++
+			break
+		}
+		if value[i] != '"' {
+			return nil, fmt.Errorf("list element %d is not a quoted string", len(out)+1)
+		}
+		s, rest, err := readQuoted(value[i:])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+		i += len(value[i:]) - len(rest)
+	}
+	if strings.TrimSpace(value[i:]) != "" {
+		return nil, errors.New("unexpected trailing characters after list")
+	}
+	return out, nil
+}
+
+func readQuoted(s string) (value, rest string, err error) {
+	if len(s) == 0 || s[0] != '"' {
+		return "", "", errors.New("expected a quoted string")
+	}
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		ch := s[i]
+		switch ch {
+		case '\\':
+			if i+1 >= len(s) {
+				return "", "", errors.New("dangling escape in quoted string")
+			}
+			i++
+			switch s[i] {
+			case '"', '\\':
+				b.WriteByte(s[i])
+			default:
+				b.WriteByte('\\')
+				b.WriteByte(s[i])
+			}
+		case '"':
+			return b.String(), s[i+1:], nil
+		default:
+			b.WriteByte(ch)
+		}
+	}
+	return "", "", errors.New("unterminated quoted string")
+}
+
+func parseBool(value string) (bool, error) {
+	switch strings.TrimSpace(value) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("expected true or false, got %q", strings.TrimSpace(value))
+	}
+}
+
+func parseInt(value string) (int, error) {
+	v, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0, fmt.Errorf("expected an integer, got %q", strings.TrimSpace(value))
+	}
+	return v, nil
+}
