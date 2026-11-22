@@ -1,8 +1,8 @@
 module github.com/iakat/salotto
 
-go 1.24.0
+go 1.27.0
 
-toolchain go1.24.10
+toolchain go1.27.4
 
 require github.com/blevesearch/vellum v1.2.1
 
