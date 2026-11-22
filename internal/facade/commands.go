@@ -40,8 +40,9 @@ func (k windowKind) includes(name string) bool {
 	}
 }
 
-// requireNetwork returns the first network in sorted order, or false after
-// answering with ZNC's "must be connected" notice.
+// requireNetwork returns the first network in sorted order. When there is none
+// it returns "" and the result of writing ZNC's "must be connected" notice, so
+// the caller can propagate a failed write. A non-empty network means proceed.
 func (c *client) requireNetwork() (string, bool) {
 	network := c.commandNetwork()
 	if network == "" {
@@ -60,8 +61,8 @@ func plural(n int, one, many string) string {
 
 func (c *client) handleAttach(rest []byte) bool {
 	network, ok := c.requireNetwork()
-	if !ok {
-		return false
+	if network == "" {
+		return ok
 	}
 	arg := string(ircline.Params(rest))
 	if arg == "" {
@@ -86,8 +87,8 @@ func (c *client) handleAttach(rest []byte) bool {
 
 func (c *client) handleDetach(rest []byte) bool {
 	network, ok := c.requireNetwork()
-	if !ok {
-		return false
+	if network == "" {
+		return ok
 	}
 	arg := string(ircline.Params(rest))
 	if arg == "" {
@@ -112,8 +113,8 @@ func (c *client) handleDetach(rest []byte) bool {
 
 func (c *client) handlePlayBuffer(rest []byte) bool {
 	network, ok := c.requireNetwork()
-	if !ok {
-		return false
+	if network == "" {
+		return ok
 	}
 	window := string(ircline.FirstParam(ircline.Params(rest)))
 	if window == "" {
@@ -146,8 +147,8 @@ func (c *client) handlePlayBuffer(rest []byte) bool {
 
 func (c *client) handleClearBuffer(rest []byte) bool {
 	network, ok := c.requireNetwork()
-	if !ok {
-		return false
+	if network == "" {
+		return ok
 	}
 	arg := string(ircline.FirstParam(ircline.Params(rest)))
 	if arg == "" {
@@ -165,8 +166,8 @@ func (c *client) handleClearBuffer(rest []byte) bool {
 
 func (c *client) handleClearAllBuffers(rest []byte, kind windowKind) bool {
 	network, ok := c.requireNetwork()
-	if !ok {
-		return false
+	if network == "" {
+		return ok
 	}
 	for _, window := range c.srv.windows.knownWindows(network) {
 		if !kind.includes(window) {
@@ -186,8 +187,8 @@ func (c *client) handleClearAllBuffers(rest []byte, kind windowKind) bool {
 
 func (c *client) handleDisableChan(rest []byte, disable bool) bool {
 	network, ok := c.requireNetwork()
-	if !ok {
-		return false
+	if network == "" {
+		return ok
 	}
 	verb := "DisableChan"
 	if !disable {
@@ -226,8 +227,8 @@ func (c *client) handleDisableChan(rest []byte, disable bool) bool {
 // (ZNC's own counters overlap when a channel is both detached and disabled).
 func (c *client) handleListChans() bool {
 	network, ok := c.requireNetwork()
-	if !ok {
-		return false
+	if network == "" {
+		return ok
 	}
 	names := c.srv.windows.knownWindows(network)
 	if len(names) == 0 {

@@ -214,10 +214,19 @@ func (s *Server) DetachWindow(sub *Subscriber, network, window string) bool {
 
 // SetDisabled sets the not-buffered flag for a window. ZNC's flag also stops
 // the channel being re-joined after a reconnect; we do not manage joins at
-// runtime, so the observable effect here is "not buffered". It reports whether
-// the flag changed.
+// runtime, so the observable effect here is "not buffered". Re-enabling
+// advances the clear floor to the newest line so only subsequent lines can be
+// replayed: a disabled window must not replay a stale buffer. It reports
+// whether the flag changed.
 func (s *Server) SetDisabled(network, window string, disabled bool) bool {
-	return s.windows.setDisabled(windowKey(network, window), disabled)
+	key := windowKey(network, window)
+	changed := s.windows.setDisabled(key, disabled)
+	if changed && !disabled {
+		if ne := s.network(network); ne != nil {
+			s.windows.clear(key, ne.net.Newest())
+		}
+	}
+	return changed
 }
 
 // Disabled reports whether a window is not buffered.
