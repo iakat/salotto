@@ -22,6 +22,7 @@ import (
 	"github.com/iakat/salotto/internal/bindhost"
 	"github.com/iakat/salotto/internal/config"
 	"github.com/iakat/salotto/internal/facade"
+	"github.com/iakat/salotto/internal/ident"
 	"github.com/iakat/salotto/internal/logfile"
 	"github.com/iakat/salotto/internal/ring"
 	"github.com/iakat/salotto/internal/upstream"
@@ -118,6 +119,8 @@ func run() int {
 	networks := make(map[string]*facade.Network, len(cfg.Networks))
 	var srv *facade.Server
 
+	reg := ident.NewRegistry()
+
 	bindState := bindhost.New(cfg.User.BindHost, cfg.User.DenySetBindHost)
 	for i := range cfg.Networks {
 		bindState.Seed(cfg.Networks[i].Name, cfg.Networks[i].BindHost)
@@ -135,6 +138,13 @@ func run() int {
 		nc := cfg.Networks[i]
 		netName := nc.Name
 		bindHost, _ := bindState.Resolve(netName)
+		// Per-network resolved ident, read at dial time. When it is empty the
+		// pair is not registered at all: NO-USER is more honest than inventing
+		// a value.
+		identStr := cfg.Ident
+		if identStr == "" {
+			identStr = nc.Nick
+		}
 		r := ring.New(cfg.RingSegments, cfg.RingSegmentSize)
 
 		var serverStr string
@@ -170,6 +180,12 @@ func run() int {
 			},
 			OnDisconnect: func() {
 				w.Disconnect(serverStr)
+			},
+			OnOpen: func(conn net.Conn) func() {
+				if identStr == "" {
+					return nil
+				}
+				return reg.Add(conn.LocalAddr(), conn.RemoteAddr(), identStr)
 			},
 		}
 		if ucfg.RealName == "" {
@@ -251,7 +267,7 @@ func run() int {
 			return 1
 		}
 		statsSrv = &http.Server{
-			Handler:           statsHandler(start, runtimes, hub, srv),
+			Handler:           statsHandler(start, runtimes, hub, srv, reg, cfg.IdentListen != ""),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 	}
@@ -270,6 +286,27 @@ func run() int {
 		logSrv = &http.Server{
 			Handler:           logfile.SearchHandler(cfg.LogDir, cfg.LogToken),
 			ReadHeaderTimeout: 5 * time.Second,
+		}
+	}
+
+	var identLn net.Listener
+	var identSrv *ident.Server
+	if cfg.IdentListen != "" {
+		identLn, err = net.Listen("tcp", cfg.IdentListen)
+		if err != nil {
+			logger.Warn("ident listen failed; continuing without ident", "addr", cfg.IdentListen, "err", err)
+			identLn = nil
+		} else {
+			identSrv, err = ident.New(ident.Config{
+				Listener: identLn,
+				Registry: reg,
+				Log:      logger,
+			})
+			if err != nil {
+				logger.Warn("ident setup failed; continuing without ident", "err", err)
+				_ = identLn.Close()
+				identLn, identSrv = nil, nil
+			}
 		}
 	}
 
@@ -305,6 +342,17 @@ func run() int {
 			}
 		}()
 		logger.Info("listening", "addr", tlsLn.Addr().String(), "tls", true)
+	}
+
+	if identSrv != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := identSrv.Serve(ctx); err != nil {
+				logger.Error("ident serve failed", "addr", identLn.Addr().String(), "err", err)
+			}
+		}()
+		logger.Info("ident listening", "addr", identLn.Addr().String())
 	}
 
 	if statsSrv != nil {
@@ -348,6 +396,9 @@ func run() int {
 	_ = plainLn.Close()
 	if tlsRaw != nil {
 		_ = tlsRaw.Close()
+	}
+	if identLn != nil {
+		_ = identLn.Close()
 	}
 	if statsSrv != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -425,7 +476,7 @@ func validateStatsAddr(addr string) error {
 	return nil
 }
 
-func statsHandler(start time.Time, runtimes []*networkRuntime, hub *facade.Hub, srv *facade.Server) http.Handler {
+func statsHandler(start time.Time, runtimes []*networkRuntime, hub *facade.Hub, srv *facade.Server, reg *ident.Registry, identEnabled bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -448,6 +499,11 @@ func statsHandler(start time.Time, runtimes []*networkRuntime, hub *facade.Hub, 
 			fmt.Fprintf(&b, "net.%s.ring_oldest=%d\n", rt.name, rt.ring.Oldest())
 			fmt.Fprintf(&b, "net.%s.ring_newest=%d\n", rt.name, rt.ring.Newest())
 			fmt.Fprintf(&b, "net.%s.ring_bytes=%d\n", rt.name, rt.ring.Bytes())
+		}
+		if identEnabled {
+			fmt.Fprintf(&b, "ident.enabled=1\n")
+			fmt.Fprintf(&b, "ident.queries=%d\n", reg.Queries.Load())
+			fmt.Fprintf(&b, "ident.refused=%d\n", reg.Refused.Load())
 		}
 		fmt.Fprintf(&b, "clients_attached=%d\n", srv.Attached())
 		fmt.Fprintf(&b, "clients_dropped_slow=%d\n", hub.Dropped())

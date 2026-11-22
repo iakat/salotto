@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -79,6 +80,16 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 		}
 		return false, err
 	}
+
+	onClose := func() {}
+	if c.cfg.OnOpen != nil {
+		onClose = c.cfg.OnOpen(raw)
+		if onClose == nil {
+			onClose = func() {}
+		}
+	}
+	var closeOnce sync.Once
+	defer func() { closeOnce.Do(onClose) }()
 
 	conn := raw
 	if c.cfg.TLS {

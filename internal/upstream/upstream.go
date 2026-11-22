@@ -37,8 +37,13 @@ type Config struct {
 	OnConnect func()
 	// OnDisconnect is called when the connection drops.
 	OnDisconnect func()
-	Log          *slog.Logger
-	Dialer       *net.Dialer
+	// OnOpen, when non-nil, is called with the freshly dialled connection,
+	// before registration is attempted. Its return value is called exactly once
+	// when the connection closes or the dial attempt fails afterwards. Used by
+	// the ident registry; it must be cheap and must not block.
+	OnOpen func(conn net.Conn) (onClose func())
+	Log    *slog.Logger
+	Dialer *net.Dialer
 	// BindHost, when non-empty, is the local source address the outbound socket
 	// binds to. The dialer enables IP_FREEBIND for it, so the address does not
 	// have to be configured on an interface.
