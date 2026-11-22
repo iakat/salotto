@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/iakat/salotto/internal/bindhost"
 	"github.com/iakat/salotto/internal/config"
 	"github.com/iakat/salotto/internal/facade"
 	"github.com/iakat/salotto/internal/logfile"
@@ -117,10 +118,23 @@ func run() int {
 	networks := make(map[string]*facade.Network, len(cfg.Networks))
 	var srv *facade.Server
 
+	bindState := bindhost.New(cfg.User.BindHost, cfg.User.DenySetBindHost)
+	for i := range cfg.Networks {
+		bindState.Seed(cfg.Networks[i].Name, cfg.Networks[i].BindHost)
+	}
+	conns := make(map[string]*upstream.Conn, len(cfg.Networks))
+	bindState.SetOnChange(func(network, host string) {
+		if conn := conns[network]; conn != nil {
+			if err := conn.SetBindHost(host); err != nil {
+				logger.Error("invalid bind host from wire command", "network", network, "host", host, "err", err)
+			}
+		}
+	})
+
 	for i := range cfg.Networks {
 		nc := cfg.Networks[i]
 		netName := nc.Name
-		bindHost, _ := config.ResolveBindHost(cfg.User.BindHost, nc.BindHost)
+		bindHost, _ := bindState.Resolve(netName)
 		r := ring.New(cfg.RingSegments, cfg.RingSegmentSize)
 
 		var serverStr string
@@ -169,6 +183,7 @@ func run() int {
 		serverStr = conn.ServerString()
 		w.SetServer(serverStr)
 		w.SetHasCap(conn.HasCap)
+		conns[netName] = conn
 
 		runtimes = append(runtimes, &networkRuntime{
 			name:   netName,
@@ -190,6 +205,7 @@ func run() int {
 		ServerName: cfg.ServerName,
 		Hub:        hub,
 		Networks:   networks,
+		BindHosts:  bindState,
 		Log:        logger,
 		MaxClients: maxClients,
 	})

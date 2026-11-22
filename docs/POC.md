@@ -91,10 +91,17 @@ These are the things that were exercised while building this POC:
   inside the ring.
 - TLS to the upstream verifies certificates unless
   `insecure_skip_verify = true`. There is no certificate pinning.
+- Bind host / `IP_FREEBIND`: `[user] bind_host`, `[[network]] bind_host` and the
+  `SetBindHost`/`ClearBindHost`/`SetUserBindHost`/`ClearUserBindHost`/
+  `ShowBindHost` commands set the outbound source address. FREEBIND makes
+  `bind()` succeed for an address the host does not own; it does **not** make
+  the address reachable. Without a route (transit/anycast, a tunnel, or a NAT
+  that rewrites the source) the connection opens and then hangs, and the dial
+  logs exactly that. `deny_set_bind_host = true` refuses both setters.
 - The only special-cased client commands are the ones in
-  `internal/facade/server.go` (`CAP`, `NICK`, `USER`, `PING`, `QUIT`, `WEBIRC`).
-  Everything else is forwarded verbatim, so a command the bouncer does not
-  know is the network's problem, not a bug.
+  `internal/facade/server.go` (`CAP`, `NICK`, `USER`, `PING`, `QUIT`, `WEBIRC`,
+  and the bind-host family). Everything else is forwarded verbatim, so a
+  command the bouncer does not know is the network's problem, not a bug.
 
 ## Verify it yourself
 

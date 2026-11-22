@@ -64,15 +64,15 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 	attempt := c.attempts.Add(1)
 
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	raw, err := c.dialer.DialContext(dialCtx, "tcp", c.cfg.Addr)
+	raw, err := c.dialerForDial().DialContext(dialCtx, "tcp", c.cfg.Addr)
 	if err != nil {
 		cancel()
-		if c.cfg.BindHost != "" {
+		if bindHost := c.BindHost(); bindHost != "" {
 			timeout := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded)
 			if timeout || errors.Is(err, syscall.ENETUNREACH) {
 				c.log.Warn("dial failed with a bind host set; the address may be bound but unroutable",
 					"name", c.cfg.Name,
-					"bind_host", c.cfg.BindHost,
+					"bind_host", bindHost,
 					"err", err,
 				)
 			}

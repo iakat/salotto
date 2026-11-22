@@ -160,8 +160,43 @@ func TestDialerWithoutFreebindFailsAtBind(t *testing.T) {
 	}
 }
 
-// TestDialerWithBindHostDoesNotMutate ensures the caller's dialer is copied,
-// not modified in place.
+// TestSetBindHostRepointsNextDial checks that SetBindHost is applied to the next
+// dial without touching a running connection (ZNC's SetBindHost is the same: it
+// stores the value and Connect reads it).
+func TestSetBindHostRepointsNextDial(t *testing.T) {
+	c, err := New(Config{
+		Name: "test",
+		Addr: "127.0.0.1:1",
+		Nick: "nick",
+		Ring: ring.New(2, 512),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if c.BindHost() != "" {
+		t.Fatalf("initial BindHost = %q", c.BindHost())
+	}
+	if err := c.SetBindHost("192.0.2.77"); err != nil {
+		t.Fatalf("SetBindHost: %v", err)
+	}
+	if c.BindHost() != "192.0.2.77" {
+		t.Fatalf("BindHost = %q", c.BindHost())
+	}
+	d := c.dialerForDial()
+	if d == nil || d.LocalAddr == nil || d.LocalAddr.String() != "192.0.2.77:0" {
+		t.Fatalf("next dial LocalAddr = %v", d.LocalAddr)
+	}
+	if err := c.SetBindHost("not-an-ip"); err == nil {
+		t.Fatal("SetBindHost accepted a non-IP")
+	}
+	if err := c.SetBindHost(""); err != nil {
+		t.Fatalf("SetBindHost(\"\"): %v", err)
+	}
+	if d := c.dialerForDial(); d.LocalAddr != nil || d.Control != nil {
+		t.Fatalf("cleared dialer still bound: LocalAddr=%v Control set=%v", d.LocalAddr, d.Control != nil)
+	}
+}
+
 func TestDialerWithBindHostDoesNotMutate(t *testing.T) {
 	base := &net.Dialer{}
 	_ = dialerWithBindHost(base, "192.0.2.77")

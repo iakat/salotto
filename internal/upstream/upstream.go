@@ -85,6 +85,9 @@ type Conn struct {
 	log    *slog.Logger
 	dialer *net.Dialer
 
+	dialerMu   sync.Mutex
+	baseDialer *net.Dialer
+
 	state    atomic.Int32
 	attempts atomic.Uint64
 	linesIn  atomic.Uint64
@@ -129,7 +132,8 @@ func New(cfg Config) (*Conn, error) {
 	if cfg.Dialer == nil {
 		cfg.Dialer = &net.Dialer{}
 	}
-	cfg.Dialer = dialerWithBindHost(cfg.Dialer, cfg.BindHost)
+	baseDialer := cfg.Dialer
+	cfg.Dialer = dialerWithBindHost(baseDialer, cfg.BindHost)
 	if cfg.BackoffMin <= 0 {
 		cfg.BackoffMin = time.Second
 	}
@@ -144,6 +148,7 @@ func New(cfg Config) (*Conn, error) {
 		cfg:        cfg,
 		log:        cfg.Log,
 		dialer:     cfg.Dialer,
+		baseDialer: baseDialer,
 		regC:       make(chan struct{}),
 		caps:       make(map[string]bool),
 		freeSlabs:  make(chan *slab, slabCount),
@@ -154,6 +159,36 @@ func New(cfg Config) (*Conn, error) {
 		c.freeSlabs <- &slab{}
 	}
 	return c, nil
+}
+
+// SetBindHost repoints the next dial. The value is only used at dial time, so a
+// running connection is not interrupted; ZNC does the same (CIRCNetwork.cpp
+// 1545 accepts the value and only reads it in Connect).
+func (c *Conn) SetBindHost(host string) error {
+	if host != "" && net.ParseIP(host) == nil {
+		return errors.New("upstream: invalid BindHost: not an IP address")
+	}
+	d := dialerWithBindHost(c.baseDialer, host)
+
+	c.dialerMu.Lock()
+	c.cfg.BindHost = host
+	c.dialer = d
+	c.dialerMu.Unlock()
+	return nil
+}
+
+// BindHost returns the bind host the next dial will use.
+func (c *Conn) BindHost() string {
+	c.dialerMu.Lock()
+	defer c.dialerMu.Unlock()
+	return c.cfg.BindHost
+}
+
+func (c *Conn) dialerForDial() *net.Dialer {
+	c.dialerMu.Lock()
+	d := c.dialer
+	c.dialerMu.Unlock()
+	return d
 }
 
 func (c *Conn) State() State     { return State(c.state.Load()) }

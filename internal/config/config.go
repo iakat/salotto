@@ -99,10 +99,10 @@ func ResolveBindHost(user, network string) (host, origin string) {
 	}
 }
 
-// validateBindHost rejects anything but a bare IPv4 or IPv6 literal: a bind
+// ValidateBindHost rejects anything but a bare IPv4 or IPv6 literal: a bind
 // host with a port or a hostname would silently bind to something else than the
 // operator wrote.
-func validateBindHost(field, value string) error {
+func ValidateBindHost(field, value string) error {
 	if value == "" {
 		return nil
 	}
@@ -121,7 +121,7 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Listen) == "" {
 		return errors.New("listen must not be empty")
 	}
-	if err := validateBindHost("user.bind_host", c.User.BindHost); err != nil {
+	if err := ValidateBindHost("user.bind_host", c.User.BindHost); err != nil {
 		return err
 	}
 	if c.RingSegments < minRingSegments {
@@ -147,7 +147,7 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(n.Nick) == "" {
 			return fmt.Errorf("network %q: nick must not be empty", n.Name)
 		}
-		if err := validateBindHost(fmt.Sprintf("networks[%d].bind_host", i), n.BindHost); err != nil {
+		if err := ValidateBindHost(fmt.Sprintf("networks[%d].bind_host", i), n.BindHost); err != nil {
 			return err
 		}
 	}

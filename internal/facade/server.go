@@ -29,6 +29,19 @@ type Config struct {
 	MaxClients int
 	OutBuf     int // per-client outbound buffer, default 64 KiB
 	MaxLineLen int // default 8192; longer client lines are truncated
+	// BindHosts, when set, answers the SetBindHost/ClearBindHost family. It is
+	// optional so the facade stays usable without an upstream dialer.
+	BindHosts BindHosts
+}
+
+// BindHosts is the bind-host state the wire commands mutate. Resolution is
+// network value, else user value, else empty (kernel picks).
+type BindHosts interface {
+	Resolve(network string) (host, origin string)
+	SetNetwork(network, host string) error
+	ClearNetwork(network string) error
+	SetUser(host string) error
+	ClearUser() error
 }
 
 // Network is a handle to one upstream. The facade deliberately does not depend
@@ -363,9 +376,109 @@ func (c *client) handle(line, rest []byte) bool {
 		return false
 	case ircline.IsVerb(rest, "WEBIRC"):
 		return c.send(":", c.srv.cfg.ServerName, " NOTICE * :WEBIRC not supported")
+	case ircline.IsVerb(rest, "SETBINDHOST"):
+		return c.handleSetBindHost(rest)
+	case ircline.IsVerb(rest, "CLEARBINDHOST"):
+		return c.handleClearBindHost()
+	case ircline.IsVerb(rest, "SETUSERBINDHOST"):
+		return c.handleSetUserBindHost(rest)
+	case ircline.IsVerb(rest, "CLEARUSERBINDHOST"):
+		return c.handleClearUserBindHost()
+	case ircline.IsVerb(rest, "SHOWBINDHOST"):
+		return c.handleShowBindHost()
 	default:
 		return c.forward(line)
 	}
+}
+
+// commandNetwork returns the network the bind-host commands act on. Like
+// forward, the proof of concept has no in-band network selector: it is the first
+// network in sorted order.
+func (c *client) commandNetwork() string {
+	if len(c.srv.nets) == 0 {
+		return ""
+	}
+	return c.srv.nets[0].name
+}
+
+func (c *client) bindHosts() BindHosts {
+	return c.srv.cfg.BindHosts
+}
+
+func (c *client) status(text ...string) bool {
+	nick := c.nick
+	if nick == "" {
+		nick = "*"
+	}
+	parts := make([]string, 0, len(text)+4)
+	parts = append(parts, ":", c.srv.cfg.ServerName, " NOTICE ", nick, " :")
+	parts = append(parts, text...)
+	return c.send(parts...)
+}
+
+func (c *client) noBindHosts() bool {
+	return c.bindHosts() == nil
+}
+
+func (c *client) handleSetBindHost(rest []byte) bool {
+	if c.noBindHosts() {
+		return c.status("SetBindHost is not available")
+	}
+	arg := string(ircline.FirstParam(ircline.Params(rest)))
+	if arg == "" {
+		return c.status("Usage: SetBindHost <host>")
+	}
+	network := c.commandNetwork()
+	if current, _ := c.bindHosts().Resolve(network); arg == current {
+		return c.status("You already have this bind host!")
+	}
+	if err := c.bindHosts().SetNetwork(network, arg); err != nil {
+		return c.status(err.Error())
+	}
+	return c.status("Set bind host for network ", network, " to ", arg)
+}
+
+func (c *client) handleClearBindHost() bool {
+	if c.noBindHosts() {
+		return c.status("ClearBindHost is not available")
+	}
+	network := c.commandNetwork()
+	if err := c.bindHosts().ClearNetwork(network); err != nil {
+		return c.status(err.Error())
+	}
+	return c.status("Bind host cleared for this network.")
+}
+
+func (c *client) handleSetUserBindHost(rest []byte) bool {
+	if c.noBindHosts() {
+		return c.status("SetUserBindHost is not available")
+	}
+	arg := string(ircline.FirstParam(ircline.Params(rest)))
+	if arg == "" {
+		return c.status("Usage: SetUserBindHost <host>")
+	}
+	if err := c.bindHosts().SetUser(arg); err != nil {
+		return c.status(err.Error())
+	}
+	return c.status("Set default bind host to ", arg)
+}
+
+func (c *client) handleClearUserBindHost() bool {
+	if c.noBindHosts() {
+		return c.status("ClearUserBindHost is not available")
+	}
+	if err := c.bindHosts().ClearUser(); err != nil {
+		return c.status(err.Error())
+	}
+	return c.status("Default bind host cleared for your user.")
+}
+
+func (c *client) handleShowBindHost() bool {
+	if c.noBindHosts() {
+		return c.status("ShowBindHost is not available")
+	}
+	host, origin := c.bindHosts().Resolve(c.commandNetwork())
+	return c.status("bind_host=", host, " (", origin, ")")
 }
 
 func (c *client) handleCap(rest []byte) bool {
