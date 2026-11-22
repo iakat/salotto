@@ -180,6 +180,33 @@ func (s *Server) DetachWindow(sub *Subscriber, network, window string) bool {
 	return s.windows.detach(sub, windowKey(network, window))
 }
 
+// Known reports whether a window has ever been seen for this network.
+func (s *Server) Known(network, window string) bool {
+	key := windowKey(network, window)
+	s.windows.mu.Lock()
+	known := s.windows.known[key]
+	s.windows.mu.Unlock()
+	return known
+}
+
+// BufferEmpty reports whether a window has nothing to replay: the shared ring
+// has no lines, or a clear floor hides everything.
+func (s *Server) BufferEmpty(network, window string) bool {
+	ne := s.network(network)
+	if ne == nil {
+		return true
+	}
+	newest := ne.net.Newest()
+	if newest == 0 {
+		return true
+	}
+	from := ne.net.Oldest()
+	if floor := s.windows.cleared(windowKey(network, window)); floor >= from {
+		from = floor + 1
+	}
+	return from > newest
+}
+
 // matchWindows returns the known windows of network whose name matches every
 // token in arg, using ZNC's rule: split on commas, then on spaces, then match
 // each token case-insensitively with '*' and '?' wildcards. A token with no

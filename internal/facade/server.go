@@ -390,6 +390,16 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleAttach(rest)
 	case ircline.IsVerb(rest, "DETACH"):
 		return c.handleDetach(rest)
+	case ircline.IsVerb(rest, "PLAYBUFFER"):
+		return c.handlePlayBuffer(rest)
+	case ircline.IsVerb(rest, "CLEARBUFFER"):
+		return c.handleClearBuffer(rest)
+	case ircline.IsVerb(rest, "CLEARALLCHANNELBUFFERS"):
+		return c.handleClearAllBuffers(rest, windowChannels)
+	case ircline.IsVerb(rest, "CLEARALLQUERYBUFFERS"):
+		return c.handleClearAllBuffers(rest, windowQueries)
+	case ircline.IsVerb(rest, "CLEARALLBUFFERS"):
+		return c.handleClearAllBuffers(rest, windowAll)
 	default:
 		return c.forward(line)
 	}
