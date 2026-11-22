@@ -35,6 +35,19 @@ func newClientWindows() *clientWindows {
 // mute flags, plus a per-window clear floor. Nothing is persisted; a client
 // that is not attached simply has no state and starts from Oldest().
 //
+// A window is in exactly one of three states for a given client:
+//
+//	state                                  live delivery              PlayBuffer
+//	attached (default when no opinion)     yes, once                  replays from cursor
+//	detached (explicit DETACH)             no                         replays from cursor
+//	status (no opinion, no attaches)       yes, once, via catch-all   n/a
+//
+// An absent key in clientWindows.attached means "no opinion"; the status
+// catch-all applies. An explicit false means "detached": the client stated a
+// preference, so neither the window path nor the catch-all may deliver to it.
+// Muting has the same live effect as detaching here; the flags stay separate
+// because the wire commands differ and LISTCHANS reports them differently.
+//
 // The rings are still one per network. Per-window cursors index that shared
 // ring, so replay for a window is an approximation: a busy window can push a
 // quiet window's lines out before the quiet window's client reads them.
@@ -155,23 +168,65 @@ func (ws *windowState) forget(sub *Subscriber) {
 	ws.mu.Unlock()
 }
 
-// hasAnyAttach reports whether sub is attached to at least one window. The
-// status fallback uses it to keep clients that asked for window delivery off
-// the catch-all stream.
-func (ws *windowState) hasAnyAttach(sub *Subscriber) bool {
+// liveState is a client's explicit relationship to one window.
+type liveState int
+
+const (
+	// liveViaOther: the client has no opinion about this window but follows
+	// some other window, so the catch-all must not reach it.
+	liveViaOther liveState = iota
+	// liveAttached: explicitly attached, or no opinion and the client has no
+	// attaches at all. The latter is the status catch-all case.
+	liveAttached
+	// liveSuppressed: explicitly detached, or muted. No live delivery at all.
+	liveSuppressed
+)
+
+// liveState reports a client's explicit relationship to a window:
+// liveAttached (explicitly attached, or no opinion and the client has no
+// attaches at all), liveSuppressed (explicitly detached), or liveViaOther.
+//
+// The distinction matters because an absent key is not the same as an explicit
+// false: absent means "no opinion" and lets the catch-all apply, while false
+// means "detached" and suppresses both the window path and the catch-all.
+func (ws *windowState) liveState(sub *Subscriber, key string) liveState {
 	ws.mu.Lock()
-	cw := ws.clients[sub]
-	any := false
-	if cw != nil {
-		for _, attached := range cw.attached {
-			if attached {
-				any = true
-				break
-			}
+	defer ws.mu.Unlock()
+	return liveStateLocked(ws.clients[sub], key)
+}
+
+// liveStateLocked is liveState with ws.mu held.
+func liveStateLocked(cw *clientWindows, key string) liveState {
+	if cw == nil {
+		return liveAttached
+	}
+	if cw.muted[key] {
+		return liveSuppressed
+	}
+	if attached, present := cw.attached[key]; present {
+		if attached {
+			return liveAttached
+		}
+		return liveSuppressed
+	}
+	if hasAnyAttachLocked(cw) {
+		return liveViaOther
+	}
+	return liveAttached
+}
+
+// hasAnyAttachLocked reports whether cw is attached to at least one window,
+// with ws.mu held.
+func hasAnyAttachLocked(cw *clientWindows) bool {
+	if cw == nil {
+		return false
+	}
+	for _, attached := range cw.attached {
+		if attached {
+			return true
 		}
 	}
-	ws.mu.Unlock()
-	return any
+	return false
 }
 
 // deliveringAny returns each subscriber attached to at least one of keys and
@@ -193,6 +248,24 @@ func (ws *windowState) deliveringAny(keys []string) []*Subscriber {
 	}
 	ws.mu.Unlock()
 	return subs
+}
+
+// skipCatchAll reports whether the status catch-all must leave sub alone for a
+// line belonging to keys: sub already got the line directly, explicitly
+// detached or muted one of the line's windows, or follows another window.
+func (ws *windowState) skipCatchAll(sub *Subscriber, keys []string, direct bool) bool {
+	if direct {
+		return true
+	}
+	for _, key := range keys {
+		switch ws.liveState(sub, key) {
+		case liveSuppressed:
+			return true
+		case liveViaOther:
+			return true
+		}
+	}
+	return false
 }
 
 func (ws *windowState) setDisabled(key string, disabled bool) bool {
@@ -246,8 +319,11 @@ func (s *Server) AttachWindow(sub *Subscriber, network, window string) bool {
 	return s.windows.attach(sub, windowKey(network, window))
 }
 
-// DetachWindow stops delivery for a window and freezes its cursor. It reports
-// whether the window was attached.
+// DetachWindow stops live delivery for a window and freezes its cursor, so
+// PlayBuffer resumes from where the client stopped. Detaching is an explicit
+// preference: an absent key means "no opinion" (status catch-all applies),
+// while the explicit false written here suppresses both the window path and the
+// catch-all. It reports whether the window was attached.
 func (s *Server) DetachWindow(sub *Subscriber, network, window string) bool {
 	return s.windows.detach(sub, windowKey(network, window))
 }
@@ -380,6 +456,11 @@ func wildMatch(pattern, name string) bool {
 
 // MuteWindow suppresses live delivery for a window without forgetting its
 // cursor. A muted window can still be replayed explicitly.
+//
+// In this in-memory model mute and detach are behaviourally identical: both
+// mean "do not deliver live, do buffer, let PlayBuffer catch up". They stay
+// separate flags because the wire commands differ and LISTCHANS must still
+// report detach state (a muted window is not shown as detached there).
 func (s *Server) MuteWindow(sub *Subscriber, network, window string, muted bool) {
 	s.windows.mute(sub, windowKey(network, window), muted)
 }
@@ -437,10 +518,11 @@ func (s *Server) BroadcastWindow(netName, window string, seq uint64, line []byte
 
 // BroadcastWindows delivers one live line to the clients attached to any of
 // windows (once, even when a client is attached to several) and to every client
-// with no explicit attach through the status fallback. No client receives it
-// twice. It is the routing entry point for a non-status line.
+// with no opinion through the status catch-all. A client that explicitly
+// detached (or muted) one of windows gets the line live through neither path:
+// it is buffered and PLAYBUFFER is how that client catches up. No client
+// receives it twice. It is the routing entry point for a non-status line.
 func (s *Server) BroadcastWindows(netName string, windows []string, seq uint64, line []byte, ts int64) {
-	_ = seq
 	if len(windows) == 0 {
 		return
 	}
@@ -471,10 +553,7 @@ func (s *Server) BroadcastWindows(netName string, windows []string, seq uint64, 
 		sub.WriteFrom(b, un)
 	}
 	s.hub.BroadcastFromSkip(b, un, func(sub *Subscriber) bool {
-		if attachedSet[sub] {
-			return true
-		}
-		return s.windows.hasAnyAttach(sub)
+		return s.windows.skipCatchAll(sub, keys, attachedSet[sub])
 	})
 	*p = b
 	s.linePool.Put(p)
@@ -550,6 +629,10 @@ func (s *Server) PlayBuffer(sub *Subscriber, network string, windows ...string) 
 		if !ok {
 			return false
 		}
+		// A replay is a played line: advance the cursor so a second PlayBuffer
+		// cannot replay it again. PlayBuffer is the deliberate catch-up path, so
+		// replaying is the same as acknowledging for the client's cursor.
+		s.windows.ack(sub, key, newest)
 	}
 	return true
 }
