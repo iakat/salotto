@@ -137,14 +137,43 @@ func TestDuplicateNumeric(t *testing.T) {
 }
 
 func TestPoolBalance(t *testing.T) {
-	w := New("net", "", 1, time.Now)
+	// Assert the enqueue path itself, not whole-process allocations: the drain
+	// goroutine's formatting allocates, so AllocsPerRun on a draining Writer is
+	// inherently noisy (it flaked ~20% on dev). Block the drain in clock(), fill
+	// the one-slot queue, then measure the drop path. A zero result proves the
+	// slab went back to the pool and no new slab was allocated; Dropped proves
+	// the send was actually rejected. BenchmarkOnLine is the same evidence for
+	// the accepted path (0 B/op, 0 allocs/op).
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	clock := func() time.Time {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-gate
+		return time.Now()
+	}
+	// An empty log_dir with no network subdirectory keeps the startup index pass
+	// from calling clock, so entered/gate unambiguously belong to the drain.
+	w := New("net", t.TempDir(), 1, clock)
 	line := []byte(":x!u@h PRIVMSG #c :hi")
-	allocs := testing.AllocsPerRun(10, func() {
-		w.OnLine(1, line)
+
+	w.OnLine(1, line)
+	<-entered
+	w.OnLine(2, line)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		w.OnLine(3, line)
 	})
+	close(gate)
 	w.Close()
+
 	if allocs != 0 {
-		t.Fatalf("allocs per run = %v, want 0", allocs)
+		t.Fatalf("drop path allocs per run = %v, want 0", allocs)
+	}
+	if w.Dropped() == 0 {
+		t.Fatal("expected drops once the queue was full")
 	}
 }
 

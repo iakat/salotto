@@ -127,7 +127,31 @@ func BuildIndexFile(logPath, idxPath string) error {
 	out.Write(u32buf[:])
 	out.WriteString("1")
 
-	return os.WriteFile(idxPath, out.Bytes(), 0644)
+	// Write atomically: the startup catch-up pass and lazy queries may build the
+	// same index concurrently, and a reader must never see a half-written file.
+	tmp, err := os.CreateTemp(filepath.Dir(idxPath), filepath.Base(idxPath)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(out.Bytes()); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, idxPath); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func BuildIndexForDay(logDir, network, window, day string) error {
@@ -362,12 +386,15 @@ func searchFile(logDir, network, window, day, q string, qwords []string, qterms 
 		return nil
 	}
 	idxPath := logPath + ".idx"
-	// rebuild if needed
-	if fi, err := os.Stat(logPath); err == nil {
-		if ii, err := os.Stat(idxPath); err == nil {
-			if fi.ModTime().After(ii.ModTime()) {
-				_ = BuildIndexFile(logPath, idxPath)
-			}
+	// Build on miss and rebuild when the log is newer. A missing .idx is a cache
+	// miss to fill once, not an error to fall back from silently.
+	fi, err := os.Stat(logPath)
+	if err != nil {
+		return nil
+	}
+	if ii, err := os.Stat(idxPath); err != nil || fi.ModTime().After(ii.ModTime()) {
+		if err := BuildIndexFile(logPath, idxPath); err != nil {
+			return scanFile(logPath, network, window, day, qwords)
 		}
 	}
 	idx, err := LoadIndex(idxPath)

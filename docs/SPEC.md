@@ -59,9 +59,22 @@ writing, always (ZNC makes this optional via `-sanitize`; salotto does it by
 default because a log line with an embedded CR is a corrupt log).
 
 A per-network bounded queue feeds one drain goroutine; `OnLine` performs a
-single non-blocking send and never blocks the socket. A daily index is built at
-day rollover (and lazily on query) using `github.com/blevesearch/vellum`, one
-`.idx` file per log file, next to it. Search endpoint:
+single non-blocking send and never blocks the socket. Daily indexes are built
+with `github.com/blevesearch/vellum`, one `.idx` file per log file, next to it.
+
+Index lifecycle: at writer start (and again on `SetNick`, where the network
+becomes usable) one background pass indexes every log file that already exists
+for every day *before* the current one, skipping any `.idx` that is newer than
+its `.log`. It logs one `Info` line per window with the day and source size. The
+current day is never indexed eagerly: it is incomplete by definition and would
+be rebuilt on every write, so it is indexed lazily on query. The query path
+builds a missing `.idx` (and rebuilds a stale one, using the same `ModTime`
+rule) instead of silently falling back to a full scan; a missing index is a
+cache miss to fill once, not an error. The startup pass and lazy queries may
+build the same index concurrently; the writer writes a temporary file and
+renames it so a reader never sees a partial index.
+
+Search endpoint:
 `GET /v1/log/search?network=&window=&q=&since=&until=&limit=&order=` on its
 own listener `log_listen`. `GET /v1/log/windows?network=` lists windows.
 
@@ -221,6 +234,39 @@ frames straight into the attachment's outbound buffer, and sets `MORE` while
 there is more. A 2 MiB replay of one attachment is 0 allocs because the frames
 are built in a reused stack buffer (`[16]byte` header + copy of the line body
 into the outbound ring — still no allocation, the outbound ring is the arena).
+
+### 6.2.1 Windows and per-client cursors (B2, current implementation)
+
+The bouncer tracks cursors per client **per window**, where a window is the same
+key the log uses: network + window name (`status` for the server window). Only
+the last acknowledged `seq` per client/window is kept, in memory; nothing is
+persisted. A client that is not attached has no cursor and starts at
+`oldest_seq`. `PlayBuffer` is window-scoped: for each requested window it
+replays from `max(oldest_seq, cursor+1)`. If the client's cursor has already
+been dropped by the ring, a `GAP` marker is written first, then the surviving
+lines. The marker is one plain IRC line so the POC's text client can render it:
+
+```
+:<server> GAP <network> <window> <lost_from> <lost_to>
+```
+
+`lost_from` is the first sequence after the client's cursor and `lost_to` is the
+last sequence the ring dropped (`oldest_seq-1`), i.e. the exact range the client
+will never see.
+
+`Attach`/`Detach` state lives next to the cursors: a window can be detached
+(delivery stops, the cursor freezes) or muted (delivery stops, replay still
+possible). Detaching and re-attaching replays exactly what arrived while away.
+`ClearBuffer <window>` hides that window's already-broadcast lines and advances
+every client's cursor past them, so cleared lines are never replayed; it is a
+no-op with a message for an unknown window.
+
+**Honest limitation.** The rings are still one per network, not one per window.
+Per-window cursors index that shared ring, which approximates a per-window split
+without fragmenting it. A very busy window can therefore push a quiet window's
+lines out of the shared ring even though the quiet window's client was caught
+up; that client sees a `GAP` where true per-window rings would have retained the
+lines. One ring per window is a separate, larger change.
 
 ### 6.3 Checkpoint (the trick that keeps the bouncer dumb)
 

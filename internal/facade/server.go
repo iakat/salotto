@@ -111,6 +111,7 @@ type Server struct {
 	log     *slog.Logger
 	hub     *Hub
 	nets    []networkEntry
+	windows *windowState
 	created string
 	active  atomic.Int64
 
@@ -159,6 +160,7 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		cfg:     cfg,
 		log:     cfg.Log,
+		windows: newWindowState(),
 		created: time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 MST"),
 	}
 
@@ -308,6 +310,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	go c.writeLoop()
 	defer func() {
 		s.hub.Remove(sub)
+		s.windows.forget(sub)
 		sub.Close()
 	}()
 

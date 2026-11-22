@@ -2,8 +2,10 @@ package logfile
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +48,12 @@ type Writer struct {
 	// rollover indexing
 	lastDay string
 
+	// indexMu serialises the startup/catch-up index pass with itself and with
+	// any explicit pass. bgMu guards the WaitGroup against Add after Close.
+	indexMu sync.Mutex
+	bgMu    sync.Mutex
+	closed  bool
+
 	done chan struct{}
 	wg   sync.WaitGroup
 }
@@ -71,6 +79,7 @@ func New(network, logDir string, queueDepth int, clock func() time.Time) *Writer
 	}
 	w.tracker.SetOwnNick("") // will be set by 001
 	// allow nick injection via separate field set later; track initial via tracker only
+	w.startIndexPass()
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
@@ -84,7 +93,13 @@ func NewWriter(network, logDir string, queueDepth int, clock func() time.Time) *
 	return New(network, logDir, queueDepth, clock)
 }
 
-func (w *Writer) SetNick(nick string)            { w.nick = nick; w.tracker.SetOwnNick(nick) }
+func (w *Writer) SetNick(nick string) {
+	w.nick = nick
+	w.tracker.SetOwnNick(nick)
+	// SetNick is where the network becomes usable; catch up on any log files
+	// that were written before this process started.
+	w.startIndexPass()
+}
 func (w *Writer) SetHasCap(fn func(string) bool) { w.hasCap = fn }
 func (w *Writer) Tracker() *Tracker              { return w.tracker }
 
@@ -141,6 +156,9 @@ func (w *Writer) Disconnect(server string) {
 func (w *Writer) Dropped() uint64 { return w.dropped.Load() }
 
 func (w *Writer) Close() {
+	w.bgMu.Lock()
+	w.closed = true
+	w.bgMu.Unlock()
 	close(w.done)
 	w.wg.Wait()
 	w.mu.Lock()
@@ -277,6 +295,84 @@ func (w *Writer) indexYesterday(day string) {
 	if w.logDir == "" {
 		return
 	}
+	w.indexDay(day)
+}
+
+// startIndexPass runs the catch-up index pass in the background so neither the
+// constructor nor SetNick blocks on file IO. The pass is idempotent: an index
+// newer than its log file is skipped.
+func (w *Writer) startIndexPass() {
+	if w.logDir == "" {
+		return
+	}
+	w.bgMu.Lock()
+	if w.closed {
+		w.bgMu.Unlock()
+		return
+	}
+	w.wg.Add(1)
+	w.bgMu.Unlock()
+	go func() {
+		defer w.wg.Done()
+		w.indexExisting()
+	}()
+}
+
+// indexExisting builds any missing (or stale) daily indexes for log files that
+// existed before this writer started. It never indexes the current day: that
+// file is incomplete and is indexed lazily on query instead. An up-to-date
+// index is left untouched, so calling this repeatedly is cheap and safe.
+func (w *Writer) indexExisting() {
+	if w.logDir == "" {
+		return
+	}
+	w.indexMu.Lock()
+	defer w.indexMu.Unlock()
+
+	netDir := filepath.Join(w.logDir, w.network)
+	windows, err := os.ReadDir(netDir)
+	if err != nil {
+		return
+	}
+	today := w.clock().Format("2006-01-02")
+	for _, win := range windows {
+		if !win.IsDir() {
+			continue
+		}
+		window := win.Name()
+		dir := filepath.Join(netDir, window)
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".log") {
+				continue
+			}
+			day := strings.TrimSuffix(f.Name(), ".log")
+			if _, err := time.Parse("2006-01-02", day); err != nil {
+				continue
+			}
+			if !dayBefore(day, today) {
+				continue
+			}
+			logPath := filepath.Join(dir, f.Name())
+			idxPath := logPath + ".idx"
+			if fi, err := os.Stat(logPath); err == nil {
+				if ii, err := os.Stat(idxPath); err == nil && !fi.ModTime().After(ii.ModTime()) {
+					continue
+				}
+				if err := BuildIndexFile(logPath, idxPath); err == nil {
+					slog.Info("index built", "network", w.network, "window", window, "day", day, "source_bytes", fi.Size())
+				}
+			}
+		}
+	}
+}
+
+func (w *Writer) indexDay(day string) {
+	w.indexMu.Lock()
+	defer w.indexMu.Unlock()
 	netDir := filepath.Join(w.logDir, w.network)
 	entries, err := os.ReadDir(netDir)
 	if err != nil {
@@ -300,6 +396,18 @@ func (w *Writer) indexYesterday(day string) {
 		}
 		_ = BuildIndexFile(logPath, idxPath)
 	}
+}
+
+func dayBefore(day, today string) bool {
+	d, err := time.Parse("2006-01-02", day)
+	if err != nil {
+		return false
+	}
+	t, err := time.Parse("2006-01-02", today)
+	if err != nil {
+		return false
+	}
+	return d.Before(t)
 }
 
 // sanitizeBody strips CR, LF and C0 control bytes (except tab) from a log body.
