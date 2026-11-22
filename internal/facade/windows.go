@@ -402,12 +402,12 @@ func (s *Server) WindowCursor(sub *Subscriber, network, window string) (uint64, 
 //
 // Routing rule: a line reaches a client at most once. Clients explicitly
 // attached to one of the line's windows get it through BroadcastWindows (the
-// window path); every client with no attach gets it through the status fallback
-// inside BroadcastWindows, which is BroadcastUnattached. Clients attached to
-// any window never receive window lines from that fallback, so a client
-// attached to "status" cannot see a channel line twice. Status lines themselves
-// are not windowed: Broadcast is the status stream and delivers them to
-// everyone, attached or not.
+// window path); every client with no explicit attach gets it through the
+// Broadcast catch-all inside BroadcastWindows. Clients attached to any window
+// never receive window lines from that catch-all, so a client attached to
+// "status" cannot see a channel line twice. Status lines themselves are not
+// windowed: Broadcast is the status stream and delivers them to everyone,
+// attached or not.
 func (s *Server) BroadcastWindow(netName, window string, seq uint64, line []byte, ts int64) {
 	_ = seq
 	key := windowKey(netName, window)
