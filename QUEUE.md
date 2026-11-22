@@ -54,7 +54,7 @@ written here. Nothing gets to be quietly missing.
 | B10 | Buffer playback on attach | `PlayBuffer`, `PlayBuffer` triggers | **partial**: replays whole ring, no window selection |
 | B11 | Clear buffers on demand | `ClearBuffer`, `ClearAllQueryBuffers`, `ClearAllChannelBuffers` | **no** |
 | B12 | Per-channel enable/disable logging-to-buffer | `DisableChan`/`EnableChan` | **no** |
-| B13 | Bind host / user bind host for outbound sockets | `SetBindHost`, `SetUserBindHost` | **no** |
+| B13 | Bind host / user bind host for outbound sockets, **plus `FREEBIND`** | `SetBindHost`/`SetUserBindHost`/`ClearBindHost`/`ClearUserBindHost`/`ShowBindHost` in `src/ClientCommand.cpp`; resolution in `CIRCNetwork::GetBindHost()` (network value, else user value); applied at dial in `CIRCNetwork::Connect` → `Connect(..., GetBindHost(), ...)` | **no** — and it is a *must*, not a nice-to-have (see 1.1.1) |
 | B14 | Trusted server fingerprints (pinning beyond CA) | `AddTrustedServerFingerprint` | **no** |
 | B15 | MOTD control (block/missing) | `modules/block_motd.cpp`, `modules/missingmotd.cpp` | **no** |
 | B16 | Runtime module load/unload | `LoadMod`/`UnloadMod`/`ListMods`/`ReloadMod` | **refuse** (see R3) |
@@ -63,6 +63,143 @@ written here. Nothing gets to be quietly missing.
 **Work estimate for 1.1**: B2 (per-window buffers + per-client cursor), B5
 (runtime network management), B10/B11/B12, B6-EXTERNAL, B13, B14, B15. This is
 the real bouncer backlog; everything below is a feature layer on top.
+
+### 1.1.1 B13 in full: bind host, user bind host, FREEBIND (must have)
+
+This is not a nice-to-have: it is the difference between "the bouncer dials out
+as itself" and "the bouncer dials out as the address the operator owns". ZNC has
+five commands and salottod currently has none.
+
+**ZNC semantics, read from source** (`src/ClientCommand.cpp`,
+`src/IRCNetwork.cpp`, `src/User.cpp`):
+
+| command | scope | meaning |
+|---|---|---|
+| `SetBindHost <host>` | network | source address for this network's outbound connection |
+| `ClearBindHost` | network | forget the network value, fall back to the user value |
+| `SetUserBindHost <host>` | user | default source address for every network of this user |
+| `ClearUserBindHost` | user | forget the user default |
+| `ShowBindHost` | both | print what would actually be used |
+
+Resolution is one function, `CIRCNetwork::GetBindHost()`: **network value if
+non-empty, else user value, else empty** (kernel picks). `SetBindHost` on the
+network is a no-op-with-warning if it equals the user value (line 1546), so the
+network value is only ever an *override*.
+
+`User::IsDenySetBindHost()` exists as an operator policy: with it on,
+`SetBindHost`/`SetUserBindHost` are refused for that user. Keep it — self-service
+means "this user may do it", not "anyone may do anything".
+
+The value is applied at dial time only:
+`CIRCNetwork::Connect` → `Manager.Connect(..., GetBindHost(), ...)` →
+`CZNC::SockClose`/`CConnectBase` bind the local socket before connecting.
+Nothing else uses it; there is no per-listener bind host in ZNC's core (the
+`znc.cpp:1609` comparison is ZNC's own listener config, unrelated).
+
+**FREEBIND is the point.** Without it, `SetBindHost 198.51.100.7` fails with
+`EADDRNOTAVAIL` unless the address is configured on an interface. With
+`IP_FREEBIND` (Linux `setsockopt(IPPROTO_IP, IP_FREEBIND, 1)`, or the global
+`net.ipv4.ip_nonlocal_bind=1`), `bind()` succeeds for any address and the dial
+goes out with that source. Verified on this host, uid 10000, zero capabilities,
+`ip_nonlocal_bind=0`:
+
+```
+$ cc -O1 -o fbhost fb.c && ./fbhost
+BOUND 192.0.2.77:52361 (freebind ok)
+```
+
+That is a per-socket `IP_FREEBIND` doing the work, not a sysctl and not a
+privilege. In Go this is `net.Dialer.Control`:
+
+```go
+d := &net.Dialer{
+    LocalAddr: &net.TCPAddr{IP: bindIP},
+    Control: func(network, address string, c syscall.RawConn) error {
+        var serr error
+        if err := c.Control(func(fd uintptr) {
+            if bindIP.To4() != nil {
+                serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_FREEBIND, 1)
+            } else {
+                serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_FREEBIND, 1)
+            }
+        }); err != nil {
+            return err
+        }
+        return serr
+    },
+}
+```
+
+Note the ordering trap: `Control` runs **after** `socket()` and **before**
+`bind()`, which is exactly where the option must be set. Setting it on the
+`net.TCPConn` after `Dial` is too late and silently does nothing.
+
+**Honest limitation, and it must be in the docs:** `IP_FREEBIND` makes `bind()`
+succeed; it does not make the address *reachable*. The reply packets come back to
+an address the host does not own, so unless the operator has the route (a
+transit/anycast setup, a tunnel, or a NAT that rewrites the source) the connection
+opens and then hangs. So: FREEBIND is supported, and the failure mode when the
+routing is missing is "connects, then no traffic" — say that in the error path
+and in `docs/SPEC.md`, do not pretend it is a magic capability. Also note
+`IP_FREEBIND` needs no privilege, but a port below 1024 in `SetBindHost` (a
+`host:port` form, which ZNC does not support and we should reject) would.
+
+**Config and wire.** Two new fields, mirroring ZNC's split:
+
+```toml
+[[networks]]
+name      = "freebnc"
+bind_host = "198.51.100.7"   # optional; empty = kernel default
+
+[user]
+bind_host = ""               # optional default for every network
+```
+
+Wire commands, same names as ZNC so muscle memory works: `SetBindHost`,
+`ClearBindHost`, `SetUserBindHost`, `ClearUserBindHost`, `ShowBindHost`. All
+require the network/user admin scope; `ShowBindHost` prints the *resolved* value
+and where it came from (`network` / `user` / `kernel`), because otherwise the
+operator cannot tell why the dial is using what it is using. Validation at set
+time: parseable IP literal (v4 or v6), reject a port, reject a hostname (ZNC
+resolves nothing here; a hostname would silently become one address at random).
+`FREEBIND` is always on for a non-empty bind host — no separate flag, because a
+bind host that cannot bind is not a feature.
+
+Tests: resolution order (network > user > kernel), clear-falls-back, denied user
+refused, `EADDRNOTAVAIL` gone with FREEBIND (bind to `192.0.2.77` in a test that
+uses `Control`), and the negative control — without `Control`, the same test
+**must** fail with `EADDRNOTAVAIL`, which is the proof the option is what makes
+it work and not a coincidence of the test host.
+
+### 1.1.2 ident (`:113`) — ZNC's `identfile`, but ours
+
+IRC servers ask `identd` on port 113 "who owns this TCP pair", and refuse or
+mark connections without an answer. ZNC answers this with `modules/identfile.cpp`,
+which works by *rewriting an external ident daemon's spoof file* (`ispell`/
+`oidentd`) — a hack around not owning port 113. We own the process, so we can be
+the ident server.
+
+Refuse the ZNC approach (writing another daemon's config file is a race with a
+process we do not control) and do it directly:
+
+- Listen on `tcp :113` (config `ident_listen = ":113"`, default **off**). Verified
+  we can: uid 10000, `ip_unprivileged_port_start=0`, bind succeeded.
+- RFC 1413 request `<server-port> , <client-port>` → reply
+  `<same pair> : USERID : UNIX : <ident>`. Verified round trip:
+  `6667 , 40123 : USERID : UNIX : salotto`.
+- Answer **only** for pairs we actually opened: the daemon must register
+  `(localAddr:port, remoteAddr:port)` at dial time and delete it on close. Any
+  other query gets `ERROR : NO-USER`. This is the whole safety property — a
+  blanket `USERID` reply is an information leak about every socket on the host.
+- Ident string: config `ident = "salotto"`, default the configured nick of the
+  network that owns the connection. Never the OS user.
+- Timeout 5 s per query, max 2 concurrent queries per connection, no logging of
+  the queried ports beyond a counter (it is metadata about the operator's
+  sessions).
+- If `:113` is taken, log once at startup and continue; ident is not fatal.
+
+This is a bouncer capability, not a module: it belongs in the daemon because the
+knowledge "which sockets did *we* open" only exists there.
 
 ### 1.2 ZNC modules worth having (the 59, triaged)
 
@@ -131,15 +268,19 @@ Mapping:
   `ListNetworks`, `ListServers`, `ListChans`, `ListClients`, `SetBuffer`,
   `Traffic`, `ClearAllBuffers`, `ClearAllChannelBuffers`, `DisableChan`,
   `EnableChan`, `AddServer`, `DelServer`, `MoveChan`, `MoveNetwork`.
-- **Meaningless for us, drop**: `AddPort`/`ClearMOTD`/`ClearUserBindHost`/
-  `SetBindHost`/`SetUserBindHost` — these configure a *shared* IRC listener per
-  user, which is the ZNC deployment model we are not copying; our listener is one
-  process config. `ClearMOTD` is `block_motd`'s toggle.
+- **Must have, and not negotiable** (katia): `SetBindHost`, `ClearBindHost`,
+  `SetUserBindHost`, `ClearUserBindHost`, `ShowBindHost` — plus FREEBIND support.
+  These are the outbound *source address* controls, not listener config; the
+  earlier draft of this file wrongly filed them with `AddPort`. Full design and
+  the FREEBIND mechanism are in §1.1.1. `AddPort` alone stays out: it configures
+  a per-user IRC *listener*, which is the ZNC deployment model we are not copying
+  (one process, one listener config). `ClearMOTD` is `block_motd`'s toggle, kept
+  as B15.
 - **Refuse**: `LoadMod`, `UnloadMod`, `ReloadMod`, `Restart`, `SaveConfig`,
   `Broadcast`, `ListMods`, `ListUsers` (cross-user; no multi-tenant admin over
   IRC — admin lives in the Web UI, per Part 0.3).
 
-So: ~18 commands to implement, 8 dropped by design, 6 refused.
+So: ~22 commands to implement, 1 dropped by design (`AddPort`), 6 refused.
 
 ### 1.4 Bouncer gaps the `log` work exposed
 
@@ -170,6 +311,142 @@ under `client/components/MessageTypes/`, **29** socket events
 (`client/js/socket-events/*.ts`), **29** IRC event handlers on the server
 (`server/plugins/irc-events/*.ts`), auth plugins `local` + `ldap`, storage plugins
 `sqlite` + `text`, and an uploader plugin.
+
+### 2.0 The UI stack: one model, three renderers (charmbracelet, no duplication)
+
+Requirement: TUI via charmbracelet, a Web UI that is **all monospace** and reuses
+the charmbracelet look as much as possible, **without duplicating code**.
+
+The rule that makes that possible: **the UI is a `tea.Model`, and nothing in it
+knows what it is drawing into.** Input arrives as `tea.Msg`, output is a string
+plus ANSI. Three front ends feed the same value:
+
+| front end | input | output | how |
+|---|---|---|---|
+| **SSH TUI** | a real terminal over SSH | terminal | `wish` + `wish/bubbletea.Middleware` on port 2222 |
+| **Web** | browser keystrokes over WebSocket | HTML | call `Update()` ourselves, pass `View()` through ANSI→HTML |
+| **headless** (tests, bots) | synthetic `tea.Msg` | string compare | call `Update()` in a loop |
+
+Verified, not assumed — same `tea.Model`, three drivers, one file of model code:
+
+- `tea.WithInput(io.Reader)` / `tea.WithOutput(io.Writer)` / `WithoutRenderer()`
+  exist in bubbletea v1.3.10, so a `Program` can be driven with no TTY at all.
+- A model driven by hand (`m, _ = m.Update(msg)` … `m.View()`) produces the same
+  string the `Program` would render: `VIEW=\x1b[1;38;5;212m<me>\x1b[0m hi\n> yo`.
+  Same value still satisfies `tea.Model` for a real `Program`.
+- lipgloss v1.1.0 renders a titled bordered box, then
+  `terminal.Render()` (buildkite/terminal-to-html **v3**, `go 1.22`) turns it into
+  HTML with **zero ESC bytes left** and 13 `<span class="term-*">` elements:
+
+```
+<span class="term-bgx99"> </span><span class="term-fgx231 term-bgx99 term-fg1">salotto</span>…
+<span class="term-fgx63">╭──────────────────────────────────────╮</span>
+<span class="term-fgx63">│</span><span class="term-fgx240">20:03:43</span> …
+```
+
+That is the whole trick: **the browser does not get a second UI implementation,
+it gets the terminal rendering.** Monospace is free (it *is* a terminal grid),
+the charmbracelet look is free (it *is* lipgloss), and there is no CSS theme to
+keep in sync because the only CSS is terminal-to-html's 9.8 KB
+`terminal.css` (embedded, 240 `term-fgx*` classes) plus the layout for our own
+chrome around the terminal pane.
+
+**Two traps, both found by probing, both must be avoided:**
+
+1. **24-bit colour is silently dropped.** `terminal-to-html` v3 maps SGR 8-bit
+   (`38;5;n`) to `term-fgx*` classes, but its 24-bit branch is an empty `case`
+   ("outside the scope"). A truecolor lipgloss style therefore renders as
+   unstyled text in the browser. So the daemon sets
+   `lipgloss.SetColorProfile(termenv.ANSI256)`: every style must be expressible
+   in the 256-colour palette. Confirmed: with `TrueColor` the `#DDD` body text
+   lost its colour; with `ANSI256` it becomes `term-fgx188` and survives.
+   Pin this with a test that greps the rendered HTML for `38;2` and fails.
+2. **A daemon has no TTY, so lipgloss would end up with the ASCII profile** and
+   strip all colour before the HTML converter ever sees it. The explicit
+   `SetColorProfile` is what makes the SSH and web outputs *identical*.
+
+**Dependency budget**, one Go module, all `go 1.23`-or-lower so the existing
+`go 1.24.0` toolchain is enough: `bubbletea v1.3.10`, `lipgloss v1.1.0`,
+`bubbles v0.21.1`, `wish v1.4.7`, `charmbracelet/ssh`, `terminal-to-html/v3
+v3.14.0`, plus the already-present `vellum`. That is the whole UI stack: about
+seven modules, no Node, no bundler, no second language, no `npm audit`.
+
+The browser side is then thin enough to be honest about: one WebSocket that
+speaks the existing `salotto.v1` frames, one `<pre>` target, a keystroke encoder
+and a resize observer. It is glue, not a client — and it is the same reason
+`docs/SPEC.md` §13 already says the client is transport-agnostic.
+
+### 2.0.1 PWA, first class
+
+The Web UI ships as an installable PWA from the first release, not bolted on:
+
+- `manifest.webmanifest`: name `salotto`, `display: standalone`, monospace-only
+  icon (a glyph, not a photo), theme colour = the terminal background.
+- **Service worker**: cache the shell (HTML, `terminal.css`, the ~30 KB glue JS,
+  the icon set) so the app opens instantly and shows the **cached scrollback**
+  read-only when the network is down, with a banner saying it is stale. It must
+  never pretend to be connected: sending while offline is disabled, not queued
+  silently.
+- **No offline mutation.** A bouncer with a queue of unsent commands that fire
+  hours later is a footgun; show the failure instead.
+- **Web Push** (W7) is the only reason a service worker does work in the
+  background, and it stays off by default with VAPID keys generated by the
+  daemon on first use.
+- Install prompt handled explicitly: no interstitial, just a menu item.
+- iOS quirk to document: no push without "Add to Home Screen", so the UI must
+  detect standalone mode and say so instead of offering a button that cannot
+  work.
+
+### 2.0.2 Self-service
+
+"Self-service" is a bouncer requirement, not a web-UI nicety: a user must be able
+to create their own networks, channels, bind hosts and settings without the
+operator editing a file, and without becoming an admin.
+
+- **OIDC login** (`docs/SPEC.md` §8 already specifies it) → a salotto user record
+  keyed by `iss` + `sub`, created on first login. No password store of ours.
+- First login creates a **user** with no networks and a landing screen whose only
+  affordance is "add a network".
+- Per-user limits, configurable and enforced server-side: networks, channels per
+  network, buffer memory, upload bytes, log retention. Limits are the operator's
+  policy; hitting one is a clear message, not a silent failure.
+- Everything ZNC exposes as a per-user command is available here: `SetBindHost`
+  (subject to `IsDenySetBindHost`), `SetUserBindHost`, nick/altnick/ident/realname,
+  SASL credentials, quit message, auto-join list, per-channel buffer on/off.
+- **Secrets live server-side and are write-only over the wire**: SASL passwords,
+  server passwords and ident strings are `PUT`-able and never `GET`-able, only
+  shown as `set`/`unset`. (The same rule as this repo's other work: a password
+  that can be read back is a password that leaks through a screenshot.)
+- **Deleting a user deletes their logs and uploads**, and says exactly how many
+  files that is before doing it. No "orphaned data" surprise.
+- No admin escalation path: a user cannot grant themselves `bnc.admin`; that is
+  an operator action in the config file or in the admin panel (§2.3).
+
+### 2.0.3 File uploads
+
+IRC has no file transfer that survives a bouncer well, so uploads are ours:
+paste a file, get a URL, and the URL is posted to the channel as a normal
+message.
+
+- Storage: a directory per user under `upload_dir`, files named by
+  content-addressed hash, never by the client-supplied name (that name is
+  metadata only). One metadata row per file: size, MIME, uploader, channel,
+  timestamp, expiry.
+- Limits: per-file and per-user-total quotas, both configurable; quota check
+  happens on the streaming write, not after, so a huge upload cannot fill the
+  disk before being rejected.
+- Content policy, explicit: no executable MIME types served inline, always
+  `Content-Disposition: attachment` unless the type is in a small allowlist
+  (image/png, image/jpeg, image/gif, image/webp, text/plain, application/pdf),
+  `X-Content-Type-Options: nosniff` always, MIME sniffed from bytes and
+  disagreeing with the extension → attachment + a warning to the uploader.
+- Serving: opaque unguessable ID, no directory listing, `Cache-Control: private`,
+  and **expiry is the default** (e.g. 30 days, configurable, `0` = never). A
+  bouncer that silently becomes permanent public file hosting is a liability.
+- Deleting a message does not delete the file (a bouncer must not lose data), but
+  the file list is per-user and visible, so it can be deleted deliberately.
+- The upload goes over the same authenticated session, not a separate token
+  scheme, so revocation is one action.
 
 ### 2.1 What we build, in order
 
@@ -222,8 +499,12 @@ Scope, deliberately small:
 - **Admin panel surfaces**: networks and their connection state; sessions and
   attached clients with the ability to detach; buffer sizes and clear; per-user
   limits within the deployment ceiling; log index health (files, index age,
-  rebuild); daemon version and uptime. **No** module loading, **no** arbitrary
-  config editing, **no** shell, **no** restart button.
+  rebuild); **bind-host resolution per network (and whether FREEBIND is actually
+  in effect — the resolved value plus the origin, §1.1.1)**; **ident listener
+  state (`:113` bound or not, query counter, last refusal reason, §1.1.2)**;
+  **upload storage usage per user and expiry sweep status (§2.0.3)**; daemon
+  version and uptime. **No** module loading, **no** arbitrary config editing,
+  **no** shell, **no** restart button.
 - **Audit**: every admin action appends a line to an admin log with actor `sub`,
   action, target, result, timestamp. Admin actions are the one thing a bouncer
   must be able to answer "who did that" about.
@@ -271,21 +552,28 @@ Two more principles, beyond the list:
 Dependency order, not priority-by-excitement. Each line is roughly one milestone.
 
 1. **Finish `lane/zlog`** — ZNC-format logs, index, search endpoint. *(in flight)*
-2. **B2**: per-window buffers, per-client cursors, `GAP` on cursor loss
+2. **B13 + FREEBIND + ident** (§1.1.1, §1.1.2). Small, self-contained, and
+   nothing else depends on it — but it changes how connections are made, so it
+   must land before anything else touches the dial path.
+3. **B2**: per-window buffers, per-client cursors, `GAP` on cursor loss
    (`docs/SPEC.md` §6 already specifies it). Everything else in the client needs
    this.
-3. **B5 + B10–B12**: runtime networks, buffer playback per window, clear,
+4. **B5 + B10–B12**: runtime networks, buffer playback per window, clear,
    enable/disable per channel.
-4. **OIDC + tickets** (`docs/SPEC.md` §8) — the gate for any Web UI.
-5. **W1–W3**: WebSocket transport, client state engine, rendering. First usable
-   web UI.
-6. **W10 + §2.3**: admin panel and audit log.
-7. **B6-EXTERNAL, B13, B14, B15** and the `Keep — implement` module set.
-8. **W4–W9**: search UI, previews (safely), uploads, push, typing/mentions,
-   themes.
-9. **Anti-abuse** (`fail2ban`, `ctcpflood`, `flooddetach`) if the deployment is
-   ever exposed beyond its owner.
-10. **Deferred backlog** (§1.2) one item at a time, each with its motivating
+5. **UI stack skeleton** (§2.0): the `tea.Model` crate, `wish` SSH listener, and
+   the ANSI→HTML path proven end to end on one screen. Do this *before* OIDC, so
+   the model's shape is set by a rendering that already works in both places.
+6. **OIDC + tickets** (`docs/SPEC.md` §8) and **self-service** (§2.0.2) — the gate
+   for any Web UI.
+7. **W1–W3**: WebSocket transport, client state engine, rendering. First usable
+   web UI, and the PWA shell (§2.0.1) with it.
+8. **W10 + §2.3**: admin panel and audit log.
+9. **B6-EXTERNAL, B14, B15** and the `Keep — implement` module set.
+10. **W4–W9**: search UI, previews (safely), **uploads (§2.0.3)**, push,
+    typing/mentions, themes.
+11. **Anti-abuse** (`fail2ban`, `ctcpflood`, `flooddetach`) if the deployment is
+    ever exposed beyond its owner.
+12. **Deferred backlog** (§1.2) one item at a time, each with its motivating
     behaviour.
 
 ### What "done" means for parity
