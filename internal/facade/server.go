@@ -400,6 +400,12 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleClearAllBuffers(rest, windowQueries)
 	case ircline.IsVerb(rest, "CLEARALLBUFFERS"):
 		return c.handleClearAllBuffers(rest, windowAll)
+	case ircline.IsVerb(rest, "DISABLECHAN"):
+		return c.handleDisableChan(rest, true)
+	case ircline.IsVerb(rest, "ENABLECHAN"):
+		return c.handleDisableChan(rest, false)
+	case ircline.IsVerb(rest, "LISTCHANS"):
+		return c.handleListChans()
 	default:
 		return c.forward(line)
 	}

@@ -183,3 +183,100 @@ func (c *client) handleClearAllBuffers(rest []byte, kind windowKind) bool {
 		return c.status("All buffers have been cleared")
 	}
 }
+
+func (c *client) handleDisableChan(rest []byte, disable bool) bool {
+	network, ok := c.requireNetwork()
+	if !ok {
+		return false
+	}
+	verb := "DisableChan"
+	if !disable {
+		verb = "EnableChan"
+	}
+	arg := string(ircline.Params(rest))
+	if arg == "" {
+		return c.status("Usage: " + verb + " <#chans>")
+	}
+
+	matches := c.srv.matchWindows(network, arg)
+	changed := 0
+	for _, window := range matches {
+		if c.srv.SetDisabled(network, window, disable) {
+			changed++
+		}
+	}
+	if !c.status(plural(len(matches),
+		fmt.Sprintf("There was %d channel matching [%s]", len(matches), arg),
+		fmt.Sprintf("There were %d channels matching [%s]", len(matches), arg))) {
+		return false
+	}
+	if disable {
+		return c.status(plural(changed,
+			fmt.Sprintf("Disabled %d channel", changed),
+			fmt.Sprintf("Disabled %d channels", changed)))
+	}
+	return c.status(plural(changed,
+		fmt.Sprintf("Enabled %d channel", changed),
+		fmt.Sprintf("Enabled %d channels", changed)))
+}
+
+// handleListChans prints one row per known window plus the summary ZNC prints.
+// "status" is reported: it is a window, but it is neither a channel nor a
+// query. The summary counts each window once, by the Status column it displays
+// (ZNC's own counters overlap when a channel is both detached and disabled).
+func (c *client) handleListChans() bool {
+	network, ok := c.requireNetwork()
+	if !ok {
+		return false
+	}
+	names := c.srv.windows.knownWindows(network)
+	if len(names) == 0 {
+		return c.status("There are no channels defined.")
+	}
+
+	headers := [2]string{"Name", "Status"}
+	width := [2]int{len(headers[0]), len(headers[1])}
+	rows := make([][2]string, 0, len(names))
+	joined, detached, disabled := 0, 0, 0
+	for _, name := range names {
+		var status string
+		switch {
+		case c.srv.Disabled(network, name):
+			status = "Disabled"
+			disabled++
+		case c.srv.WindowAttached(c.sub, network, name):
+			status = "Joined"
+			joined++
+		default:
+			status = "Detached"
+			detached++
+		}
+		row := [2]string{name, status}
+		for i := range row {
+			if len(row[i]) > width[i] {
+				width[i] = len(row[i])
+			}
+		}
+		rows = append(rows, row)
+	}
+
+	sep := "+-" + strings.Repeat("-", width[0]) + "-+-" + strings.Repeat("-", width[1]) + "-+"
+	line := func(a, b string) string {
+		return "| " + a + strings.Repeat(" ", width[0]-len(a)) +
+			" | " + b + strings.Repeat(" ", width[1]-len(b)) + " |"
+	}
+
+	if !c.status(sep) || !c.status(line(headers[0], headers[1])) || !c.status(sep) {
+		return false
+	}
+	for _, row := range rows {
+		if !c.status(line(row[0], row[1])) {
+			return false
+		}
+	}
+	if !c.status(sep) {
+		return false
+	}
+	return c.status(fmt.Sprintf("Total: %d, Joined: %d, Detached: %d, Disabled: %d",
+		len(names), joined, detached, disabled))
+}

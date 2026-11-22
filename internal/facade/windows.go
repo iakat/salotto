@@ -39,17 +39,19 @@ func newClientWindows() *clientWindows {
 // ring, so replay for a window is an approximation: a busy window can push a
 // quiet window's lines out before the quiet window's client reads them.
 type windowState struct {
-	mu      sync.Mutex
-	clients map[*Subscriber]*clientWindows
-	known   map[string]bool
-	floor   map[string]uint64
+	mu       sync.Mutex
+	clients  map[*Subscriber]*clientWindows
+	known    map[string]bool
+	disabled map[string]bool
+	floor    map[string]uint64
 }
 
 func newWindowState() *windowState {
 	return &windowState{
-		clients: make(map[*Subscriber]*clientWindows),
-		known:   make(map[string]bool),
-		floor:   make(map[string]uint64),
+		clients:  make(map[*Subscriber]*clientWindows),
+		known:    make(map[string]bool),
+		disabled: make(map[string]bool),
+		floor:    make(map[string]uint64),
 	}
 }
 
@@ -153,6 +155,36 @@ func (ws *windowState) forget(sub *Subscriber) {
 	ws.mu.Unlock()
 }
 
+func (ws *windowState) setDisabled(key string, disabled bool) bool {
+	ws.mu.Lock()
+	ws.known[key] = true
+	was := ws.disabled[key]
+	if disabled {
+		ws.disabled[key] = true
+	} else {
+		delete(ws.disabled, key)
+	}
+	ws.mu.Unlock()
+	return was != disabled
+}
+
+func (ws *windowState) isDisabled(key string) bool {
+	ws.mu.Lock()
+	disabled := ws.disabled[key]
+	ws.mu.Unlock()
+	return disabled
+}
+
+func (ws *windowState) isAttached(sub *Subscriber, key string) bool {
+	ws.mu.Lock()
+	var attached bool
+	if cw := ws.clients[sub]; cw != nil {
+		attached = cw.attached[key]
+	}
+	ws.mu.Unlock()
+	return attached
+}
+
 func (ws *windowState) knownWindows(network string) []string {
 	prefix := network + "/"
 	ws.mu.Lock()
@@ -180,6 +212,24 @@ func (s *Server) DetachWindow(sub *Subscriber, network, window string) bool {
 	return s.windows.detach(sub, windowKey(network, window))
 }
 
+// SetDisabled sets the not-buffered flag for a window. ZNC's flag also stops
+// the channel being re-joined after a reconnect; we do not manage joins at
+// runtime, so the observable effect here is "not buffered". It reports whether
+// the flag changed.
+func (s *Server) SetDisabled(network, window string, disabled bool) bool {
+	return s.windows.setDisabled(windowKey(network, window), disabled)
+}
+
+// Disabled reports whether a window is not buffered.
+func (s *Server) Disabled(network, window string) bool {
+	return s.windows.isDisabled(windowKey(network, window))
+}
+
+// WindowAttached reports whether sub is attached to a window.
+func (s *Server) WindowAttached(sub *Subscriber, network, window string) bool {
+	return s.windows.isAttached(sub, windowKey(network, window))
+}
+
 // Known reports whether a window has ever been seen for this network.
 func (s *Server) Known(network, window string) bool {
 	key := windowKey(network, window)
@@ -189,9 +239,12 @@ func (s *Server) Known(network, window string) bool {
 	return known
 }
 
-// BufferEmpty reports whether a window has nothing to replay: the shared ring
-// has no lines, or a clear floor hides everything.
+// BufferEmpty reports whether a window has nothing to replay: it is disabled,
+// the shared ring has no lines, or a clear floor hides everything.
 func (s *Server) BufferEmpty(network, window string) bool {
+	if s.Disabled(network, window) {
+		return true
+	}
 	ne := s.network(network)
 	if ne == nil {
 		return true
@@ -328,6 +381,9 @@ func (s *Server) PlayBuffer(sub *Subscriber, network string, windows ...string) 
 
 	for _, window := range windows {
 		key := windowKey(network, window)
+		if s.windows.isDisabled(key) {
+			continue
+		}
 
 		oldest := ne.net.Oldest()
 		newest := ne.net.Newest()
