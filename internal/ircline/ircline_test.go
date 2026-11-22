@@ -244,7 +244,9 @@ func TestNoAllocations(t *testing.T) {
 		}
 	}
 
-	if got := testing.AllocsPerRun(1000, f); got != 0 {
+	got := testing.AllocsPerRun(1000, f)
+	t.Logf("allocations per run = %v", got)
+	if got != 0 {
 		t.Fatalf("allocations per run = %v, want 0", got)
 	}
 }

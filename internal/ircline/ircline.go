@@ -27,6 +27,9 @@ func Tags(line []byte) (tags, rest []byte) {
 // or nil. key is compared case-insensitively. Handles the value-less tag form
 // ("key" with no '='), returning an empty non-nil slice in that case.
 func TagValue(tags, key []byte) []byte {
+	if len(key) == 0 {
+		return nil
+	}
 	i := 0
 	for i <= len(tags) {
 		j := i

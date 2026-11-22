@@ -1,5 +1,7 @@
 package ring
 
+import "sync"
+
 type segment struct {
 	data    []byte
 	offsets []int
@@ -10,6 +12,7 @@ type segment struct {
 }
 
 type Ring struct {
+	mu         sync.RWMutex
 	segs       []segment
 	n          int
 	segSize    int
@@ -51,6 +54,8 @@ func (r *Ring) Append(line []byte) uint64 {
 }
 
 func (r *Ring) AppendStamp(line []byte, ts int64) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	n := len(line)
 	truncated := false
 	if n > 65535 {
@@ -112,6 +117,8 @@ func (r *Ring) calcOldest() uint64 {
 }
 
 func (r *Ring) Stamp(seq uint64) (int64, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	s, idx, ok := r.locate(seq)
 	if !ok {
 		return 0, false
@@ -120,6 +127,8 @@ func (r *Ring) Stamp(seq uint64) (int64, bool) {
 }
 
 func (r *Ring) Truncated(seq uint64) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	s, idx, ok := r.locate(seq)
 	if !ok {
 		return false
@@ -144,6 +153,8 @@ func (r *Ring) locate(seq uint64) (*segment, int, bool) {
 }
 
 func (r *Ring) Replay(from uint64, emit func(seq uint64, line []byte) bool) (missing uint64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if r.newest == 0 {
 		return 0
 	}
@@ -203,14 +214,20 @@ func (r *Ring) Replay(from uint64, emit func(seq uint64, line []byte) bool) (mis
 }
 
 func (r *Ring) Oldest() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.oldest
 }
 
 func (r *Ring) Newest() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.newest
 }
 
 func (r *Ring) Len() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if r.newest == 0 {
 		return 0
 	}
@@ -218,5 +235,7 @@ func (r *Ring) Len() uint64 {
 }
 
 func (r *Ring) Bytes() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.bytes
 }
