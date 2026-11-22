@@ -53,7 +53,10 @@ salottod keeps ZNC `log` module parity for log files only. Log path template
 with `/` and `\` replaced by `-`. One line per event, `[%H:%M:%S] ` + body,
 appended and `\n`-terminated. Bodies and fan-out match ZNC exactly, with one
 documented deviation: a QUIT or NICK change for a nick sharing no channel is
-written to the `<network>/status/` window instead of being dropped.
+written to the `<network>/status/` window instead of being dropped. Bodies are
+sanitized: `\r`, `\n` and C0 control bytes (except `\t`) are stripped before
+writing, always (ZNC makes this optional via `-sanitize`; salotto does it by
+default because a log line with an embedded CR is a corrupt log).
 
 A per-network bounded queue feeds one drain goroutine; `OnLine` performs a
 single non-blocking send and never blocks the socket. A daily index is built at
