@@ -275,7 +275,13 @@ func parsePair(line []byte) (Pair, bool) {
 		i++
 	}
 	cp, ok := port()
-	if !ok || i != len(line) {
+	if !ok {
+		return Pair{}, false
+	}
+	for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+		i++
+	}
+	if i != len(line) {
 		return Pair{}, false
 	}
 	return Pair{ServerPort: sp, ClientPort: cp}, true
