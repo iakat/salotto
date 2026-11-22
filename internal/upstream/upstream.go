@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,11 +30,17 @@ type Config struct {
 	// OnLine is called for every line stored in the ring. The line slice is
 	// only valid for the duration of the call: it aliases an internal read
 	// buffer, so copy it if it is retained.
-	OnLine     func(seq uint64, line []byte)
-	Log        *slog.Logger
-	Dialer     *net.Dialer
-	BackoffMin time.Duration
-	BackoffMax time.Duration
+	OnLine func(seq uint64, line []byte)
+	// OnSend is called for every line sent to the network via Send.
+	OnSend func(line []byte)
+	// OnConnect is called after successful registration.
+	OnConnect func()
+	// OnDisconnect is called when the connection drops.
+	OnDisconnect func()
+	Log          *slog.Logger
+	Dialer       *net.Dialer
+	BackoffMin   time.Duration
+	BackoffMax   time.Duration
 }
 
 // State is the current connection state.
@@ -82,6 +89,9 @@ type Conn struct {
 	mu   sync.Mutex
 	regC chan struct{}
 
+	capsMu sync.RWMutex
+	caps   map[string]bool
+
 	freeSlabs  chan *slab
 	writeSlabs chan *slab
 }
@@ -127,6 +137,7 @@ func New(cfg Config) (*Conn, error) {
 		log:        cfg.Log,
 		dialer:     cfg.Dialer,
 		regC:       make(chan struct{}),
+		caps:       make(map[string]bool),
 		freeSlabs:  make(chan *slab, slabCount),
 		writeSlabs: make(chan *slab, slabCount),
 	}
@@ -141,6 +152,37 @@ func (c *Conn) State() State     { return State(c.state.Load()) }
 func (c *Conn) Attempts() uint64 { return c.attempts.Load() }
 func (c *Conn) LinesIn() uint64  { return c.linesIn.Load() }
 func (c *Conn) LinesOut() uint64 { return c.linesOut.Load() }
+
+func (c *Conn) HasCap(name string) bool {
+	c.capsMu.RLock()
+	defer c.capsMu.RUnlock()
+	return c.caps[strings.ToLower(name)]
+}
+
+func (c *Conn) SetCaps(caps []string) {
+	m := make(map[string]bool, len(caps))
+	for _, cap := range caps {
+		name := cap
+		if i := strings.IndexByte(name, '='); i >= 0 {
+			name = name[:i]
+		}
+		m[strings.ToLower(name)] = true
+	}
+	c.capsMu.Lock()
+	c.caps = m
+	c.capsMu.Unlock()
+}
+
+func (c *Conn) ServerString() string {
+	host, port, err := net.SplitHostPort(c.cfg.Addr)
+	if err != nil {
+		return c.cfg.Addr
+	}
+	if c.cfg.TLS {
+		return host + " +" + port
+	}
+	return host + " " + port
+}
 
 // Registered returns a channel that is closed when the current (or next)
 // registration succeeds. A fresh channel is installed after each success.
@@ -171,6 +213,9 @@ func (c *Conn) Send(line []byte) error {
 	case StateRegistered:
 	default:
 		return ErrNotRegistered
+	}
+	if c.cfg.OnSend != nil {
+		c.cfg.OnSend(line)
 	}
 	return c.enqueue(line)
 }

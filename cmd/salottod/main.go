@@ -21,6 +21,7 @@ import (
 
 	"github.com/iakat/salotto/internal/config"
 	"github.com/iakat/salotto/internal/facade"
+	"github.com/iakat/salotto/internal/logfile"
 	"github.com/iakat/salotto/internal/ring"
 	"github.com/iakat/salotto/internal/upstream"
 )
@@ -50,10 +51,11 @@ func (n *networkAdapter) Bytes() int     { return n.ring.Bytes() }
 func (n *networkAdapter) Stamp(seq uint64) (int64, bool) { return n.ring.Stamp(seq) }
 
 type networkRuntime struct {
-	name string
-	addr string
-	conn *upstream.Conn
-	ring *ring.Ring
+	name   string
+	addr   string
+	conn   *upstream.Conn
+	ring   *ring.Ring
+	writer *logfile.Writer
 }
 
 func main() {
@@ -96,6 +98,18 @@ func run() int {
 		logger.Error("invalid stats_listen", "addr", cfg.StatsListen, "err", err)
 		return 1
 	}
+	if err := validateStatsAddr(cfg.LogListen); err != nil {
+		// log_listen may be non-loopback; only validate host:port syntax here
+		host, _, err2 := net.SplitHostPort(cfg.LogListen)
+		if cfg.LogListen != "" && (err2 != nil || host == "") {
+			logger.Error("invalid log_listen", "addr", cfg.LogListen, "err", err2)
+			return 1
+		}
+	}
+	if cfg.LogListen != "" && !isLoopbackAddr(cfg.LogListen) && cfg.LogToken == "" {
+		logger.Error("log_listen is non-loopback but log_token is empty")
+		return 1
+	}
 
 	start := time.Now()
 
@@ -107,6 +121,11 @@ func run() int {
 		nc := cfg.Networks[i]
 		netName := nc.Name
 		r := ring.New(cfg.RingSegments, cfg.RingSegmentSize)
+
+		var serverStr string
+		w := logfile.New(netName, cfg.LogDir, cfg.LogQueue, time.Now)
+		w.SetNick(nc.Nick)
+		w.SetServer(nc.Addr)
 
 		ucfg := upstream.Config{
 			Name:               netName,
@@ -125,6 +144,16 @@ func run() int {
 				if srv != nil {
 					srv.Broadcast(netName, seq, line, time.Now().UnixNano())
 				}
+				w.OnLine(seq, line)
+			},
+			OnSend: func(line []byte) {
+				w.OnSend(line)
+			},
+			OnConnect: func() {
+				w.Connect(serverStr)
+			},
+			OnDisconnect: func() {
+				w.Disconnect(serverStr)
 			},
 		}
 		if ucfg.RealName == "" {
@@ -135,12 +164,16 @@ func run() int {
 			logger.Error("upstream config invalid", "network", netName, "err", err)
 			return 1
 		}
+		serverStr = conn.ServerString()
+		w.SetServer(serverStr)
+		w.SetHasCap(conn.HasCap)
 
 		runtimes = append(runtimes, &networkRuntime{
-			name: netName,
-			addr: nc.Addr,
-			conn: conn,
-			ring: r,
+			name:   netName,
+			addr:   nc.Addr,
+			conn:   conn,
+			ring:   r,
+			writer: w,
 		})
 		var n facade.Network = &networkAdapter{name: netName, conn: conn, ring: r}
 		networks[netName] = &n
@@ -204,6 +237,23 @@ func run() int {
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 	}
+	var logLn net.Listener
+	var logSrv *http.Server
+	if cfg.LogListen != "" {
+		logLn, err = net.Listen("tcp", cfg.LogListen)
+		if err != nil {
+			_ = plainLn.Close()
+			if tlsRaw != nil {
+				_ = tlsRaw.Close()
+			}
+			logger.Error("log listen failed", "addr", cfg.LogListen, "err", err)
+			return 1
+		}
+		logSrv = &http.Server{
+			Handler:           logfile.SearchHandler(cfg.LogDir, cfg.LogToken),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -251,6 +301,18 @@ func run() int {
 		}()
 		logger.Info("stats listening", "addr", statsLn.Addr().String())
 	}
+	if logSrv != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := logSrv.Serve(logLn); err != nil &&
+				!errors.Is(err, http.ErrServerClosed) &&
+				!errors.Is(err, net.ErrClosed) {
+				logger.Error("log serve failed", "addr", logLn.Addr().String(), "err", err)
+			}
+		}()
+		logger.Info("log listening", "addr", logLn.Addr().String())
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -259,6 +321,11 @@ func run() int {
 
 	cancel()
 	logger.Info("shutting down")
+	for _, rt := range runtimes {
+		if rt.writer != nil {
+			rt.writer.Close()
+		}
+	}
 
 	_ = plainLn.Close()
 	if tlsRaw != nil {
@@ -267,6 +334,11 @@ func run() int {
 	if statsSrv != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = statsSrv.Shutdown(shutdownCtx)
+		shutdownCancel()
+	}
+	if logSrv != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = logSrv.Shutdown(shutdownCtx)
 		shutdownCancel()
 	}
 
@@ -297,6 +369,18 @@ func parseLogLevel(value string) (slog.Level, error) {
 	default:
 		return 0, fmt.Errorf("invalid log level %q (want debug, info, warn or error)", value)
 	}
+}
+
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func validateStatsAddr(addr string) error {

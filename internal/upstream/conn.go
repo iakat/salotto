@@ -79,6 +79,10 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 
 	c.setState(StateRegistered)
 
+	if c.cfg.OnConnect != nil {
+		c.cfg.OnConnect()
+	}
+
 	for _, ch := range c.cfg.Channels {
 		if err := c.enqueue([]byte("JOIN " + ch)); err != nil {
 			close(stop)
@@ -91,6 +95,10 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 	c.markRegistered()
 
 	err = c.readLoop(br, scratch)
+
+	if c.cfg.OnDisconnect != nil {
+		c.cfg.OnDisconnect()
+	}
 
 	close(stop)
 	conn.Close()

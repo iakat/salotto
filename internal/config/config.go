@@ -36,6 +36,10 @@ type Config struct {
 	TLSKey          string
 	ServerName      string
 	StatsListen     string
+	LogDir          string
+	LogQueue        int
+	LogListen       string
+	LogToken        string
 	RingSegments    int
 	RingSegmentSize int
 	MaxClients      int
@@ -49,6 +53,7 @@ func Default() *Config {
 		Listen:          "127.0.0.1:6667",
 		ServerName:      "salotto",
 		StatsListen:     "127.0.0.1:6668",
+		LogQueue:        4096,
 		RingSegments:    8,
 		RingSegmentSize: 262144,
 		MaxClients:      32,
@@ -85,6 +90,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RingSegmentSize < minRingSegmentSize {
 		return fmt.Errorf("ring_segment_size must be at least %d", minRingSegmentSize)
+	}
+	if c.LogQueue <= 0 {
+		c.LogQueue = 4096
 	}
 	if c.TLSListen != "" && c.TLSCert == "" {
 		return errors.New("tls_cert is required when tls_listen is set")
@@ -161,6 +169,14 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.ServerName, err = parseString(value)
 	case "stats_listen":
 		c.StatsListen, err = parseString(value)
+	case "log_dir":
+		c.LogDir, err = parseString(value)
+	case "log_queue":
+		c.LogQueue, err = parseInt(value)
+	case "log_listen":
+		c.LogListen, err = parseString(value)
+	case "log_token":
+		c.LogToken, err = parseString(value)
 	case "ring_segments":
 		c.RingSegments, err = parseInt(value)
 	case "ring_segment_size":
