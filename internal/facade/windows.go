@@ -230,6 +230,18 @@ func (s *Server) WindowAttached(sub *Subscriber, network, window string) bool {
 	return s.windows.isAttached(sub, windowKey(network, window))
 }
 
+// WindowStats returns the number of known windows for a network and how many of
+// them are disabled.
+func (s *Server) WindowStats(network string) (known, disabled int) {
+	names := s.windows.knownWindows(network)
+	for _, name := range names {
+		if s.Disabled(network, name) {
+			disabled++
+		}
+	}
+	return len(names), disabled
+}
+
 // Known reports whether a window has ever been seen for this network.
 func (s *Server) Known(network, window string) bool {
 	key := windowKey(network, window)

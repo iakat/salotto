@@ -499,6 +499,9 @@ func statsHandler(start time.Time, runtimes []*networkRuntime, hub *facade.Hub, 
 			fmt.Fprintf(&b, "net.%s.ring_oldest=%d\n", rt.name, rt.ring.Oldest())
 			fmt.Fprintf(&b, "net.%s.ring_newest=%d\n", rt.name, rt.ring.Newest())
 			fmt.Fprintf(&b, "net.%s.ring_bytes=%d\n", rt.name, rt.ring.Bytes())
+			known, disabled := srv.WindowStats(rt.name)
+			fmt.Fprintf(&b, "net.%s.windows_known=%d\n", rt.name, known)
+			fmt.Fprintf(&b, "net.%s.windows_disabled=%d\n", rt.name, disabled)
 		}
 		if identEnabled {
 			fmt.Fprintf(&b, "ident.enabled=1\n")
