@@ -155,6 +155,46 @@ func (ws *windowState) forget(sub *Subscriber) {
 	ws.mu.Unlock()
 }
 
+// hasAnyAttach reports whether sub is attached to at least one window. The
+// status fallback uses it to keep clients that asked for window delivery off
+// the catch-all stream.
+func (ws *windowState) hasAnyAttach(sub *Subscriber) bool {
+	ws.mu.Lock()
+	cw := ws.clients[sub]
+	any := false
+	if cw != nil {
+		for _, attached := range cw.attached {
+			if attached {
+				any = true
+				break
+			}
+		}
+	}
+	ws.mu.Unlock()
+	return any
+}
+
+// deliveringAny returns each subscriber attached to at least one of keys and
+// not muted on it, once per subscriber, in map order.
+func (ws *windowState) deliveringAny(keys []string) []*Subscriber {
+	ws.mu.Lock()
+	seen := make(map[*Subscriber]bool, len(ws.clients))
+	var subs []*Subscriber
+	for sub, cw := range ws.clients {
+		for _, key := range keys {
+			if cw.attached[key] && !cw.muted[key] {
+				seen[sub] = true
+				break
+			}
+		}
+		if seen[sub] {
+			subs = append(subs, sub)
+		}
+	}
+	ws.mu.Unlock()
+	return subs
+}
+
 func (ws *windowState) setDisabled(key string, disabled bool) bool {
 	ws.mu.Lock()
 	ws.known[key] = true
@@ -359,6 +399,15 @@ func (s *Server) WindowCursor(sub *Subscriber, network, window string) (uint64, 
 // BroadcastWindow delivers one live line to the clients attached to a window.
 // It is additive: Broadcast keeps its broadcast-to-everyone behaviour for the
 // POC client path, which does not negotiate windows.
+//
+// Routing rule: a line reaches a client at most once. Clients explicitly
+// attached to one of the line's windows get it through BroadcastWindows (the
+// window path); every client with no attach gets it through the status fallback
+// inside BroadcastWindows, which is BroadcastUnattached. Clients attached to
+// any window never receive window lines from that fallback, so a client
+// attached to "status" cannot see a channel line twice. Status lines themselves
+// are not windowed: Broadcast is the status stream and delivers them to
+// everyone, attached or not.
 func (s *Server) BroadcastWindow(netName, window string, seq uint64, line []byte, ts int64) {
 	_ = seq
 	key := windowKey(netName, window)
@@ -382,6 +431,51 @@ func (s *Server) BroadcastWindow(netName, window string, seq uint64, line []byte
 	for _, sub := range subs {
 		sub.WriteFrom(b, un)
 	}
+	*p = b
+	s.linePool.Put(p)
+}
+
+// BroadcastWindows delivers one live line to the clients attached to any of
+// windows (once, even when a client is attached to several) and to every client
+// with no explicit attach through the status fallback. No client receives it
+// twice. It is the routing entry point for a non-status line.
+func (s *Server) BroadcastWindows(netName string, windows []string, seq uint64, line []byte, ts int64) {
+	_ = seq
+	if len(windows) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(windows))
+	s.windows.mu.Lock()
+	for _, window := range windows {
+		key := windowKey(netName, window)
+		s.windows.known[key] = true
+		keys = append(keys, key)
+	}
+	s.windows.mu.Unlock()
+
+	attached := s.windows.deliveringAny(keys)
+	attachedSet := make(map[*Subscriber]bool, len(attached))
+	for _, sub := range attached {
+		attachedSet[sub] = true
+	}
+
+	var un string
+	if ne := s.network(netName); ne != nil {
+		forLine, _ := ne.advanceNick(ne.knownNick(), line)
+		un = forLine
+	}
+
+	p := s.linePool.Get().(*[]byte)
+	b := appendLiveLine((*p)[:0], line, ts)
+	for _, sub := range attached {
+		sub.WriteFrom(b, un)
+	}
+	s.hub.BroadcastFromSkip(b, un, func(sub *Subscriber) bool {
+		if attachedSet[sub] {
+			return true
+		}
+		return s.windows.hasAnyAttach(sub)
+	})
 	*p = b
 	s.linePool.Put(p)
 }

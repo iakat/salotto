@@ -200,10 +200,22 @@ func (h *Hub) Broadcast(line []byte) {
 // full is removed and closed, and the dropped counter increments. No socket is
 // written here and no subscriber can block the broadcast.
 func (h *Hub) BroadcastFrom(line []byte, upstreamNick string) {
+	h.BroadcastFromSkip(line, upstreamNick, nil)
+}
+
+// BroadcastFromSkip is BroadcastFrom with a per-subscriber skip predicate. A
+// skipped subscriber is left untouched (it is neither written to nor treated as
+// slow). The predicate runs under the hub lock and must not call back into the
+// hub.
+func (h *Hub) BroadcastFromSkip(line []byte, upstreamNick string, skip func(*Subscriber) bool) {
 	h.mu.Lock()
 	i := 0
 	for i < h.n {
 		s := h.subs[i]
+		if skip != nil && skip(s) {
+			i++
+			continue
+		}
 		if s.WriteFrom(line, upstreamNick) {
 			i++
 			continue
