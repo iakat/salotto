@@ -324,3 +324,106 @@ func TestResolveBindHost(t *testing.T) {
 		})
 	}
 }
+
+func TestIdentConfig(t *testing.T) {
+	t.Run("parsed", func(t *testing.T) {
+		cfg, err := loadString(t, `
+ident_listen = "127.0.0.1:10113"
+ident = "salotto-1"
+
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdentListen != "127.0.0.1:10113" {
+			t.Fatalf("ident_listen = %q", cfg.IdentListen)
+		}
+		if cfg.Ident != "salotto-1" {
+			t.Fatalf("ident = %q", cfg.Ident)
+		}
+	})
+
+	t.Run("empty means off", func(t *testing.T) {
+		cfg, err := loadString(t, `
+ident_listen = ""
+ident = ""
+
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdentListen != "" || cfg.Ident != "" {
+			t.Fatalf("ident fields = %q / %q, want empty", cfg.IdentListen, cfg.Ident)
+		}
+	})
+
+	bad := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name: "listen without port",
+			body: `
+ident_listen = "127.0.0.1"
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`,
+			wantErr: "ident_listen",
+		},
+		{
+			name: "ident with space",
+			body: `
+ident = "sal otto"
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`,
+			wantErr: "ident",
+		},
+		{
+			name: "ident with colon",
+			body: `
+ident = "sal:otto"
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`,
+			wantErr: "ident",
+		},
+		{
+			name: "ident too long",
+			body: `
+ident = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`,
+			wantErr: "ident",
+		},
+	}
+	for _, tt := range bad {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := loadString(t, tt.body)
+			if err == nil {
+				t.Fatalf("Load succeeded, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}

@@ -48,6 +48,8 @@ type Config struct {
 	LogQueue        int
 	LogListen       string
 	LogToken        string
+	IdentListen     string
+	Ident           string
 	RingSegments    int
 	RingSegmentSize int
 	MaxClients      int
@@ -99,6 +101,40 @@ func ResolveBindHost(user, network string) (host, origin string) {
 	}
 }
 
+// ValidateIdentListen accepts empty (ident off) or a host:port literal.
+func ValidateIdentListen(value string) error {
+	if value == "" {
+		return nil
+	}
+	if _, _, err := net.SplitHostPort(value); err != nil {
+		return fmt.Errorf("ident_listen must be host:port, got %q", value)
+	}
+	return nil
+}
+
+// ValidateIdent accepts empty (the network's nick is used) or a single token
+// made of [A-Za-z0-9._-], at most 32 bytes. A space or colon in an ident would
+// corrupt the single-line RFC 1413 reply.
+func ValidateIdent(value string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > 32 {
+		return fmt.Errorf("ident must be at most 32 characters, got %d", len(value))
+	}
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		ok := ch >= 'A' && ch <= 'Z' ||
+			ch >= 'a' && ch <= 'z' ||
+			ch >= '0' && ch <= '9' ||
+			ch == '.' || ch == '_' || ch == '-'
+		if !ok {
+			return fmt.Errorf("ident may only contain [A-Za-z0-9._-], got %q", value)
+		}
+	}
+	return nil
+}
+
 // ValidateBindHost rejects anything but a bare IPv4 or IPv6 literal: a bind
 // host with a port or a hostname would silently bind to something else than the
 // operator wrote.
@@ -122,6 +158,12 @@ func (c *Config) Validate() error {
 		return errors.New("listen must not be empty")
 	}
 	if err := ValidateBindHost("user.bind_host", c.User.BindHost); err != nil {
+		return err
+	}
+	if err := ValidateIdentListen(c.IdentListen); err != nil {
+		return err
+	}
+	if err := ValidateIdent(c.Ident); err != nil {
 		return err
 	}
 	if c.RingSegments < minRingSegments {
@@ -238,6 +280,10 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.LogListen, err = parseString(value)
 	case "log_token":
 		c.LogToken, err = parseString(value)
+	case "ident_listen":
+		c.IdentListen, err = parseString(value)
+	case "ident":
+		c.Ident, err = parseString(value)
 	case "ring_segments":
 		c.RingSegments, err = parseInt(value)
 	case "ring_segment_size":
