@@ -376,6 +376,49 @@ func tagValue(tags, key []byte) []byte {
 }
 
 func trMembersMap(tr *Tracker) map[string]map[string]bool {
-	// access unexported via same package
-	return tr.members
+	// Snapshot under the tracker lock: Format also runs on the upstream
+	// goroutine (via WindowFor) while the log drain mutates membership.
+	return tr.membersSnapshot()
+}
+
+// WindowFor returns the replay window name for an IRC line, using exactly the
+// same rules Format uses to choose the log file, so a replayed window and a
+// logged window can never disagree. When the line produces several entries (a
+// QUIT fanned out to every shared channel) it returns the first window and the
+// full de-duplicated list.
+//
+// ok is false when the line has no window of its own: it produces no entry at
+// all (a CAP reply, a suppressed own echo) or every entry it produces is the
+// "status" window (numerics, PING, ERROR, a QUIT from a nick sharing no
+// channel). The caller treats that as "status". Status lines are not windowed:
+// Broadcast is the status stream.
+func WindowFor(tr *Tracker, line []byte, outbound bool, hasEcho bool) (first string, all []string, ok bool) {
+	entries := Format(tr, nil, line, outbound, hasEcho, "")
+	seen := make(map[string]bool, len(entries))
+	all = make([]string, 0, len(entries))
+	for _, e := range entries {
+		w := e.Window
+		if w == "" {
+			w = "status"
+		}
+		if seen[w] {
+			continue
+		}
+		seen[w] = true
+		all = append(all, w)
+	}
+	if len(all) == 0 {
+		return "", nil, false
+	}
+	onlyStatus := true
+	for _, w := range all {
+		if w != "status" {
+			onlyStatus = false
+			break
+		}
+	}
+	if onlyStatus {
+		return "", nil, false
+	}
+	return all[0], all, true
 }

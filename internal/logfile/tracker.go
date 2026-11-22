@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/iakat/salotto/internal/ircline"
 )
@@ -11,6 +12,10 @@ import (
 // Tracker is the minimum read-only IRC state needed to reproduce ZNC's
 // fan-out. It observes the same line stream as the logger.
 type Tracker struct {
+	// mu guards every field. The tracker is written by the log writer's drain
+	// goroutine and read by the upstream goroutine when it routes a line to its
+	// replay windows, so the two must not race.
+	mu       sync.RWMutex
 	ownNick  string
 	channels map[string]bool
 	members  map[string]map[string]bool
@@ -33,55 +38,86 @@ func NewTracker(initial ...string) *Tracker {
 
 func NewTracker0() *Tracker { return NewTracker("") }
 
-func (t *Tracker) OwnNick() string { return t.ownNick }
+func (t *Tracker) OwnNick() string {
+	t.mu.RLock()
+	n := t.ownNick
+	t.mu.RUnlock()
+	return n
+}
 
-func (t *Tracker) SetOwnNick(n string) { t.ownNick = n }
+func (t *Tracker) SetOwnNick(n string) {
+	t.mu.Lock()
+	t.ownNick = n
+	t.mu.Unlock()
+}
 
 func (t *Tracker) Channels() []string {
+	t.mu.RLock()
 	out := make([]string, 0, len(t.channels))
 	for c := range t.channels {
 		out = append(out, c)
 	}
+	t.mu.RUnlock()
 	sort.Strings(out)
 	return out
 }
 
 func (t *Tracker) Members(ch string) map[string]bool {
-	if m, ok := t.members[ch]; ok {
-		return m
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	m, ok := t.members[ch]
+	if !ok {
+		return nil
 	}
-	return nil
+	out := make(map[string]bool, len(m))
+	for n := range m {
+		out[n] = true
+	}
+	return out
 }
 
 func (t *Tracker) IsMember(ch, nick string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	if m, ok := t.members[ch]; ok {
 		return m[nick]
 	}
 	return false
 }
 
-func (t *Tracker) Topic(ch string) string { return t.topic[ch] }
+func (t *Tracker) Topic(ch string) string {
+	t.mu.RLock()
+	s := t.topic[ch]
+	t.mu.RUnlock()
+	return s
+}
 
 func (t *Tracker) ChannelsWithMember(nick string) []string {
+	t.mu.RLock()
 	var out []string
 	for ch, ms := range t.members {
 		if ms[nick] {
 			out = append(out, ch)
 		}
 	}
+	t.mu.RUnlock()
 	// deterministic order
 	sort.Strings(out)
 	return out
 }
 
 func (t *Tracker) Clear() {
+	t.mu.Lock()
 	t.ownNick = ""
 	t.channels = make(map[string]bool)
 	t.members = make(map[string]map[string]bool)
 	t.topic = make(map[string]string)
+	t.mu.Unlock()
 }
 
 func (t *Tracker) Observe(line []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	_, rest := ircline.Tags(line)
 	prefix, rest := ircline.Prefix(rest)
 	verb := strings.ToUpper(string(ircline.Verb(rest)))
@@ -216,4 +252,18 @@ func trailingStr(params []byte) string {
 		return ""
 	}
 	return string(fields[len(fields)-1])
+}
+
+func (t *Tracker) membersSnapshot() map[string]map[string]bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make(map[string]map[string]bool, len(t.members))
+	for ch, ms := range t.members {
+		cp := make(map[string]bool, len(ms))
+		for n := range ms {
+			cp[n] = true
+		}
+		out[ch] = cp
+	}
+	return out
 }

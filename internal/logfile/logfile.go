@@ -206,7 +206,12 @@ func (w *Writer) handle(e event) {
 		defer w.pool.Put(p)
 	}
 
-	if w.logDir == "" {
+	if w.logDir == "" && e.buf != nil {
+		// No log files, but the tracker still backs per-window live routing
+		// (logfile.WindowFor), so keep observing. Nothing to format or write.
+		if !e.out {
+			w.tracker.Observe((*e.buf)[:e.n])
+		}
 		return
 	}
 
@@ -237,18 +242,15 @@ func (w *Writer) handle(e event) {
 		hasEcho = w.hasCap("echo-message")
 	}
 
+	// Format first, then Observe. Format chooses windows from the state the
+	// line arrived in: a QUIT or NICK fans out to the channels the nick shared
+	// before it happened. Observing first would erase that membership and log
+	// the event to status while the replay went to the channels, or vice versa.
+	server := w.server
+	entries := Format(w.tracker, now, line, e.out, hasEcho, server)
 	if !e.out {
 		w.tracker.Observe(line)
 	}
-
-	server := w.server
-	ownFallback := w.nick
-	if ownFallback == "" {
-		ownFallback = w.tracker.OwnNick()
-	}
-	_ = ownFallback
-
-	entries := Format(w.tracker, now, line, e.out, hasEcho, server)
 	w.writeEntries(day, entries, now)
 }
 
