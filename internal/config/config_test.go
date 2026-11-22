@@ -187,3 +187,140 @@ channels = ["#a", "#b c", "#d"]
 		})
 	}
 }
+
+func TestBindHostConfig(t *testing.T) {
+	t.Run("user and network", func(t *testing.T) {
+		cfg, err := loadString(t, `
+[user]
+bind_host = "198.51.100.7"
+deny_set_bind_host = true
+
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+bind_host = "2001:db8::1"
+`)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.User.BindHost != "198.51.100.7" {
+			t.Fatalf("user bind_host = %q", cfg.User.BindHost)
+		}
+		if !cfg.User.DenySetBindHost {
+			t.Fatal("deny_set_bind_host not parsed")
+		}
+		if cfg.Networks[0].BindHost != "2001:db8::1" {
+			t.Fatalf("network bind_host = %q", cfg.Networks[0].BindHost)
+		}
+	})
+
+	bad := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{
+			name: "user hostname",
+			body: `
+[user]
+bind_host = "example.com"
+
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`,
+			wantErr: "user.bind_host",
+		},
+		{
+			name: "user port",
+			body: `
+[user]
+bind_host = "198.51.100.7:6667"
+
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`,
+			wantErr: "user.bind_host",
+		},
+		{
+			name: "network hostname",
+			body: `
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+bind_host = "example.com"
+`,
+			wantErr: "networks[0].bind_host",
+		},
+		{
+			name: "network garbage",
+			body: `
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+bind_host = "not-an-ip"
+`,
+			wantErr: "networks[0].bind_host",
+		},
+	}
+	for _, tt := range bad {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := loadString(t, tt.body)
+			if err == nil {
+				t.Fatalf("Load succeeded, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %q, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+
+	good := []struct {
+		name  string
+		value string
+	}{
+		{name: "ipv6 loopback", value: "::1"},
+		{name: "ipv6 global", value: "2001:db8::1"},
+		{name: "ipv4", value: "198.51.100.7"},
+	}
+	for _, tt := range good {
+		t.Run("accept "+tt.name, func(t *testing.T) {
+			if _, err := loadString(t, `
+[user]
+bind_host = "`+tt.value+`"
+
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`); err != nil {
+				t.Fatalf("Load(%q): %v", tt.value, err)
+			}
+		})
+	}
+}
+
+func TestResolveBindHost(t *testing.T) {
+	tests := []struct {
+		name, user, network, wantHost, wantOrigin string
+	}{
+		{name: "network wins", user: "198.51.100.7", network: "203.0.113.9", wantHost: "203.0.113.9", wantOrigin: "network"},
+		{name: "user wins", user: "198.51.100.7", network: "", wantHost: "198.51.100.7", wantOrigin: "user"},
+		{name: "kernel picks", user: "", network: "", wantHost: "", wantOrigin: "kernel"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host, origin := ResolveBindHost(tt.user, tt.network)
+			if host != tt.wantHost || origin != tt.wantOrigin {
+				t.Fatalf("ResolveBindHost(%q, %q) = (%q, %q), want (%q, %q)",
+					tt.user, tt.network, host, origin, tt.wantHost, tt.wantOrigin)
+			}
+		})
+	}
+}

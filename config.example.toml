@@ -19,6 +19,10 @@ ring_segments = 8
 ring_segment_size = 262144
 max_clients = 32
 
+[user]
+bind_host = ""                   # default source address for every network; empty = kernel picks
+deny_set_bind_host = false       # operator policy: refuse Set*BindHost from the client
+
 [[network]]
 name = "libera"
 addr = "irc.libera.chat:6697"
@@ -31,6 +35,7 @@ pass = ""
 # sasl_pass = "secret"
 # Channels joined after every successful (re)connect.
 channels = ["#chan1", "#chan2"]
+bind_host = ""                   # override for this network only; empty = use the user value
 insecure_skip_verify = false
 
 [[network]]
@@ -43,4 +48,5 @@ pass = ""
 # sasl_user = "mynick"
 # sasl_pass = "secret"
 channels = []
+bind_host = ""
 insecure_skip_verify = false

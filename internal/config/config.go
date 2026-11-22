@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -13,6 +14,12 @@ const (
 	minRingSegments    = 2
 	minRingSegmentSize = 512
 )
+
+// User describes the single local user of the proof-of-concept process.
+type User struct {
+	BindHost        string
+	DenySetBindHost bool
+}
 
 // Network describes one upstream IRC network.
 type Network struct {
@@ -25,6 +32,7 @@ type Network struct {
 	SASLUser           string
 	SASLPass           string
 	Channels           []string
+	BindHost           string
 	InsecureSkipVerify bool
 }
 
@@ -43,6 +51,7 @@ type Config struct {
 	RingSegments    int
 	RingSegmentSize int
 	MaxClients      int
+	User            User
 	Networks        []Network
 }
 
@@ -76,6 +85,33 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// ResolveBindHost returns the address the dial must bind to and where it came
+// from: the network value if set, else the user value, else "" (kernel picks).
+// Same precedence as ZNC's CIRCNetwork::GetBindHost().
+func ResolveBindHost(user, network string) (host, origin string) {
+	switch {
+	case network != "":
+		return network, "network"
+	case user != "":
+		return user, "user"
+	default:
+		return "", "kernel"
+	}
+}
+
+// validateBindHost rejects anything but a bare IPv4 or IPv6 literal: a bind
+// host with a port or a hostname would silently bind to something else than the
+// operator wrote.
+func validateBindHost(field, value string) error {
+	if value == "" {
+		return nil
+	}
+	if net.ParseIP(value) == nil {
+		return fmt.Errorf("%s must be a bare IP address, got %q", field, value)
+	}
+	return nil
+}
+
 // Validate checks the parts of the configuration that cannot be left empty or
 // below the ring's own hard limits.
 func (c *Config) Validate() error {
@@ -84,6 +120,9 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Listen) == "" {
 		return errors.New("listen must not be empty")
+	}
+	if err := validateBindHost("user.bind_host", c.User.BindHost); err != nil {
+		return err
 	}
 	if c.RingSegments < minRingSegments {
 		return fmt.Errorf("ring_segments must be at least %d", minRingSegments)
@@ -108,27 +147,46 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(n.Nick) == "" {
 			return fmt.Errorf("network %q: nick must not be empty", n.Name)
 		}
+		if err := validateBindHost(fmt.Sprintf("networks[%d].bind_host", i), n.BindHost); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (c *Config) parse(text string) error {
-	inNetwork := false
+	const (
+		secGlobal  = ""
+		secUser    = "user"
+		secNetwork = "network"
+	)
+	section := secGlobal
 	for lineNo, raw := range strings.Split(text, "\n") {
 		line := strings.TrimSpace(stripComment(raw))
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[[") {
-			if !strings.HasSuffix(line, "]]") {
+		if strings.HasPrefix(line, "[") {
+			if strings.HasPrefix(line, "[[") {
+				if !strings.HasSuffix(line, "]]") {
+					return fmt.Errorf("line %d: malformed section header %q", lineNo+1, line)
+				}
+				name := strings.TrimSpace(line[2 : len(line)-2])
+				if name != secNetwork {
+					return fmt.Errorf("line %d: unknown section [[%s]]", lineNo+1, name)
+				}
+				c.Networks = append(c.Networks, Network{})
+				section = secNetwork
+				continue
+			}
+			if !strings.HasSuffix(line, "]") {
 				return fmt.Errorf("line %d: malformed section header %q", lineNo+1, line)
 			}
-			name := strings.TrimSpace(line[2 : len(line)-2])
-			if name != "network" {
-				return fmt.Errorf("line %d: unknown section [[%s]]", lineNo+1, name)
+			name := strings.TrimSpace(line[1 : len(line)-1])
+			if name != secUser {
+				return fmt.Errorf("line %d: unknown section [%s]", lineNo+1, name)
 			}
-			c.Networks = append(c.Networks, Network{})
-			inNetwork = true
+			section = secUser
 			continue
 		}
 		eq := strings.IndexByte(line, '=')
@@ -142,9 +200,12 @@ func (c *Config) parse(text string) error {
 		}
 
 		var err error
-		if inNetwork {
+		switch section {
+		case secNetwork:
 			err = c.parseNetworkKey(&c.Networks[len(c.Networks)-1], key, value)
-		} else {
+		case secUser:
+			err = c.parseUserKey(key, value)
+		default:
 			err = c.parseGlobalKey(key, value)
 		}
 		if err != nil {
@@ -189,6 +250,19 @@ func (c *Config) parseGlobalKey(key, value string) error {
 	return err
 }
 
+func (c *Config) parseUserKey(key, value string) error {
+	var err error
+	switch key {
+	case "bind_host":
+		c.User.BindHost, err = parseString(value)
+	case "deny_set_bind_host":
+		c.User.DenySetBindHost, err = parseBool(value)
+	default:
+		return fmt.Errorf("unknown key %q in [user]", key)
+	}
+	return err
+}
+
 func (c *Config) parseNetworkKey(n *Network, key, value string) error {
 	var err error
 	switch key {
@@ -210,6 +284,8 @@ func (c *Config) parseNetworkKey(n *Network, key, value string) error {
 		n.SASLPass, err = parseString(value)
 	case "channels":
 		n.Channels, err = parseStringList(value)
+	case "bind_host":
+		n.BindHost, err = parseString(value)
 	case "insecure_skip_verify":
 		n.InsecureSkipVerify, err = parseBool(value)
 	default:
