@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
+	"syscall"
 	"time"
 
 	"github.com/iakat/salotto/internal/ircline"
@@ -15,7 +18,47 @@ import (
 const (
 	dialTimeout = 30 * time.Second
 	maxLine     = 8192
+	// ipv6Freebind is IPV6_FREEBIND. syscall does not define it, and the value
+	// is stable on Linux (include/uapi/linux/in6.h).
+	ipv6Freebind = 0x4e
 )
+
+// dialerWithBindHost returns a dialer that binds the outbound socket to host and
+// enables IP_FREEBIND before bind, so the address does not have to be local.
+// base is never mutated: the result is a copy with its own Control.
+func dialerWithBindHost(base *net.Dialer, host string) *net.Dialer {
+	if host == "" {
+		return base
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return base
+	}
+
+	d := *base
+	d.LocalAddr = &net.TCPAddr{IP: ip}
+
+	prev := d.Control
+	d.Control = func(network, address string, c syscall.RawConn) error {
+		if prev != nil {
+			if err := prev(network, address, c); err != nil {
+				return err
+			}
+		}
+		var serr error
+		if err := c.Control(func(fd uintptr) {
+			if ip.To4() != nil {
+				serr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_FREEBIND, 1)
+			} else {
+				serr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, ipv6Freebind, 1)
+			}
+		}); err != nil {
+			return err
+		}
+		return serr
+	}
+	return &d
+}
 
 func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 	attempt := c.attempts.Add(1)
@@ -24,6 +67,16 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 	raw, err := c.dialer.DialContext(dialCtx, "tcp", c.cfg.Addr)
 	if err != nil {
 		cancel()
+		if c.cfg.BindHost != "" {
+			timeout := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded)
+			if timeout || errors.Is(err, syscall.ENETUNREACH) {
+				c.log.Warn("dial failed with a bind host set; the address may be bound but unroutable",
+					"name", c.cfg.Name,
+					"bind_host", c.cfg.BindHost,
+					"err", err,
+				)
+			}
+		}
 		return false, err
 	}
 

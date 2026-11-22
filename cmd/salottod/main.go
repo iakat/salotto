@@ -120,6 +120,7 @@ func run() int {
 	for i := range cfg.Networks {
 		nc := cfg.Networks[i]
 		netName := nc.Name
+		bindHost, _ := config.ResolveBindHost(cfg.User.BindHost, nc.BindHost)
 		r := ring.New(cfg.RingSegments, cfg.RingSegmentSize)
 
 		var serverStr string
@@ -138,6 +139,7 @@ func run() int {
 			SASLUser:           nc.SASLUser,
 			SASLPass:           nc.SASLPass,
 			Channels:           append([]string(nil), nc.Channels...),
+			BindHost:           bindHost,
 			Ring:               r,
 			Log:                logger.With("network", netName),
 			OnLine: func(seq uint64, line []byte) {

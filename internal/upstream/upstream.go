@@ -39,8 +39,12 @@ type Config struct {
 	OnDisconnect func()
 	Log          *slog.Logger
 	Dialer       *net.Dialer
-	BackoffMin   time.Duration
-	BackoffMax   time.Duration
+	// BindHost, when non-empty, is the local source address the outbound socket
+	// binds to. The dialer enables IP_FREEBIND for it, so the address does not
+	// have to be configured on an interface.
+	BindHost   string
+	BackoffMin time.Duration
+	BackoffMax time.Duration
 }
 
 // State is the current connection state.
@@ -110,6 +114,9 @@ func New(cfg Config) (*Conn, error) {
 	if cfg.Nick == "" {
 		return nil, errors.New("upstream: Nick is required")
 	}
+	if cfg.BindHost != "" && net.ParseIP(cfg.BindHost) == nil {
+		return nil, errors.New("upstream: invalid BindHost: not an IP address")
+	}
 	if cfg.Ring == nil {
 		return nil, errors.New("upstream: Ring is required")
 	}
@@ -122,6 +129,7 @@ func New(cfg Config) (*Conn, error) {
 	if cfg.Dialer == nil {
 		cfg.Dialer = &net.Dialer{}
 	}
+	cfg.Dialer = dialerWithBindHost(cfg.Dialer, cfg.BindHost)
 	if cfg.BackoffMin <= 0 {
 		cfg.BackoffMin = time.Second
 	}
