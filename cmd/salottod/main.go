@@ -148,6 +148,7 @@ func run() int {
 		r := ring.New(cfg.RingSegments, cfg.RingSegmentSize)
 
 		var serverStr string
+		var conn *upstream.Conn
 		w := logfile.New(netName, cfg.LogDir, cfg.LogQueue, time.Now)
 		w.SetNick(nc.Nick)
 		w.SetServer(nc.Addr)
@@ -167,12 +168,11 @@ func run() int {
 			Ring:               r,
 			Log:                logger.With("network", netName),
 			OnLine: func(seq uint64, line []byte) {
-				if srv != nil {
-					srv.Broadcast(netName, seq, line, time.Now().UnixNano())
-				}
+				dispatchLine(srv, w.Tracker(), conn != nil && conn.HasCap("echo-message"), netName, seq, line, false)
 				w.OnLine(seq, line)
 			},
 			OnSend: func(line []byte) {
+				dispatchLine(srv, w.Tracker(), conn != nil && conn.HasCap("echo-message"), netName, 0, line, true)
 				w.OnSend(line)
 			},
 			OnConnect: func() {
@@ -191,7 +191,7 @@ func run() int {
 		if ucfg.RealName == "" {
 			ucfg.RealName = nc.Nick
 		}
-		conn, err := upstream.New(ucfg)
+		conn, err = upstream.New(ucfg)
 		if err != nil {
 			logger.Error("upstream config invalid", "network", netName, "err", err)
 			return 1
@@ -423,6 +423,25 @@ func run() int {
 		logger.Warn("shutdown timed out", "wait", "5s")
 	}
 	return 0
+}
+
+// dispatchLine routes one line to the replay windows its log file belongs to,
+// using the same window model the logger uses (logfile.WindowFor). Live status
+// lines (numerics, server notices, MODE on the client) are the status stream and
+// go through Broadcast, which every client receives. A line with channel or
+// query windows goes through BroadcastWindows only: clients attached to one of
+// those windows get it once through the window path and clients with no attach
+// get it once through the status fallback. Nothing is delivered twice.
+func dispatchLine(srv *facade.Server, tr *logfile.Tracker, hasEcho bool, netName string, seq uint64, line []byte, outbound bool) {
+	if srv == nil {
+		return
+	}
+	_, all, ok := logfile.WindowFor(tr, line, outbound, hasEcho)
+	if !ok {
+		srv.Broadcast(netName, seq, line, time.Now().UnixNano())
+		return
+	}
+	srv.BroadcastWindows(netName, all, seq, line, time.Now().UnixNano())
 }
 
 func parseLogLevel(value string) (slog.Level, error) {
