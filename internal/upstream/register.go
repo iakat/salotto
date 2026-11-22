@@ -45,6 +45,7 @@ func (c *Conn) register(conn net.Conn, br *bufio.Reader, scratch []byte) error {
 	}
 
 	want, sasl := selectCaps(offered, c.cfg.SASLUser != "")
+	c.SetCaps(want)
 	if len(want) > 0 {
 		if err := c.writeLine(conn, []byte("CAP REQ :"+strings.Join(want, " "))); err != nil {
 			return err

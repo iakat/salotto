@@ -27,18 +27,47 @@ Naming is a proposal: `salotto` (the parlour next to `stanze`). Binaries
 - **The client can manage the bouncer within server-enforced ceilings** (§7):
   add and remove networks, set per-network options, attach and detach. It can
   lower limits, never raise them past the ceiling.
-- **One binary each, no cgo,** stdlib plus `golang.org/x/oauth2` (client only).
+- **One binary each, no cgo,** stdlib plus `golang.org/x/oauth2` (client only) and `github.com/blevesearch/vellum` (plus three transitive deps: mmap-go, bitset, golang.org/x/sys) for the log index in salottod.
 
 ## 2. Non-goals (v1)
 
-- No message search, no full-text index, no push notifications.
+- No client-side message search beyond the daily log index (§2.1); no push notifications.
 - No web UI. The client is a TUI first; a browser client is a later transport
   adapter (same frames over a binary WebSocket, §13).
 - No shared channel access between users. One user, many sessions, many
   clients. Multi-tenant means many users, each in their own box.
-- No bouncer-side IRC state, ever. Not as a cache, not as an optimisation.
+- No bouncer-side IRC state in the *facade*: the facade keeps no IRC state. A read-only tracker inside the logging subsystem (`internal/logfile`) keeps membership and topic solely to reproduce ZNC's fan-out; it is never exposed to clients, runs on the log drain goroutine, and is cleared on disconnect. This is a narrowing of the rule, not its removal.
 - No history older than the ring. Backfill beyond the ring is the network's
   job via `chathistory` (§11), from the client.
+
+## 2.1 Logging and search (salottod)
+
+salottod keeps ZNC `log` module parity for log files only. Log path template
+(network module):
+
+```
+<log_dir>/$NETWORK/$WINDOW/%Y-%m-%d.log
+```
+
+`$NETWORK` is the configured network name verbatim; `$WINDOW` is lowercased
+with `/` and `\` replaced by `-`. One line per event, `[%H:%M:%S] ` + body,
+appended and `\n`-terminated. Bodies and fan-out match ZNC exactly, with one
+documented deviation: a QUIT or NICK change for a nick sharing no channel is
+written to the `<network>/status/` window instead of being dropped.
+
+A per-network bounded queue feeds one drain goroutine; `OnLine` performs a
+single non-blocking send and never blocks the socket. A daily index is built at
+day rollover (and lazily on query) using `github.com/blevesearch/vellum`, one
+`.idx` file per log file, next to it. Search endpoint:
+`GET /v1/log/search?network=&window=&q=&since=&until=&limit=&order=` on its
+own listener `log_listen`. `GET /v1/log/windows?network=` lists windows.
+
+Auth: `log_token` set requires `Authorization: Bearer <token>` compared with
+`crypto/subtle`; non-loopback `log_listen` with empty token refuses to start;
+loopback without token needs no auth.
+
+Config keys: `log_dir` (empty disables logging), `log_queue` (default 4096),
+`log_listen` (empty disables search), `log_token`.
 
 ## 3. What "zero allocations" means here
 
@@ -399,7 +428,7 @@ Same framing, different carrier:
 ## 14. Deliberate omissions
 
 - No bouncer-side push, no e-mail, no webhooks.
-- No server-side search.
+- Server-side log search over the daily index (§2.1), loopback by default.
 - No file transfer beyond what the network carries.
 - No plugin system. A bouncer that loads plugins is a bouncer that grows state.
 - No persistence by default: a `salottod` restart loses the rings. Optional
