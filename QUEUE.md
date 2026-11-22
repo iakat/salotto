@@ -53,7 +53,7 @@ written here. Nothing gets to be quietly missing.
 | B9 | Reconnect with backoff, unlimited attempts | `CIRCNetwork::m_uConnectCycles` | **have** |
 | B10 | Buffer playback on attach | `PlayBuffer`, `PlayBuffer` triggers | **partial**: replays whole ring, no window selection |
 | B11 | Clear buffers on demand | `ClearBuffer`, `ClearAllQueryBuffers`, `ClearAllChannelBuffers` | **no** |
-| B12 | Per-channel enable/disable logging-to-buffer | `DisableChan`/`EnableChan` | **no** |
+| B12 | Per-channel enable/disable | `DisableChan`/`EnableChan` | **partial, with a known semantic deviation.** ZNC's `CChan::Disable()` only sets `m_bDisabled`: `CClient::AddBuffer` never checks it, so a disabled-but-joined channel **keeps buffering**, and what is suppressed is the **rejoin** after a reconnect (`IRCNetwork.cpp`: `if (!pChan->IsOn() && !pChan->IsDisabled())`). Ours instead makes a disabled window **unreplayable** (`BufferEmpty` returns true, `PlayBuffer` skips it). Neither the buffering behaviour nor the rejoin suppression is modelled yet: the facade does not own the join state. Fix before claiming B12. |
 | B13 | Bind host / user bind host for outbound sockets, **plus `FREEBIND`** | `SetBindHost`/`SetUserBindHost`/`ClearBindHost`/`ClearUserBindHost`/`ShowBindHost` in `src/ClientCommand.cpp`; resolution in `CIRCNetwork::GetBindHost()` (network value, else user value); applied at dial in `CIRCNetwork::Connect` → `Connect(..., GetBindHost(), ...)` | **no** — and it is a *must*, not a nice-to-have (see 1.1.1) |
 | B14 | Trusted server fingerprints (pinning beyond CA) | `AddTrustedServerFingerprint` | **no** |
 | B15 | MOTD control (block/missing) | `modules/block_motd.cpp`, `modules/missingmotd.cpp` | **no** |
@@ -299,6 +299,16 @@ recording because they are not obvious from a feature list:
   scrollback. ZNC handles them by fanning `QUIT` to every shared channel, which
   we now do. A *condensed* rendering is a client concern and must not truncate
   history to be pretty.
+- **Q4. Every routed line is parsed twice** (measured, not suspected). Routing
+  (`dispatchLine` → `logfile.WindowFor`) calls `Format` to decide the window, and
+  the writer's drain calls `Format` again to build the log entry. Ad-hoc
+  measurement on `PRIVMSG #c`: `Format` once = 250.4 ns/op, 112 B/op, 9 allocs;
+  twice = 595.9 ns/op, 240 B/op, 19 allocs. So ≈ +345 ns, +128 B, +10 allocs per
+  logged line. The existing `BenchmarkOnLine` (21.37 ns/op, 0 allocs) cannot see
+  it because it measures the enqueue path only and the format happens on the
+  drain goroutine. Fix: return the parsed `[]Entry` from routing and hand it to
+  the writer instead of re-parsing. Not urgent, but it is pure waste on the hot
+  path.
 
 ---
 
