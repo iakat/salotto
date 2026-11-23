@@ -156,6 +156,18 @@ func (p *Program) SetInput(text string) {
 	p.mu.Unlock()
 }
 
+// Search runs a scrollback search and converts the hits to wire form.
+func (p *Program) Search(query string) []SearchHit {
+	p.mu.Lock()
+	results := p.model.Search(query)
+	p.mu.Unlock()
+	hits := make([]SearchHit, 0, len(results))
+	for _, r := range results {
+		hits = append(hits, SearchHit{Window: r.Window, Nick: r.Line.Nick, Text: r.Line.Text})
+	}
+	return hits
+}
+
 // Next waits for the next message from the transport, blocking. A driver runs it
 // in a loop; the web handler runs it with a timeout.
 func (p *Program) Next() (tea.Msg, bool) {

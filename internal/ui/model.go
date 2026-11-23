@@ -23,6 +23,12 @@ type Line struct {
 	Nick   string
 	Text   string
 	Kind   LineKind
+
+	// Mention marks a line that addressed us by name. It lives on the line rather
+	// than in a separate index so a renderer draws a highlight from the data it is
+	// already drawing, and a search result carries its own answer to "was this for
+	// me".
+	Mention bool
 }
 
 // LineKind selects the style a line is drawn with. It exists so the model never
@@ -54,6 +60,13 @@ type Model struct {
 	windows map[string][]Line
 	active  string
 	order   []string
+
+	// unread counts lines that arrived in a window the user was not looking at,
+	// and mention marks the subset addressed to us by name. They are separate
+	// because they answer different questions: "is there anything new" and "is
+	// there anything for me" - and the second is the one worth a colour.
+	unread  map[string]int
+	mention map[string]bool
 
 	input   []rune
 	scroll  int
@@ -102,6 +115,10 @@ func (m Model) SetActive(name string) Model {
 	}
 	m.active = name
 	m.scroll = 0
+	// Looking at a window is the only thing that clears it: not reading it, not
+	// scrolling it, just having it open.
+	delete(m.unread, name)
+	delete(m.mention, name)
 	return m
 }
 
@@ -128,7 +145,11 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		return m, nil
 
 	case Incoming:
-		m.append(Line(msg))
+		line := Line(msg)
+		m.append(line)
+		if line.Mention {
+			m = m.NoteMention(line.Window)
+		}
 		return m, nil
 
 	case Sent:
@@ -224,6 +245,15 @@ func (m *Model) append(l Line) {
 		m.order = append(m.order, l.Window)
 	}
 	m.windows[l.Window] = append(m.windows[l.Window], l)
+	// Unread is a count of things you did not see arrive. A line in the window you
+	// are looking at was seen, so it does not count; that is what makes the number
+	// meaningful rather than a total.
+	if l.Window != m.active && l.Kind != LineGap {
+		if m.unread == nil {
+			m.unread = make(map[string]int)
+		}
+		m.unread[l.Window]++
+	}
 	if m.scroll > 0 {
 		m.scroll++
 	}
@@ -234,17 +264,21 @@ func (m *Model) append(l Line) {
 // index for the reason documented in docs/UI.md: the HTML converter maps
 // 8-bit SGR to classes and drops 24-bit colour silently.
 var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	borderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
-	nickStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
-	timeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	bodyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
-	actionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
-	noticeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
-	systemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	gapStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	inputStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
-	barStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
+	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+	// mentionStyle is the same 256-palette idea: a warm colour for a line that
+	// addresses us, so it stands out without a background fill that would fight
+	// the terminal's own theme.
+	mentionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("222")).Bold(true)
+	borderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+	nickStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
+	timeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	bodyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
+	actionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
+	noticeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
+	systemStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	gapStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	inputStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
+	barStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 )
 
 // View renders the whole screen: a titled box with the scrollback and an input
@@ -343,6 +377,12 @@ func styleLine(l Line, width int) string {
 	case LineAction:
 		return actionStyle.Render("* " + l.Nick + " " + text)
 	default:
+		// A mention is drawn differently in every front end. The model decides
+		// that it IS a mention; each renderer decides what that looks like, which
+		// is why this is a style here and a CSS class in the browser.
+		if l.Mention {
+			return nickStyle.Render("<"+l.Nick+">") + " " + mentionStyle.Render(text)
+		}
 		return nickStyle.Render("<"+l.Nick+">") + " " + bodyStyle.Render(text)
 	}
 }
@@ -384,3 +424,67 @@ func (m Model) SetInput(text string) Model {
 
 // Status is the status-bar text.
 func (m Model) Status() string { return m.status }
+
+// Unread returns the per-window unread counts, for a sidebar that shows which
+// windows have something new. A copy, so a renderer cannot corrupt the model.
+func (m Model) Unread() map[string]int {
+	out := make(map[string]int, len(m.unread))
+	for k, v := range m.unread {
+		out[k] = v
+	}
+	return out
+}
+
+// Mentions returns the windows where we were addressed by name. Separate from
+// unread on purpose: everything new is not everything for you.
+func (m Model) Mentions() map[string]bool {
+	out := make(map[string]bool, len(m.mention))
+	for k, v := range m.mention {
+		out[k] = v
+	}
+	return out
+}
+
+// NoteMention marks a window as containing a line addressed to us. The transport
+// decides whether a line mentions us, because it is the only place that knows our
+// nick; the model just records the consequence.
+func (m Model) NoteMention(window string) Model {
+	if m.mention == nil {
+		m.mention = make(map[string]bool)
+	}
+	if window != m.active {
+		m.mention[window] = true
+	}
+	return m
+}
+
+// SearchResult is one hit: the window it is in and the line itself.
+type SearchResult struct {
+	Window string
+	Line   Line
+}
+
+// Search finds every line containing the query, case-insensitively, across every
+// window. It is the in-client half of W4: the server-side log index answers "find
+// this from last month", and this answers "find this in what I have in front of
+// me". Both are needed; they are different questions.
+//
+// It is a linear scan on purpose. The scrollback in memory is bounded by the
+// window caps, so there is no index to keep in sync with appends, and an index that
+// can disagree with the lines it indexes is worse than a scan.
+func (m Model) Search(query string) []SearchResult {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return nil
+	}
+	var out []SearchResult
+	for _, window := range m.order {
+		for _, line := range m.windows[window] {
+			if strings.Contains(strings.ToLower(line.Text), query) ||
+				strings.Contains(strings.ToLower(line.Nick), query) {
+				out = append(out, SearchResult{Window: window, Line: line})
+			}
+		}
+	}
+	return out
+}

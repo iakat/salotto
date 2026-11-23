@@ -241,7 +241,15 @@ func (t *Transport) handle(raw []byte) {
 			// Any other CTCP is not chat and does not belong in the window.
 			return
 		}
-		t.push(Incoming(Line{Window: window, Nick: from, Text: text, Kind: kind}))
+		// A mention is our own nick as a word in the text. A substring test would
+		// flag "alice" inside "malice", and a word-boundary test done properly
+		// needs to know the nick's length anyway, so this walks the text for
+		// standalone occurrences.
+		line := Line{Window: window, Nick: from, Text: text, Kind: kind}
+		if kind != LineNotice && t.mentionsUs(from, text) {
+			line.Mention = true
+		}
+		t.push(Incoming(line))
 		return
 
 	case "JOIN":
@@ -355,6 +363,56 @@ func (t *Transport) noteSelf(nick string) {
 	t.mu.Lock()
 	t.own[nick] = true
 	t.mu.Unlock()
+}
+
+// mentionsUs reports whether text addresses us by nick, as a whole word. It is
+// done here rather than in the model because the transport is the only place that
+// knows which nicks we are holding.
+//
+// A bouncer NOTICE or a line from ourselves is never a mention: telling the user
+// they mentioned themselves is noise.
+func (t *Transport) mentionsUs(from, text string) bool {
+	t.mu.Lock()
+	own := make([]string, 0, len(t.own))
+	for nick := range t.own {
+		own = append(own, nick)
+	}
+	t.mu.Unlock()
+	for _, nick := range own {
+		if strings.EqualFold(nick, from) {
+			continue
+		}
+		if wordIn(text, nick) {
+			return true
+		}
+	}
+	return false
+}
+
+// wordIn reports whether word appears in text delimited by non-word characters.
+// ASCII letters, digits and underscore count as word characters, which is the same
+// set IRC nicknames use.
+func wordIn(text, word string) bool {
+	if word == "" {
+		return false
+	}
+	lower, target := strings.ToLower(text), strings.ToLower(word)
+	for i := 0; i+len(target) <= len(lower); i++ {
+		if lower[i:i+len(target)] != target {
+			continue
+		}
+		before := i == 0 || !isNickChar(lower[i-1])
+		after := i+len(target) == len(lower) || !isNickChar(lower[i+len(target)])
+		if before && after {
+			return true
+		}
+	}
+	return false
+}
+
+func isNickChar(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' ||
+		b == '_' || b == '-' || b == '[' || b == ']' || b == '\\' || b == '^' || b == '`' || b == '{' || b == '}'
 }
 
 func (t *Transport) note(window string) {

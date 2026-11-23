@@ -259,3 +259,183 @@ func TestPageCarriesTheSocketClient(t *testing.T) {
 
 // silence an unused import if the file evolves
 var _ = tea.KeyEnter
+
+// TestUnreadCountsOnlyWhatWasNotSeen pins the definition of unread: a line in the
+// window you are looking at was seen arrive, so it does not count. Getting this
+// wrong makes the number a total, which tells the user nothing.
+func TestUnreadCountsOnlyWhatWasNotSeen(t *testing.T) {
+	m := New("#here")
+	m = m.SetActive("#there")
+	m, _ = m.Step(Incoming(Line{Window: "#there", Nick: "a", Text: "seen"}))
+	if n := m.Unread()["#there"]; n != 0 {
+		t.Fatalf("a line in the active window counted as unread: %d", n)
+	}
+	m, _ = m.Step(Incoming(Line{Window: "#here", Nick: "a", Text: "unseen"}))
+	if n := m.Unread()["#here"]; n != 1 {
+		t.Fatalf("unread in another window = %d, want 1", n)
+	}
+	// Looking at it is what clears it.
+	m = m.SetActive("#here")
+	if n := m.Unread()["#here"]; n != 0 {
+		t.Fatalf("switching to the window did not clear its unread count: %d", n)
+	}
+}
+
+// TestMentionIsSeparateFromUnread pins that the two signals stay distinct. A
+// mention is a summons; an unread line is information. Collapsing them would make
+// the sidebar unable to answer "was this for me".
+func TestMentionIsSeparateFromUnread(t *testing.T) {
+	m := New("#here")
+	m = m.SetActive("#elsewhere")
+	m, _ = m.Step(Incoming(Line{Window: "#here", Nick: "a", Text: "hey alice", Mention: true}))
+
+	// Both signals fire, and they mean different things: there is something new
+	// in #here, and some of it was addressed to us.
+	if !m.Mentions()["#here"] {
+		t.Fatal("a mention in a window we are not looking at was not recorded")
+	}
+	if n := m.Unread()["#here"]; n != 1 {
+		t.Fatalf("unread = %d, want 1: a mention is also an unread line", n)
+	}
+
+	// Looking at the window clears both. What remains is the highlight on the line
+	// itself, which is how a mention in the window you are reading is shown: there
+	// is no badge to earn when the text is already in front of you.
+	m = m.SetActive("#here")
+	if m.Mentions()["#here"] || m.Unread()["#here"] != 0 {
+		t.Fatal("switching to the window did not clear the mention")
+	}
+	hits := m.Search("hey alice")
+	if len(hits) != 1 || !hits[0].Line.Mention {
+		t.Fatalf("the line lost its mention flag: %+v", hits)
+	}
+}
+
+// TestMentionDetectionIsWordBoundary is the rule that keeps the highlight honest.
+// A substring test flags "alice" inside "malice", and a user who is told they were
+// mentioned when they were not stops trusting the highlight.
+func TestMentionDetectionIsWordBoundary(t *testing.T) {
+	tr := &Transport{own: map[string]bool{"alice": true}, windows: map[string]bool{}}
+	cases := []struct {
+		text string
+		want bool
+	}{
+		{"alice: are you there", true},
+		{"hey alice", true},
+		{"ALICE", true},
+		{"(alice)", true},
+		{"malice", false},
+		{"alicea", false},
+		{"palice", false},
+		{"nothing here", false},
+	}
+	for _, c := range cases {
+		if got := tr.mentionsUs("bob", c.text); got != c.want {
+			t.Errorf("mentionsUs(%q) = %v, want %v", c.text, got, c.want)
+		}
+	}
+	// Our own lines are never a mention.
+	if tr.mentionsUs("alice", "alice was here") {
+		t.Error("a line from ourselves was counted as a mention")
+	}
+}
+
+// TestSearchFindsAcrossWindows pins W4's in-client half: the query crosses every
+// window, not just the open one, and results carry the window they came from so a
+// click can jump there.
+func TestSearchFindsAcrossWindows(t *testing.T) {
+	m := New("#one")
+	m, _ = m.Step(Incoming(Line{Window: "#one", Nick: "a", Text: "the deploy failed"}))
+	m, _ = m.Step(Incoming(Line{Window: "#two", Nick: "b", Text: "a different deploy"}))
+	m, _ = m.Step(Incoming(Line{Window: "#two", Nick: "c", Text: "unrelated"}))
+
+	hits := m.Search("deploy")
+	if len(hits) != 2 {
+		t.Fatalf("hits = %d, want 2: %+v", len(hits), hits)
+	}
+	seen := map[string]bool{}
+	for _, h := range hits {
+		seen[h.Window] = true
+	}
+	if !seen["#one"] || !seen["#two"] {
+		t.Fatalf("search did not cross windows: %+v", hits)
+	}
+	// Case-insensitive, and it searches the nick too.
+	if len(m.Search("DEPLOY")) != 2 {
+		t.Error("search is case-sensitive")
+	}
+	if len(m.Search("b")) == 0 {
+		t.Error("search does not match nicks")
+	}
+	if len(m.Search("   ")) != 0 {
+		t.Error("an empty query returned results")
+	}
+}
+
+// TestSearchFrameReachesTheClient pins that the answer actually goes out on the
+// socket: a search that runs and is never sent looks identical to one that found
+// nothing.
+func TestSearchFrameReachesTheClient(t *testing.T) {
+	Configure()
+	p := NewProgram("#one", nil)
+	p.Step(Incoming(Line{Window: "#one", Nick: "a", Text: "needle in here"}))
+	srv := newWSServer(t, p)
+	c, _ := wsDial(t, srv)
+
+	if err := c.WriteJSON(Frame{Type: "search", Query: "needle"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		var f Frame
+		if err := c.ReadJSON(&f); err != nil {
+			t.Fatalf("waiting for results: %v", err)
+		}
+		if f.Type != "results" {
+			continue
+		}
+		if f.Query != "needle" || len(f.SearchResults) != 1 {
+			t.Fatalf("results frame = %+v", f)
+		}
+		if f.SearchResults[0].Window != "#one" {
+			t.Fatalf("hit window = %q", f.SearchResults[0].Window)
+		}
+		return
+	}
+}
+
+// TestWSCommandImmediatelyAfterConnectIsNotSwallowed is the regression test for a
+// race that produced an intermittent "waiting for state" timeout.
+//
+// The poller's baseline revision used to be read after the first frame was written.
+// A command applied in that window moved the revision before the baseline was
+// taken, so the poller believed it had already sent that state and never sent it:
+// the client's command looked ignored, sometimes, depending on timing. The baseline
+// is now read from the same lock acquisition as the first render.
+func TestWSCommandImmediatelyAfterConnectIsNotSwallowed(t *testing.T) {
+	Configure()
+	p := NewProgram("#one", nil)
+	p.Step(Incoming(Line{Window: "#two", Nick: "a", Text: "in two"}))
+	srv := newWSServer(t, p)
+	c, first := wsDial(t, srv)
+
+	var target string
+	for _, w := range first.Windows {
+		if w != first.Active {
+			target = w
+			break
+		}
+	}
+	if target == "" {
+		t.Fatalf("need a second window, got %v", first.Windows)
+	}
+
+	// Send immediately, with no pause: this is the window that used to be lost.
+	if err := c.WriteJSON(Frame{Type: "select", Active: target}); err != nil {
+		t.Fatal(err)
+	}
+	f := readState(t, c, 5*time.Second, func(f Frame) bool { return f.Active == target })
+	if f.Active != target {
+		t.Fatalf("active = %q, want %q", f.Active, target)
+	}
+}

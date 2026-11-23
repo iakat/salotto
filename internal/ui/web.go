@@ -47,6 +47,32 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   aside.windows .win:hover { background: #1e1e2b; }
   aside.windows .win.active { background: #2d2d44; color: #fff; font-weight: 600; }
+  aside.windows .win { display: flex; justify-content: space-between; gap: 6px; }
+  aside.windows .win .name { overflow: hidden; text-overflow: ellipsis; }
+  /* A mention is the strongest signal in the sidebar: something was said to you.
+     It outranks "there is something new", so the mention class wins over unread
+     and the count is not drawn at all. */
+  aside.windows .win.mention { color: #ffd76b; font-weight: 700; }
+  aside.windows .badge { flex: 0 0 auto; min-width: 16px; text-align: center;
+    border-radius: 8px; padding: 0 4px; font-size: 11px; line-height: 15px;
+    background: #3a3a55; color: #cfcfe8; }
+  aside.windows .win.mention .badge { background: #ffd76b; color: #22190a; }
+  /* Search sits above the terminal: a query is about the scrollback, and the
+     results overlay it rather than replacing it, so context is not lost. */
+  div.searchbar { display: flex; gap: 8px; padding: 6px 12px;
+    border-bottom: 1px solid #2a2a3a; background: #16161f; }
+  div.searchbar input { flex: 1; background: #0e0e15; color: #e6e6f0;
+    border: 1px solid #2a2a3a; border-radius: 4px; padding: 4px 8px;
+    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  div.results { max-height: 40%; overflow-y: auto; background: #13131c;
+    border-bottom: 1px solid #2a2a3a;
+    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  div.results .head { padding: 6px 12px; color: #7a7a95; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .06em; }
+  div.results .hit { padding: 4px 12px; cursor: pointer; color: #c6c6dd; }
+  div.results .hit:hover { background: #1e1e2b; }
+  div.results .hl { color: #ffd76b; font-weight: 600; }
+  div.results .hn { color: #8fb7ff; }
   div.wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   div.banner { padding: 6px 12px; background: #5a2020; color: #ffdede;
     font: 13px ui-monospace, monospace; }
@@ -71,6 +97,10 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 <aside class="windows" id="windows"><h2>windows</h2></aside>
 <div class="wrap">
 <div class="banner" id="banner" hidden></div>
+<div class="searchbar">
+  <input id="search" placeholder="search scrollback (enter to run, esc to clear)">
+</div>
+<div class="results" id="results" hidden></div>
 <pre class="term-container" id="term">{{.Terminal}}</pre>
 <form class="input" id="input" method="post" action="/" autocomplete="off">
   <input name="line" id="line" placeholder="message or /command" autofocus>

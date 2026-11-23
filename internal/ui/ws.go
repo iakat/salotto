@@ -30,6 +30,17 @@ type Frame struct {
 	Windows []string `json:"windows,omitempty"`
 	Active  string   `json:"active,omitempty"`
 
+	// Unread is the per-window count of lines that arrived while the user was not
+	// looking, and Mentions marks the windows where they were addressed. Two
+	// fields because they answer two questions, and the sidebar draws them
+	// differently: a count is information, a mention is a summons.
+	Unread   map[string]int  `json:"unread,omitempty"`
+	Mentions map[string]bool `json:"mentions,omitempty"`
+
+	// SearchResults is populated only in reply to a "search" request.
+	SearchResults []SearchHit `json:"results,omitempty"`
+	Query         string      `json:"query,omitempty"`
+
 	// Input mirrors the model's input buffer, so a second device attached to the
 	// same bouncer sees what is being typed. Empty means nothing in flight.
 	Input string `json:"input,omitempty"`
@@ -42,6 +53,13 @@ type Frame struct {
 	// exists to avoid.
 	Connected bool   `json:"connected,omitempty"`
 	Status    string `json:"status,omitempty"`
+}
+
+// SearchHit is one search result on the wire: which window, who, and what.
+type SearchHit struct {
+	Window string `json:"window"`
+	Nick   string `json:"nick"`
+	Text   string `json:"text"`
 }
 
 // upgrader is permissive about the origin because the front end is served from the
@@ -77,7 +95,11 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 		return conn.WriteJSON(f)
 	}
 
-	state := func() Frame {
+	// state renders the model and reports the revision it rendered. Both come out
+	// of one lock acquisition so the pair is consistent: a revision read after the
+	// render could miss a change that landed in between, and the client would then
+	// wait for an update that had already happened.
+	state := func() (Frame, uint64) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		return Frame{
@@ -88,12 +110,18 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 			Input:     p.model.Input(),
 			Connected: p.model.Connected(),
 			Status:    p.model.Status(),
-		}
+			Unread:    p.model.Unread(),
+			Mentions:  p.model.Mentions(),
+		}, p.rev
 	}
 
 	// Attach: the first frame is always the current state, so a reconnecting
-	// browser redraws without asking.
-	if err := write(state()); err != nil {
+	// browser redraws without asking. The revision it was rendered at is the
+	// poller's baseline: taking the baseline any later would swallow a command the
+	// client sent immediately after connecting, which is exactly what a browser
+	// does when it restores a half-typed line or switches window on load.
+	first, baseline := state()
+	if err := write(first); err != nil {
 		return
 	}
 
@@ -108,17 +136,19 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		tick := time.NewTicker(120 * time.Millisecond)
 		defer tick.Stop()
-		last := p.Revision()
+		last := baseline
 		for {
 			select {
 			case <-done:
 				return
 			case <-tick.C:
-				if rev := p.Revision(); rev != last {
-					last = rev
-					if err := write(state()); err != nil {
-						return
-					}
+				if p.Revision() == last {
+					continue
+				}
+				f, rev := state()
+				last = rev
+				if err := write(f); err != nil {
+					return
 				}
 			}
 		}
@@ -145,6 +175,16 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 		case "input":
 			// Typing is mirrored but not committed: replace the buffer.
 			p.SetInput(f.Text)
+		case "search":
+			// Search is answered in a frame of its own rather than through the
+			// model's revision counter: it is a question the client asked, not a
+			// change in state, and a render-tick would make the answer arrive some
+			// indeterminate time later.
+			hits := p.Search(f.Query)
+			out := Frame{Type: "results", Query: f.Query, SearchResults: hits}
+			if err := write(out); err != nil {
+				return
+			}
 		}
 		// Every command produces a state frame on the next tick, so no reply is
 		// needed here; the client is already subscribed to the render.

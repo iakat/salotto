@@ -16,6 +16,8 @@
   var inputEl = document.getElementById("line");
   var bannerEl = document.getElementById("banner");
   var statusEl = document.getElementById("status");
+  var searchEl = document.getElementById("search");
+  var resultsEl = document.getElementById("results");
 
   // -- ANSI → HTML ----------------------------------------------------------
   // Only the sequences the server actually emits: SGR colour (8-bit, which the
@@ -24,6 +26,15 @@
   // the HTML, but this path is the one a user's own message travels.
   var FG = ["#000", "#800", "#080", "#880", "#008", "#808", "#088", "#ccc",
             "#888", "#f00", "#0f0", "#ff0", "#00f", "#f0f", "#0ff", "#fff"];
+
+  // esc is used for anything that goes into markup as text. Window names come
+  // from the wire (a channel name is user input), so they are escaped rather than
+  // trusted.
+  function esc(v) {
+    return String(v).replace(/[&<>"]/g, function (c) {
+      return c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;";
+    });
+  }
 
   function xterm256(n) {
     if (n < 16) return FG[n];
@@ -105,15 +116,27 @@
 
     if (Array.isArray(f.windows)) {
       active = f.active || active;
+      var unread = f.unread || {};
+      var mentions = f.mentions || {};
       var html = "";
       for (var i = 0; i < f.windows.length; i++) {
         var name = f.windows[i];
-        var cls = name === active ? "win active" : "win";
-        html += '<div class="' + cls + '" data-window="' +
-          name.replace(/"/g, "&quot;") + '">' +
-          name.replace(/[&<>]/g, function (c) {
-            return c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;";
-          }) + "</div>";
+        var cls = "win";
+        if (name === active) cls += " active";
+        // A mention is not just "something new": it is something for you, so it
+        // gets its own class and the count is not drawn. Showing both would be
+        // two competing signals for the same glance.
+        if (mentions[name]) cls += " mention";
+        var label = esc(name);
+        // "status" is the bouncer's own window and is always present; a badge on
+        // it would be noise, since every NOTICE lands there.
+        var badge = "";
+        if (name !== "status") {
+          if (mentions[name]) badge = '<span class="badge">@</span>';
+          else if (unread[name] > 0) badge = '<span class="badge count">' + unread[name] + "</span>";
+        }
+        html += '<div class="' + cls + '" data-window="' + esc(name) + '">' +
+          '<span class="name">' + label + "</span>" + badge + "</div>";
       }
       listEl.innerHTML = html;
     }
@@ -144,6 +167,7 @@
       var f;
       try { f = JSON.parse(ev.data); } catch (e) { return; }
       if (f.type === "state") draw(f);
+      else if (f.type === "results") renderResults(f);
     };
     ws.onclose = function () {
       bannerEl.textContent = "disconnected — reconnecting";
@@ -213,6 +237,61 @@
       ws.send(JSON.stringify({ type: "select", active: name }));
     }
   });
+
+  // -- search ---------------------------------------------------------------
+  // The query goes to the server, which owns the scrollback. Searching in the
+  // browser would search only what has been rendered into the page, which is a
+  // different and much smaller set than what the bouncer holds.
+  function renderResults(f) {
+    if (!resultsEl) return;
+    var hits = f.results || [];
+    if (!hits.length) {
+      resultsEl.hidden = true;
+      resultsEl.innerHTML = "";
+      return;
+    }
+    var html = '<div class="head">' + hits.length + ' match' +
+      (hits.length === 1 ? "" : "es") + ' for ' + esc(f.query) + "</div>";
+    for (var i = 0; i < hits.length; i++) {
+      var h = hits[i];
+      html += '<div class="hit" data-window="' + esc(h.window) + '">' +
+        '<span class="hl">' + esc(h.window) + "</span> " +
+        '<span class="hn">&lt;' + esc(h.nick || "") + "&gt;</span> " +
+        esc(h.text) + "</div>";
+    }
+    resultsEl.innerHTML = html;
+    resultsEl.hidden = false;
+  }
+
+  if (searchEl) {
+    searchEl.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") {
+        searchEl.value = "";
+        renderResults({ results: [] });
+        return;
+      }
+      if (e.key !== "Enter") return;
+      var q = searchEl.value.trim();
+      if (!q) { renderResults({ results: [] }); return; }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "search", query: q }));
+      }
+    });
+  }
+
+  if (resultsEl) {
+    // Clicking a hit jumps to the window it came from, which is the part The
+    // Lounge's search cannot do and the reason ours is worth having.
+    resultsEl.addEventListener("click", function (e) {
+      var el = e.target;
+      while (el && el !== resultsEl && !el.getAttribute("data-window")) el = el.parentNode;
+      if (!el || el === resultsEl) return;
+      var name = el.getAttribute("data-window");
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "select", active: name }));
+      }
+    });
+  }
 
   connect();
 })();
