@@ -30,6 +30,11 @@ data:
     nick = "e2e"
     altnick = "e2e_"
     keepnick = true
+    # simple_away parity: same reason and same 5 s wait as the ZNC fixture, so a
+    # client detaching produces the same AWAY sentence on both sides.
+    away = true
+    away_wait = 5
+    away_reason = "Auto away at %awaytime%"
     realname = "e2e salotto"
     channels = ["#e2e"]
 ---

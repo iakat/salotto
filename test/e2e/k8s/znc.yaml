@@ -67,6 +67,11 @@ data:
             LoadModule = chansaver
             LoadModule = keepnick
             LoadModule = buffextras
+            # simple_away with a short wait so the parity harness can watch the
+            # away actually happen instead of waiting 60 s. The reason is set to
+            # the module default explicitly so the e2e comparison is about the
+            # expansion, not about which default each side chose.
+            LoadModule = simple_away -timer 5 Auto away at %awaytime%
             IRCConnectEnabled = true
             # CServer::Parse (src/Server.cpp): "host port", and a "+" prefix on
             # the port means SSL. "+6667" is therefore TLS, not a port number.

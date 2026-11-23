@@ -338,6 +338,78 @@ def case_chansaver(b: Bouncer, channel: str) -> dict:
     return {"rejoined_after_part": rejoin}
 
 
+class ErgoObserver:
+    """A plain IRC client on ergo, used to see what the bouncer does on the wire.
+
+    Some behaviour only exists upstream: simple_away's whole observable effect is
+    an `AWAY :reason` that ergo relays to the channels we share. Asking the
+    bouncer about it would be asking the defendant for a reference, so the away
+    case watches ergo instead.
+    """
+
+    def __init__(self, host: str, port: int, nick: str, channel: str):
+        self.sock = socket.create_connection((host, port), timeout=15)
+        self.sock.settimeout(0.3)
+        self.buf = b""
+        self.pending: list[str] = []
+        self.send("NICK " + nick)
+        self.send("USER %s 0 * :%s observer" % (nick, nick))
+        self.drain(1.5)
+        self.send("JOIN " + channel)
+        self.drain(1.5)
+
+    def send(self, line: str) -> None:
+        self.sock.sendall(line.encode() + b"\r\n")
+
+    def drain(self, seconds: float = 1.0) -> list[str]:
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                chunk = self.sock.recv(65536)
+            except (socket.timeout, OSError):
+                continue
+            if not chunk:
+                break
+            self.buf += chunk
+            while b"\n" in self.buf:
+                raw, self.buf = self.buf.split(b"\n", 1)
+                self.pending.append(raw.rstrip(b"\r").decode("utf-8", "replace"))
+        out, self.pending = self.pending, []
+        return out
+
+    def close(self) -> None:
+        try:
+            self.send("QUIT :done")
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def run_away(host: str, port: int, nick: str, dialect: str, password: str | None,
+             channel: str, ergo_host: str, ergo_port: int) -> dict:
+    """Detach, wait, and see whether an AWAY reaches ergo.
+
+    The bouncer is driven only to connect; the measurement is taken on the IRC
+    server, which is the only place the away is real. The reason is compared by
+    shape, not by value: the timestamp legitimately differs between the two runs.
+    """
+    obs = ErgoObserver(ergo_host, ergo_port, "obs" + ("z" if dialect == "znc" else "s"), channel)
+    try:
+        b = Bouncer(host, port, nick, dialect, password)
+        b.drain(2.0)
+        b.close()          # the last client leaving is what arms simple_away
+        lines = obs.drain(12.0)
+    finally:
+        obs.close()
+
+    aways = [l for l in lines if " AWAY " in l or l.rstrip().endswith(" AWAY")]
+    reason_ok = any(re.search(r"AWAY :Auto away at \w{3} \w{3} [ \d]\d [\d:]{8} \d{4} UTC", l) for l in aways)
+    return {
+        "away_sent": bool(aways),
+        "reason_has_znc_format": reason_ok,
+    }
+
+
 def run(host: str, port: int, nick: str, dialect: str, password: str | None, channel: str) -> dict:
     b = Bouncer(host, port, nick, dialect, password)
     out: dict[str, dict] = {}
@@ -387,6 +459,7 @@ def main() -> int:
     # Password), so both run under the same identity: the same test, twice.
     ap.add_argument("--nick", default="e2e")
     ap.add_argument("--channel", default="#e2e")
+    ap.add_argument("--ergo", default="salotto-e2e-ergo:6667")
     ap.add_argument("--json", default="")
     args = ap.parse_args()
 
@@ -397,8 +470,15 @@ def main() -> int:
     zh, zp = split(args.znc)
     sh, sp = split(args.salotto)
 
+    eh, ep = split(args.ergo)
+
     znc = run(zh, zp, args.nick, "znc", args.znc_pass, args.channel)
     sal = run(sh, sp, args.nick, "salotto", None, args.channel)
+    # The away case runs after the others and one bouncer at a time: both are
+    # attached to the same ergo under nick e2e/e2e_, and an away probe needs the
+    # channel quiet.
+    znc["away"] = run_away(zh, zp, args.nick, "znc", args.znc_pass, args.channel, eh, ep)
+    sal["away"] = run_away(sh, sp, args.nick, "salotto", None, args.channel, eh, ep)
 
     diffs, same, deviations = [], [], []
     for case in sorted(set(znc) | set(sal)):
