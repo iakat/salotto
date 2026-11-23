@@ -224,7 +224,7 @@ Grouped, because 59 rows is a wall, and the grouping *is* the decision.
 | `sasl` | SASL PLAIN | **have** |
 | `cert` / `certauth` | SASL EXTERNAL via client cert | B6 |
 
-**Refuse — do not implement (8, with reasons)**
+**Refuse — do not implement (9, with reasons)**
 
 | module | why not |
 |---|---|
@@ -234,22 +234,21 @@ Grouped, because 59 rows is a wall, and the grouping *is* the decision.
 | `identfile` | writes an ident file for a *host* we may not own; the container case makes it meaningless. |
 | `listsockets` | an `ss` invocation, not a feature. |
 | `raw`, `send_raw`, `shell`, `admindebug` | arbitrary command execution from a chat client. Absolutely not. |
+| `lastseen` | misnamed in this queue's earlier draft. `modules/lastseen.cpp` tracks `CUser` accounts, not IRC nicks: `OnClientLogin`/`OnClientDisconnect` call `SetTime(GetUser())` and the only command is an admin-only `Show` table of every user's last login. That is the multi-tenant admin surface we refuse (`ListUsers`, R2). It would tell you nothing about when a nick was last active. |
 
 **Defer — decide later, not v1 (the remaining ~37)**
 
 `alias`, `autoattach`, `autocycle`, `autoop`, `autoreply`, `autovoice`,
 `blockuser`, `cert` (extras), `clientnotify`, `controlpanel`, `corecaps`,
 `crypt`, `ctcpflood`, `cyrusauth`, `disconkick`, `fail2ban`, `flooddetach`,
-`imapauth`, `kickrejoin`, `lastseen`, `missingmotd`, `modules_online`, `nickserv`,
+`imapauth`, `kickrejoin`, `missingmotd`, `modules_online`, `nickserv`,
 `notes`, `notify_connect`, `route_replies`, `sample`, `samplewebapi`,
 `saslplainauth`, `schat`, `watch`.
 
 Each of these is a genuine feature; none is required for a bouncer to be a
 bouncer. They go into the backlog one at a time, with the behaviour that motivates
-them, not as a "parity checklist". Two deserve an early note:
+them, not as a "parity checklist". One deserves an early note:
 
-- `lastseen` — trivial to do well and genuinely useful, but it is *state about
-  people*, so it needs a retention rule before code.
 - `fail2ban` / `ctcpflood` / `flooddetach` — these are anti-abuse. They are the
   reason a public bouncer survives; schedule them with the exposure decision, not
   with the convenience features.
