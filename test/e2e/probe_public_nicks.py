@@ -34,9 +34,9 @@ def main():
     a = WS(HOSTS["alice"])
     a.state()
     join(a, CHANNEL)
-    # Alice asks for the names; the IRCd answers with 353/366, which the bouncer
-    # turns into a Nicklist on her socket.
-    a.send({"type": "send", "text": "/names " + CHANNEL})
+    # No explicit /names: joining a channel is supposed to bring the member list,
+    # and a probe that quietly asks for it anyway would hide a front end where a
+    # join leaves the nicklist empty. (Verified separately that it does not.)
     try:
         f = a.state(30.0, lambda f: f.get("active") == CHANNEL and f.get("nicks"))
         print("alice's nicklist:", names(f))
