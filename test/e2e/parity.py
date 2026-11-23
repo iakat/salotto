@@ -334,6 +334,27 @@ def case_connect_disconnect(b: Bouncer) -> dict:
     }
 
 
+def join_and_confirm(b: Bouncer, channel: str, budget: float = 90.0) -> bool:
+    """Join a channel and wait for RPL_ENDOFNAMES (366), retrying.
+
+    A bouncer's upstream can be down when the client speaks: the client line is then
+    dropped, no JOIN reaches the IRCd, and any later assertion about "the channel we
+    joined" is about a join that never happened. That is not a hypothetical — it is
+    why the chansaver control failed on salotto while the module worked: the case
+    sent JOIN during salotto's reconnect backoff.
+
+    366 is the honest proof the join landed, because the server answers it and the
+    bouncer can only relay what it received. Returns whether it landed.
+    """
+    end = time.time() + budget
+    while time.time() < end:
+        b.send("JOIN " + channel)
+        for line in b.drain(6.0):
+            if " 366 " in line and channel.lower() in line.lower():
+                return True
+    return False
+
+
 def _reconnect_and_watch(b: Bouncer, needle: str, budget: float = 75.0) -> tuple[bool, list[str]]:
     """Disconnect and reconnect, then watch for a JOIN of `needle`.
 
@@ -379,19 +400,27 @@ def case_chansaver(b: Bouncer, channel: str) -> dict:
     keep = "%s-keep%d" % (channel, stamp)
     gone = "%s-gone%d" % (channel, stamp)
 
-    # Positive control: joined in-session, so a reconnect must bring it back.
-    b.send("JOIN " + keep)
-    b.drain(2.0)
-    kept, seen_keep = _reconnect_and_watch(b, keep)
+    # Positive control: joined in-session, so a reconnect must bring it back. The
+    # join is confirmed against the server first: a bouncer whose upstream is down
+    # drops the client's JOIN, and then the control is testing nothing.
+    joined_keep = join_and_confirm(b, keep)
 
     # Negative: joined then parted in-session, so a reconnect must leave it out.
-    b.send("JOIN " + gone)
-    b.drain(2.0)
+    joined_gone = join_and_confirm(b, gone)
     b.send("PART " + gone)
     b.drain(2.0)
+
+    kept, seen_keep = _reconnect_and_watch(b, keep)
     back, seen_part = _reconnect_and_watch(b, gone)
 
     if os.environ.get("CHANSAVER_DEBUG"):
+        # The bouncer's own view of the saved list: this separates "the module never
+        # recorded the channel" from "it recorded it but did not re-join".
+        saved = b.cmd("ListChans", seconds=2.0)
+        print("### saved list:", file=sys.stderr)
+        for l in saved:
+            if l.strip():
+                print("###   %r" % l, file=sys.stderr)
         for tag, lines in (("keep", seen_keep), ("gone", seen_part)):
             print("### %s: %d lines" % (tag, len(lines)), file=sys.stderr)
             for l in lines:
@@ -406,11 +435,15 @@ def case_chansaver(b: Bouncer, channel: str) -> dict:
     b.drain(1.5)
 
     return {
+        # The joins had to land upstream for the rest to mean anything; if they did
+        # not, say so instead of reporting a chansaver verdict built on nothing.
+        "joined_keep": joined_keep,
+        "joined_gone": joined_gone,
         "kept_after_reconnect": kept,
         "parted_channel_came_back": back,
         # False whenever the control failed, so two matching silences cannot look
         # like agreement.
-        "chansaver_ok": kept and not back,
+        "chansaver_ok": joined_keep and joined_gone and kept and not back,
     }
 
 
@@ -530,24 +563,42 @@ def run_away(host: str, port: int, nick: str, dialect: str, password: str | None
         obs.close()
 
 
-def run(host: str, port: int, nick: str, dialect: str, password: str | None, channel: str) -> dict:
+def run(host: str, port: int, nick: str, dialect: str, password: str | None, channel: str, only: set[str] | None = None) -> dict:
     b = Bouncer(host, port, nick, dialect, password)
     out: dict[str, dict] = {}
+
+    def want(case: str) -> bool:
+        return only is None or case in only
+
     try:
-        out["registration"] = case_registration(b)
-        out["join"] = case_join_echo(b, channel)
-        out["playback"] = case_playback(b, channel, "parity-play")
-        out["listchans"] = case_listchans(b, channel)
-        out["setbuffer"] = case_setbuffer(b, channel)
-        out["disable"] = case_disable(b, channel)
-        out["clear"] = case_clear(b, channel, "parity-clear")
-        out["fingerprints"] = case_fingerprints(b)
-        out["listnetworks"] = case_listnetworks(b)
-        out["listservers"] = case_listservers(b)
-        out["listclients"] = case_listclients(b)
-        out["traffic"] = case_traffic(b)
-        out["connect_disconnect"] = case_connect_disconnect(b)
-        out["chansaver"] = case_chansaver(b, channel)
+        if want("registration"):
+            out["registration"] = case_registration(b)
+        if want("join"):
+            out["join"] = case_join_echo(b, channel)
+        if want("playback"):
+            out["playback"] = case_playback(b, channel, "parity-play")
+        if want("listchans"):
+            out["listchans"] = case_listchans(b, channel)
+        if want("setbuffer"):
+            out["setbuffer"] = case_setbuffer(b, channel)
+        if want("disable"):
+            out["disable"] = case_disable(b, channel)
+        if want("clear"):
+            out["clear"] = case_clear(b, channel, "parity-clear")
+        if want("fingerprints"):
+            out["fingerprints"] = case_fingerprints(b)
+        if want("listnetworks"):
+            out["listnetworks"] = case_listnetworks(b)
+        if want("listservers"):
+            out["listservers"] = case_listservers(b)
+        if want("listclients"):
+            out["listclients"] = case_listclients(b)
+        if want("traffic"):
+            out["traffic"] = case_traffic(b)
+        if want("connect_disconnect"):
+            out["connect_disconnect"] = case_connect_disconnect(b)
+        if want("chansaver"):
+            out["chansaver"] = case_chansaver(b, channel)
     finally:
         b.close()
     return out
@@ -561,7 +612,7 @@ def run(host: str, port: int, nick: str, dialect: str, password: str | None, cha
 # `rejoined_after_part: false` on both sides while the feature was working — the
 # negative half is correct, but only a positive control can prove it.
 MUST_BE_TRUE: dict[str, dict[str, bool]] = {
-    "chansaver": {"kept_after_reconnect": True},
+    "chansaver": {"joined_keep": True, "joined_gone": True, "kept_after_reconnect": True},
     "join": {"joined": True},
     "playback": {"played": True},
     "registration": {"welcome": True},
@@ -598,7 +649,11 @@ def main() -> int:
     ap.add_argument("--channel", default="#e2e")
     ap.add_argument("--ergo", default="salotto-e2e-ergo:6667")
     ap.add_argument("--json", default="")
+    # One case at a time, for debugging a single scenario without paying for the
+    # whole suite: `--only chansaver`.
+    ap.add_argument("--only", default="")
     args = ap.parse_args()
+    only = {c.strip() for c in args.only.split(",") if c.strip()} or None
 
     def split(addr: str) -> tuple[str, int]:
         host, _, port = addr.rpartition(":")
@@ -609,18 +664,21 @@ def main() -> int:
 
     eh, ep = split(args.ergo)
 
-    znc = run(zh, zp, args.nick, "znc", args.znc_pass, args.channel)
-    sal = run(sh, sp, args.nick, "salotto", None, args.channel)
+    znc = run(zh, zp, args.nick, "znc", args.znc_pass, args.channel, only)
+    sal = run(sh, sp, args.nick, "salotto", None, args.channel, only)
     # The away case runs after the others and one bouncer at a time: both are
     # attached to the same ergo under nick e2e/e2e_, and an away probe needs the
     # channel quiet.
-    znc["away"] = run_away(zh, zp, args.nick, "znc", args.znc_pass, args.channel, eh, ep)
-    sal["away"] = run_away(sh, sp, args.nick, "salotto", None, args.channel, eh, ep)
+    if only is None or "away" in only:
+        znc["away"] = run_away(zh, zp, args.nick, "znc", args.znc_pass, args.channel, eh, ep)
+        sal["away"] = run_away(sh, sp, args.nick, "salotto", None, args.channel, eh, ep)
 
     # A predicate that must hold, checked per side *before* the comparison: two
     # identical failures are not parity, they are a broken fixture.
     unmet = []
     for case, fields in MUST_BE_TRUE.items():
+        if only is not None and case not in only:
+            continue
         for field, want in fields.items():
             for side, got in (("znc", znc), ("salotto", sal)):
                 value = (got.get(case) or {}).get(field)
