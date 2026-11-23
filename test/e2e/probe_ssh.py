@@ -69,11 +69,7 @@ def main():
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        # A password must be offered even though the server accepts any: with no
-        # password, no key and no agent, paramiko fails client-side with "No
-        # authentication methods available", which looks exactly like a server
-        # that advertises none.
-        client.connect(SSH_HOST, port=SSH_PORT, username="probe", password="probe",
+        client.connect(SSH_HOST, port=SSH_PORT, username="probe",
                        look_for_keys=False, allow_agent=False, timeout=10)
     except Exception as e:
         print("FAIL: could not open an SSH session:", e)
