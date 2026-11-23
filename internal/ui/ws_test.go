@@ -1290,3 +1290,60 @@ func stripANSI(s string) string {
 	}
 	return b.String()
 }
+
+// TestTheNickListAppearsOnlyOnce pins the duplicate katia saw: the browser has its own
+// nick panel, and the old page ALSO embedded the TUI render, which draws its own nick
+// column. Every member appeared twice - once as a sidebar and once inside the framed
+// terminal.
+//
+// The fix is that the page embeds Body, which carries no nick column at all: the
+// members travel as structured data and the browser draws them where a browser
+// expects them. This asserts the body really is free of them, because the duplication
+// is invisible to any test that only counts the frame's fields.
+func TestTheNickListAppearsOnlyOnce(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Resize(100, 20)
+	p.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "hi"}))
+	p.Step(Nicklist{Window: "#c", Nicks: []Nick{{Name: "alice", Prefix: "@"}, {Name: "zebediah"}}})
+
+	srv := newWSServer(t, p)
+	_, f := wsDial(t, srv)
+
+	body := strings.Join(f.Body, "\n")
+	if strings.Contains(body, "zebediah") {
+		t.Fatalf("the nick column is inside the conversation, so the browser draws it twice:\n%s", body)
+	}
+	// The members must still be there as data: the sidebar is the one place they are
+	// drawn.
+	found := false
+	for _, n := range f.Nicks {
+		if n.Name == "zebediah" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the nick is nowhere: %+v", f.Nicks)
+	}
+}
+
+// TestThePageDoesNotEmbedAFrame pins the same thing from the server-rendered page, for
+// a browser that has not opened a socket yet: no TUI border, no second input line.
+func TestThePageDoesNotEmbedAFrame(t *testing.T) {
+	p := NewProgram("#c", nil)
+	p.Resize(80, 24)
+	p.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "hello"}))
+
+	srv := httptest.NewServer(Handler(p))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	page, _ := io.ReadAll(resp.Body)
+
+	if strings.Contains(string(page), "\u256d") {
+		t.Fatal("the page embeds the TUI frame, so the conversation is framed twice")
+	}
+}
