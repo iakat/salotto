@@ -280,16 +280,23 @@ func jitter(d time.Duration) time.Duration {
 // sleepBackoff waits out the backoff but returns early when the run loop is
 // poked: a CONNECT while we are backing off must dial at once, not up to a
 // minute later.
-func sleepBackoff(ctx context.Context, poke <-chan struct{}, d time.Duration) bool {
+// sleepBackoff waits out the backoff. It reports whether to keep running and
+// whether the wait was cut short by a poke, i.e. by someone asking us to connect
+// now rather than by the timer expiring. The caller must distinguish the two:
+// doubling the backoff after a user-initiated CONNECT is how a bouncer ends up
+// taking minutes to reconnect after a handful of manual disconnects, which is the
+// opposite of what the operator asked for. ZNC restarts the delay on an explicit
+// connect (CIRCNetwork::SetIRCConnectEnabled -> Connect), so a poke resets it.
+func sleepBackoff(ctx context.Context, poke <-chan struct{}, d time.Duration) (poked, ok bool) {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return false
+		return false, false
 	case <-poke:
-		return true
+		return true, true
 	case <-timer.C:
-		return true
+		return false, true
 	}
 }
 

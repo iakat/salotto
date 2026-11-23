@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import socket
 import sys
@@ -333,54 +334,84 @@ def case_connect_disconnect(b: Bouncer) -> dict:
     }
 
 
+def _reconnect_and_watch(b: Bouncer, needle: str, budget: float = 75.0) -> tuple[bool, list[str]]:
+    """Disconnect and reconnect, then watch for a JOIN of `needle`.
+
+    Every window is scanned, not just the one after the commands: a fast bouncer
+    brings the channel back *inside* the Connect command's own drain, so looking
+    only at later output reports a working rejoin as a failure. And the budget has
+    to outlast the slower bouncer's reconnect backoff — a short window measures the
+    harness's patience, not the bouncer's behaviour, which is how this case managed
+    to fail identically on both sides while the feature worked on one.
+
+    Returns (found, all lines seen).
+    """
+    seen: list[str] = []
+    b.cmd("Disconnect", seconds=2.5)
+    seen.extend(b.cmd("Connect", seconds=2.5))
+    end = time.time() + budget
+    found = any((" JOIN " in l) and (needle.lower() in l.lower()) for l in seen)
+    while not found and time.time() < end:
+        seen.extend(b.drain(0.5))
+        found = any((" JOIN " in l) and (needle.lower() in l.lower()) for l in seen)
+    return found, seen
+
+
 def case_chansaver(b: Bouncer, channel: str) -> dict:
-    """Does a channel the client joined inside the session survive a reconnect,
-    and does a channel the client parted stay gone?
+    """Does a channel joined inside the session survive a reconnect, and does a
+    parted channel stay gone?
 
     Both halves are needed. chansaver's job is that the saved list follows our own
     JOIN and PART (chansaver.cpp:69-92), and Disconnect/Connect drives the same
     rejoin path as a real reconnect without restarting either bouncer.
 
-    The negative half alone cannot distinguish "chansaver forgot the parted
-    channel" from "reconnect rejoins nothing at all" — exactly the difference
-    between a working feature and a dead one. So a throwaway channel is joined
-    first as a positive control: if reconnect does not bring *that* back, the
-    negative result below means nothing and the case fails loudly instead of
-    agreeing with itself.
+    The negative half alone cannot tell "chansaver forgot the parted channel" from
+    "reconnect rejoins nothing at all", and a dead chansaver produces exactly the
+    negative result. So a throwaway channel is joined first as a positive control:
+    if reconnect does not bring *that* back, the negative result below means
+    nothing. This is not hypothetical — with only the negative half, both bouncers
+    returned false, the harness called it parity, and salotto's chansaver was in
+    fact recording nothing at all (the facade could not tell which lines were
+    ours, so it never saw our JOIN).
+
+    The channel name is unique per run: a fixed name would already be in the saved
+    list from the previous run, so the join would be a no-op and the control would
+    pass without proving anything.
     """
-    keep = channel + "-keep"
-    b.send("JOIN " + keep)
-    b.drain(1.5)
+    keep = "%s-keep%d" % (channel, int(time.time()) % 100000)
 
     # Positive control: joined in-session, so a reconnect must bring it back.
-    b.cmd("Disconnect", seconds=1.5)
-    b.cmd("Connect", seconds=3.0)
-    lines = b.drain(6.0)
-    kept = any((" JOIN " in l) and (keep.lower() in l.lower()) for l in lines)
+    b.send("JOIN " + keep)
+    b.drain(2.0)
+    kept, seen_keep = _reconnect_and_watch(b, keep)
 
     # Negative: a PART must evict the channel from the saved list.
     b.send("PART " + channel)
-    b.drain(1.0)
-    b.cmd("Disconnect", seconds=1.5)
-    b.cmd("Connect", seconds=3.0)
-    lines = b.drain(6.0)
-    parts_back = any((" JOIN " in l) and (channel.lower() in l.lower()) for l in lines)
+    b.drain(2.0)
+    back, seen_part = _reconnect_and_watch(b, channel)
+
+    if os.environ.get("CHANSAVER_DEBUG"):
+        for tag, lines in (("keep", seen_keep), ("part", seen_part)):
+            print("### %s: %d lines" % (tag, len(lines)), file=sys.stderr)
+            for l in lines:
+                if "JOIN" in l.upper() or "366" in l:
+                    print("###   %r" % l, file=sys.stderr)
 
     # Restore the fixture: this case perturbs persistent state (the saved channel
     # list), so it has to put it back or every later case runs against a bouncer
     # that no longer auto-joins the channel — which is how it first made
-    # `playback` fail in the next run.
+    # `playback` fail in a later run.
     b.send("JOIN " + channel)
-    b.drain(1.5)
+    b.drain(2.0)
     b.send("PART " + keep)
-    b.drain(1.5)
+    b.drain(2.0)
 
     return {
         "kept_after_reconnect": kept,
-        "parted_channel_came_back": parts_back,
-        # A single verdict the harness can compare, and one that is False if the
-        # positive control failed, so the case cannot pass on silence twice.
-        "chansaver_ok": kept and not parts_back,
+        "parted_channel_came_back": back,
+        # One verdict, false if the control failed, so the case cannot pass on
+        # two matching silences.
+        "chansaver_ok": kept and not back,
     }
 
 

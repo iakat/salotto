@@ -74,3 +74,29 @@ debugging round:
 - `Version = 1.10.2` is required, and a `<Listener>` is required to listen.
 - `Server = host port` uses a space; `+6667` in that field means SSL, not a port
   offset (`CServer::Parse`).
+
+## A case that passes for the wrong reason
+
+Three times now a case has been green because both bouncers did nothing, which is
+not parity. Each one is now guarded, and the guards are the reason to trust the
+rest:
+
+- **`MUST_BE_TRUE`** in `parity.py` lists predicates that have to be *true* on both
+  sides before the comparison runs. `{"x": false} == {"x": false}` is a matching
+  pair, and the harness used to call that agreement. Without this table, `chansaver`
+  reported `kept_after_reconnect: false` on both sides and was counted as `same`.
+- **chansaver's positive control.** Its only original assertion was that a parted
+  channel does *not* come back after a reconnect — which is exactly what a dead
+  chansaver produces. It now joins a throwaway channel first and requires that to
+  survive the reconnect. That control is what exposed a real bug: salotto's
+  `networkAdapter` did not implement `Nick()`, so the facade could not tell which
+  lines were ours, so the chansaver recorded nothing and no channel was ever
+  re-joined. ZNC passed the control, salotto failed it.
+- **Every window is scanned, with a budget that outlasts the slow bouncer.** A
+  rejoin can happen inside the `Connect` command's own drain; watching only later
+  output reports a working rejoin as a failure, and a 20 s window measured the
+  harness's patience rather than ZNC's reconnect backoff.
+
+The rule that follows: when a differential case fails identically on both sides,
+suspect the measurement first — the fixtures are two different programs, so
+agreeing on nothing is usually the harness.

@@ -503,13 +503,11 @@ func (c *Conn) Run(ctx context.Context) {
 			backoff = c.cfg.BackoffMin
 		}
 
-		if !sleepBackoff(ctx, c.poke, backoff) {
+		poked, ok := sleepBackoff(ctx, c.poke, backoff)
+		if !ok {
 			return
 		}
-		backoff *= 2
-		if backoff > c.cfg.BackoffMax {
-			backoff = c.cfg.BackoffMax
-		}
+		backoff = nextBackoff(backoff, poked, c.cfg.BackoffMin, c.cfg.BackoffMax)
 	}
 }
 
@@ -547,3 +545,23 @@ func (c *Conn) liveServer() string {
 
 // setLiveServer records which server the current connection went to.
 func (c *Conn) setLiveServer(addr string) { c.activeServer.Store(addr) }
+
+// nextBackoff is the reconnect delay ladder: double on an ordinary failure, up to
+// the ceiling, but drop back to the floor when the wait was cut short by a poke —
+// somebody asked for this connection, and answering a request to connect now with
+// a longer delay is the opposite of what was asked. ZNC restarts the delay on an
+// explicit connect (CIRCNetwork::SetIRCConnectEnabled).
+//
+// It is a function rather than three inline lines so the ladder can be tested as
+// the ladder; inline, a test of sleepBackoff alone would pass while Run still
+// doubled after a poke, which is precisely the bug this guards.
+func nextBackoff(cur time.Duration, poked bool, min, max time.Duration) time.Duration {
+	if poked {
+		return min
+	}
+	cur *= 2
+	if max > 0 && cur > max {
+		cur = max
+	}
+	return cur
+}
