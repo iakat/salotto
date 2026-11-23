@@ -16,7 +16,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -45,7 +44,6 @@ func main() {
 func run() int {
 	addr := flag.String("addr", ":2222", "listen address")
 	bouncer := flag.String("bouncer", "", "bouncer address to attach to (host:port); empty serves a local-only UI")
-	password := flag.String("password", "", "SSH password; empty accepts any password (a bouncer front end is not a shell)")
 	nick := flag.String("nick", "salotto", "nick to register with the bouncer")
 	hostKey := flag.String("host-key", "", "path to the SSH host key (created if missing)")
 	banner := flag.String("banner", "salotto", "banner name shown to clients")
@@ -73,7 +71,6 @@ func run() int {
 		wish.WithAddress(*addr),
 		key,
 		wish.WithBanner(ui.Banner(*banner)),
-		wish.WithPasswordAuth(passwordAuth(*password)),
 		wish.WithMiddleware(session(*window, *bouncer, *nick)),
 	}
 	srv, err := wish.NewServer(opts...)
@@ -109,22 +106,6 @@ func run() int {
 		}
 	}
 	return 0
-}
-
-// passwordAuth is the SSH authentication policy.
-//
-// Without an explicit handler the server has no authentication methods at all and
-// refuses every client with "No authentication methods available" — an SSH front
-// end nobody can log into. There is no shell behind this server and nothing to
-// gain from secrecy, so an unset password accepts any password, which is what
-// every public SSH chat does; setting one simply keeps casual visitors out.
-func passwordAuth(want string) ssh.PasswordHandler {
-	return func(_ ssh.Context, got string) bool {
-		if want == "" {
-			return true
-		}
-		return subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1
-	}
 }
 
 // session is the SSH middleware: one TUI per session, each with its own bouncer
