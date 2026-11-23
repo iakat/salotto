@@ -216,7 +216,7 @@ Grouped, because 59 rows is a wall, and the grouping *is* the decision.
 | `stickychan` | keep channels joined | subsumed by chansaver + rejoin |
 | `simple_away` | auto-away on detach | **done** — `internal/facade/away.go`: away after `away_wait` with no client attached, back on attach, never fighting a user-set away (`simple_away.cpp` `m_bClientSetAway`/`m_bWeSetAway`) |
 | `awaynick` | change nick when away | **refuse** — retired in ZNC itself: the module's `OnLoad` returns false with "retired module - see https://wiki.znc.in/awaynick". Implementing it would be inventing behaviour upstream deleted |
-| `awaystore` | store and replay away messages | **open** — needs the away-notify capability we already negotiate upstream |
+| `awaystore` | store and replay away messages | **done (the useful half)** — `internal/facade/awaystore.go`: the message *store* is redundant because per-window rings plus cursors already replay private queries; what was missing is the accounting, so private PRIVMSG/ACTION that arrive while we set the away are counted and the returning client is told "Welcome back!" / "You have N messages!" (`awaystore.cpp:388-389`). No encrypted on-disk store: that is a password-protected file whose whole purpose is to survive ZNC losing state, and rings + `savebuff` already do |
 | `buffextras` | put joins/parts/modes into the replay buffer | **done** by B2's routing split; `TestBuffExtrasReachesTheReplayRing` |
 | `savebuff` | persist the buffer across restarts | the "M5 mmapped rings" item, in effect |
 | `clearbufferonmsg` | clear buffer when you speak | **done** (`clearbufferonmsg.cpp`) |

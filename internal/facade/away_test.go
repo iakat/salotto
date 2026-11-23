@@ -32,7 +32,7 @@ func TestAwayOnlyWhenTheLastClientLeaves(t *testing.T) {
 	rec := &awayRecorder{}
 	a := newAway(true, "gone", 20*time.Millisecond, rec.send)
 
-	a.clientAttached()
+	a.clientAttached(nil)
 	a.clientDetached()
 	time.Sleep(60 * time.Millisecond)
 	if got := rec.got(); len(got) != 0 && got[0] != "AWAY :gone" {
@@ -60,14 +60,14 @@ func TestAwayComesBackOnAttach(t *testing.T) {
 		t.Fatalf("setup: away did not fire: %v", rec.got())
 	}
 
-	a.clientAttached()
+	a.clientAttached(nil)
 	got := rec.got()
 	if len(got) != 2 || got[1] != "AWAY" {
 		t.Fatalf("attach did not clear our away: %v", got)
 	}
 
 	// A second attach must not send another AWAY: we already came back.
-	a.clientAttached()
+	a.clientAttached(nil)
 	if len(rec.got()) != 2 {
 		t.Fatalf("duplicate AWAY on a redundant attach: %v", rec.got())
 	}
@@ -87,7 +87,7 @@ func TestAwayDoesNotFightTheUser(t *testing.T) {
 		t.Fatalf("auto-away overwrote a user-set away: %v", got)
 	}
 
-	a.clientAttached()
+	a.clientAttached(nil)
 	if got := rec.got(); len(got) != 0 {
 		t.Fatalf("attach cleared a user-set away: %v", got)
 	}

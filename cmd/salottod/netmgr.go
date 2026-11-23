@@ -166,6 +166,10 @@ func (m *netmgr) Start(nc config.Network) error {
 			// the next connect, which is what makes the list follow reality
 			// instead of the config file.
 			channels.noteSelfJoinPart(line, m.srv.KnownNick(netName))
+			// awaystore: count private messages that arrive while the network
+			// says we are away, so the returning client is told how much it
+			// missed instead of silently replaying a buffer.
+			m.srv.NoteInbound(netName, line)
 		},
 		OnSend: func(line []byte) {
 			entries := w.Route(line, true)

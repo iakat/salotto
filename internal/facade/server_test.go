@@ -25,6 +25,7 @@ type fakeNet struct {
 	mask      string
 	connected bool
 	resized   map[string]bool
+	nick      string
 	in        uint64
 	out       uint64
 }
@@ -36,6 +37,14 @@ func newFakeNet(name string) *fakeNet {
 		set:     winring.New(8, 4, 4096),
 		resized: make(map[string]bool),
 	}
+}
+
+// Nick reports the nick we hold upstream, which is what KnownNick falls back to
+// before any 001 has been seen through the facade.
+func (f *fakeNet) Nick() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nick
 }
 
 func (f *fakeNet) ResizeWindow(window string, lines int) bool {

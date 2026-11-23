@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -890,8 +891,18 @@ func (c *client) maybeRegister() bool {
 	if !c.srv.hub.Add(c.sub) {
 		return c.send("ERROR :too many clients")
 	}
-	// simple_away's OnClientLogin: a client is here, come back.
-	c.srv.away.clientAttached()
+	// simple_away's OnClientLogin: a client is here, come back. awaystore's
+	// addition is the count of private messages that arrived while the network
+	// said we were gone, announced to the client that just came back — the one
+	// whose send path is passed in, not a shared field.
+	c.srv.away.clientAttached(func(n int, capped bool) {
+		text := "You have " + strconv.Itoa(n) + " messages!"
+		if capped {
+			text = "You have " + strconv.Itoa(n) + "+ messages!"
+		}
+		c.status("Welcome back!")
+		c.status(text)
+	})
 	return true
 }
 

@@ -26,6 +26,10 @@ type away struct {
 	weSet     bool
 	clientSet bool
 
+	// messages counts private messages that arrived while we were away, which is
+	// awaystore's "You have N messages!" (awaystore.cpp:388-389).
+	messages awayMessages
+
 	// send is what talks to the networks. It is a function so the away logic
 	// stays testable without a socket and so it can fan out over every network
 	// the facade knows.
@@ -39,9 +43,21 @@ func newAway(enabled bool, reason string, wait time.Duration, send func(string))
 	return &away{enabled: enabled, reason: reason, wait: wait, send: send}
 }
 
+// notePrivate records a private message that arrived while we were away.
+func (a *away) notePrivate() {
+	a.mu.Lock()
+	if a.weSet {
+		a.messages.add()
+	}
+	a.mu.Unlock()
+}
+
 // clientAttached cancels a pending auto-away and comes back if we were the ones
-// who set it (simple_away.cpp:122 OnClientLogin → SetBack).
-func (a *away) clientAttached() {
+// who set it (simple_away.cpp:122 OnClientLogin → SetBack). announce, if not nil,
+// tells *this* client how much arrived while we were away; it is a parameter
+// rather than a field because two clients can register at the same time and a
+// shared field would both race and deliver one client's backlog to the other.
+func (a *away) clientAttached(announce func(n int, capped bool)) {
 	a.mu.Lock()
 	if a.timer != nil {
 		a.timer.Stop()
@@ -51,9 +67,14 @@ func (a *away) clientAttached() {
 	if clear {
 		a.weSet = false
 	}
+	n, capped := a.messages.take()
 	a.mu.Unlock()
 	if clear {
 		a.send("AWAY")
+	}
+	// awaystore's OnClientLogin: the count goes to the client that came back.
+	if n > 0 && announce != nil {
+		announce(n, capped)
 	}
 }
 
@@ -76,6 +97,9 @@ func (a *away) fire() {
 	a.timer = nil
 	reason := a.reason
 	a.weSet = true
+	// Counting starts now, not at detach: the count answers "what arrived while
+	// the server said I was gone", which is the only interval the module owns.
+	a.messages.reset()
 	a.mu.Unlock()
 
 	if reason == "" {
