@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -9,6 +10,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gorilla/websocket"
 )
+
+// previewsInFrame is how many link cards one frame carries. Three is a screenful of
+// conversation; more would make a frame bigger than the render it accompanies.
+const previewsInFrame = 3
 
 // Frame is one message on the WebSocket. SPEC.md §13 calls for the same frames as
 // the IRC wire, just carried over a socket: the browser gets rendered text and the
@@ -47,6 +52,11 @@ type Frame struct {
 	// channel needs one nicklist.
 	Nicks      []Nick         `json:"nicks,omitempty"`
 	NickCounts map[string]int `json:"nickcounts,omitempty"`
+
+	// Previews are the link cards for the active window, from the cache only. A
+	// frame must never wait on a third-party server: a slow link would otherwise be
+	// indistinguishable from a hung bouncer.
+	Previews []Preview `json:"previews,omitempty"`
 
 	// Topic is the active window's topic. State, not a line: it is replaced rather
 	// than appended, and the client shows one.
@@ -131,6 +141,7 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 			Nicks:      p.model.Nicklist(p.model.Active()),
 			NickCounts: p.model.NickCounts(),
 			Topic:      p.model.Topic(p.model.Active()),
+			Previews:   p.cachedPreviews(),
 			Modes:      p.model.Modes(p.model.Active()),
 		}, p.rev
 	}
@@ -208,6 +219,57 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 		}
 		// Every command produces a state frame on the next tick, so no reply is
 		// needed here; the client is already subscribed to the render.
+	}
+}
+
+// cachedPreviews returns the previews already known for the active window.
+//
+// It never fetches. Fetching happens on its own goroutine when a line arrives
+// (see primePreviews), because a handler that blocks on somebody else's web server
+// is a handler that can be made to hang by a stranger.
+// It is called from state(), which holds p.mu, so it must not take it again.
+func (p *Program) cachedPreviews() []Preview {
+	links := p.model.Links(p.model.Active(), previewsInFrame)
+	if len(links) == 0 {
+		return nil
+	}
+	cache := p.previews
+	if cache == nil {
+		return nil
+	}
+	out := make([]Preview, 0, len(links))
+	for _, u := range links {
+		if pp, ok := cache.Cached(u); ok && pp.Kind == "link" {
+			out = append(out, pp)
+		}
+	}
+	return out
+}
+
+// primePreviews fetches previews for links in the active window that are not known
+// yet, in the background. It is called after each Step, and it is deliberately
+// fire-and-forget: a preview is decoration, and the message must appear whether or
+// not the third party answers.
+func (p *Program) primePreviews() {
+	cache := p.previewCache()
+	p.mu.Lock()
+	links := p.model.Links(p.model.Active(), previewsInFrame)
+	p.mu.Unlock()
+	for _, u := range links {
+		if _, ok := cache.Cached(u); ok {
+			continue
+		}
+		go func(link string) {
+			ctx, cancel := context.WithTimeout(context.Background(), previewTimeout)
+			defer cancel()
+			cache.Get(ctx, link)
+			// Bump the revision so a frame carries the new card. Without this the
+			// preview would be cached and never shown, which looks exactly like a
+			// feature that does not work.
+			p.mu.Lock()
+			p.rev++
+			p.mu.Unlock()
+		}(u)
 	}
 }
 

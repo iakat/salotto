@@ -683,3 +683,27 @@ func (m Model) Topic(window string) string { return m.topics[window] }
 // Modes returns a window's channel mode string ("+nt"), "" if not a channel or not
 // known.
 func (m Model) Modes(window string) string { return m.modes[window] }
+
+// Links returns the distinct links in a window's recent lines, most recent first.
+//
+// Only recent lines, and only lines that were actually shown: the point of a preview
+// is the message the user is looking at, and fetching links out of a month of
+// scrollback would turn reading old channels into a burst of traffic to strangers.
+func (m Model) Links(window string, max int) []string {
+	lines := m.windows[window]
+	const lookBack = 40
+	seen := make(map[string]bool, max)
+	out := make([]string, 0, max)
+	for i := len(lines) - 1; i >= 0 && len(lines)-i <= lookBack; i-- {
+		u := LinkIn(lines[i].Text)
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		out = append(out, u)
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}

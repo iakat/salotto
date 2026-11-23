@@ -20,6 +20,7 @@
   var resultsEl = document.getElementById("results");
   var nicksEl = document.getElementById("nicks");
   var topicEl = document.getElementById("topic");
+  var previewsEl = document.getElementById("previews");
 
   // -- ANSI → HTML ----------------------------------------------------------
   // Only the sequences the server actually emits: SGR colour (8-bit, which the
@@ -145,6 +146,11 @@
       listEl.innerHTML = html;
     }
 
+    // Link previews. They are cards under the header rather than inline: an inline
+    // card would reflow the terminal rendering the server produced, which is the one
+    // thing this client promises not to do.
+    renderPreviews(f.previews);
+
     // The topic is a header, not a message: one line per window, replaced when it
     // changes. The server sends the string; the client decides where it goes.
     if (topicEl) {
@@ -219,6 +225,40 @@
       setTimeout(connect, wait);
     };
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
+  }
+
+  function renderPreviews(list) {
+    if (!previewsEl) return;
+    previewsEl.textContent = "";
+    if (!list || !list.length) {
+      previewsEl.hidden = true;
+      return;
+    }
+    var shown = 0;
+    for (var i = 0; i < list.length; i++) {
+      var p = list[i];
+      if (!p || p.kind !== "link" || !p.title) continue;
+      var a = document.createElement("a");
+      a.className = "card";
+      a.href = p.url;
+      // noreferrer keeps the reader's origin off the third party's logs, and
+      // noopener stops the opened page from touching this window. Both are the same
+      // promise this client makes by fetching previews server-side at all.
+      a.rel = "noreferrer noopener";
+      a.target = "_blank";
+      var site = document.createElement("span");
+      site.className = "site";
+      site.textContent = p.site || "";
+      var title = document.createElement("span");
+      title.className = "title";
+      // textContent, never innerHTML: a title is a stranger's string.
+      title.textContent = p.title;
+      a.appendChild(site);
+      a.appendChild(title);
+      previewsEl.appendChild(a);
+      shown++;
+    }
+    previewsEl.hidden = shown === 0;
   }
 
   function send(text) {

@@ -23,11 +23,29 @@ type Program struct {
 	model Model
 	tr    *Transport
 
+	// previews remembers link cards. It is a cache and not a map on the model
+	// because it outlives any one window: the same link shown in two channels is
+	// one fetch, which is the whole reason previews are done server-side.
+	previews *PreviewCache
+
+	// previewsOnce makes the cache lazy: a TUI session that never opens a browser
+	// must not pay for a fetcher it cannot use.
+	previewsOnce sync.Once
+
 	// rev counts applied messages. A WebSocket driver needs to know when the
 	// render changed without being told explicitly by every path that changes it;
 	// a counter bumped in one place is that, and a missed frame is harmless
 	// because every frame carries the full render.
 	rev uint64
+}
+
+// previewCache returns the preview cache, creating it on first use. Lazy because a
+// TUI session that never opens a browser must not pay for a fetcher it cannot use.
+func (p *Program) previewCache() *PreviewCache {
+	p.previewsOnce.Do(func() {
+		p.previews = NewPreviewCache(NewFetcher())
+	})
+	return p.previews
 }
 
 // NewProgram builds the bridge. The transport is optional: a Program with no
@@ -86,6 +104,12 @@ func (p *Program) step(msg tea.Msg, sync bool) tea.Cmd {
 		// the user left, which is the quietest possible bug in a chat client.
 		p.SyncActive()
 	}
+
+	// Links in the window the user is looking at get a preview fetched in the
+	// background. It is fired from every Step rather than from the frame builder
+	// because the frame builder must never wait on a stranger's web server.
+	p.primePreviews()
+
 	return cmd
 }
 

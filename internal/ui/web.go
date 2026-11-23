@@ -78,6 +78,15 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     border-bottom: 1px solid #2a2a3a;
     font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  div.previews { display: flex; flex-direction: column; gap: 2px;
+    padding: 4px 12px; background: #10101a; border-bottom: 1px solid #2a2a3a; }
+  div.previews a.card { display: flex; gap: 8px; align-items: baseline;
+    padding: 3px 6px; border-radius: 4px; text-decoration: none;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  div.previews a.card:hover { background: #1b1b28; }
+  div.previews .site { color: #6f6f8a; flex: none; }
+  div.previews .title { color: #9ecbff; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
   div.banner { padding: 6px 12px; background: #5a2020; color: #ffdede;
     font: 13px ui-monospace, monospace; }
   pre.term-container { flex: 1; margin: 0; padding: 12px; overflow: auto;
@@ -110,6 +119,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 <div class="wrap">
 <div class="banner" id="banner" hidden></div>
 <div class="topic" id="topic" hidden></div>
+<div class="previews" id="previews" hidden></div>
 <div class="searchbar">
   <input id="search" placeholder="search scrollback (enter to run, esc to clear)">
 </div>

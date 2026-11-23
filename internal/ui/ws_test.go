@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -952,5 +953,84 @@ func TestModesReachTheFrame(t *testing.T) {
 	_, f := wsDial(t, srv)
 	if f.Modes != "+mnt" {
 		t.Fatalf("frame modes = %q", f.Modes)
+	}
+}
+
+// TestPreviewsReachTheFrameOnlyFromCache pins the rule that a frame must never wait
+// on a third-party server. A bouncer that blocks rendering on somebody else's web
+// site can be made to hang by a stranger posting a slow link.
+func TestPreviewsReachTheFrameOnlyFromCache(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "see https://example.invalid/one"}))
+
+	// Nothing is cached yet; the frame must still be produced, with no previews.
+	srv := newWSServer(t, p)
+	_, f := wsDial(t, srv)
+	if len(f.Previews) != 0 {
+		t.Fatalf("frame carried %d previews before anything was fetched", len(f.Previews))
+	}
+
+	// With the card cached, it appears. The cache is injected so no test touches the
+	// network.
+	p.mu.Lock()
+	p.previewsOnce.Do(func() {})
+	p.previews = NewPreviewCache(staticFetcher{})
+	p.previews.Get(context.Background(), "https://example.invalid/one")
+	p.mu.Unlock()
+	p.mu.Lock()
+	p.rev++
+	p.mu.Unlock()
+
+	_, f = wsDial(t, srv)
+	if len(f.Previews) != 1 || f.Previews[0].Title != "t" {
+		t.Fatalf("frame previews = %+v", f.Previews)
+	}
+}
+
+// TestPreviewOnlyForShownLines pins that previews come from recent lines in the
+// active window, not from the whole scrollback. Fetching month-old links because a
+// user opened a channel is the behaviour that makes previews a privacy problem.
+func TestPreviewOnlyForShownLines(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "old https://example.invalid/old"}))
+	for i := 0; i < 60; i++ {
+		p.Step(Incoming(Line{Window: "#c", Nick: "b", Text: "filler"}))
+	}
+	p.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "new https://example.invalid/new"}))
+
+	p.mu.Lock()
+	links := p.model.Links(p.model.Active(), 10)
+	p.mu.Unlock()
+
+	if len(links) != 1 || !strings.Contains(links[0], "/new") {
+		t.Fatalf("links = %v, want only the recent one", links)
+	}
+}
+
+// TestLinksAreDeduped pins that one link mentioned five times is one fetch.
+func TestLinksAreDeduped(t *testing.T) {
+	m := New("#c")
+	for i := 0; i < 5; i++ {
+		m, _ = m.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "again https://example.invalid/x"}))
+	}
+	if got := m.Links("#c", 10); len(got) != 1 {
+		t.Fatalf("Links = %v, want one entry", got)
+	}
+}
+
+// TestPreviewsAreNotFetchedForOtherWindows pins that a link in a channel the user is
+// not reading is not fetched. Previews follow attention; that is the whole point of
+// doing them from rendered lines.
+func TestPreviewsAreNotFetchedForOtherWindows(t *testing.T) {
+	Configure()
+	p := NewProgram("#here", nil)
+	p.Step(Incoming(Line{Window: "#elsewhere", Nick: "a", Text: "https://example.invalid/away"}))
+	p.mu.Lock()
+	links := p.model.Links(p.model.Active(), 10)
+	p.mu.Unlock()
+	if len(links) != 0 {
+		t.Fatalf("Links on the active window = %v, want none", links)
 	}
 }
