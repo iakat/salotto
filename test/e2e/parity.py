@@ -305,12 +305,21 @@ def case_listservers(b: Bouncer) -> dict:
 
 
 def case_listclients(b: Bouncer) -> dict:
+    """ListClients names the clients attached to *this* bouncer.
+
+    The count cannot be asserted as exactly one: the UI deployments keep a client
+    attached to the same bouncer, so a healthy system legitimately shows more than
+    the harness itself. What both bouncers must do is answer the command with a
+    table and include this connection - counted by finding our own nick among the
+    listed identifiers rather than by arithmetic that depends on what else is
+    running.
+    """
     got = b.cmd("ListClients", seconds=2.0)
     rows = _rows(got)
+    text = "\n".join(got).lower()
     return {
         "answered": bool(rows),
-        # Exactly one client is attached: this harness connection.
-        "one_client": len(rows) == 1,
+        "lists_this_client": b.nick.lower() in text,
     }
 
 
@@ -698,6 +707,7 @@ MUST_BE_TRUE: dict[str, dict[str, bool]] = {
     "playback": {"played": True},
     "registration": {"welcome": True},
     "clear": {"cleared": True},
+    "listclients": {"answered": True, "lists_this_client": True},
     "setbuffer": {"says_set": True},
 }
 
