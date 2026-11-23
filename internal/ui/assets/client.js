@@ -148,8 +148,13 @@
     // The topic is a header, not a message: one line per window, replaced when it
     // changes. The server sends the string; the client decides where it goes.
     if (topicEl) {
-      if (f.topic) {
-        topicEl.textContent = f.topic;
+      // Mode string and topic share one header line: "+nt | the topic". Modes
+      // lead because they are short and survive truncation.
+      var bits = [];
+      if (f.modes && f.modes !== "+") bits.push(f.modes);
+      if (f.topic) bits.push(f.topic);
+      if (bits.length) {
+        topicEl.textContent = bits.join(" | ");
         topicEl.hidden = false;
       } else {
         topicEl.textContent = "";

@@ -48,6 +48,11 @@ type Transport struct {
 	// topic is replaced, not appended to, and the whole point of showing it is
 	// that it is the current answer to "what is this channel for".
 	topics map[string]string
+	// modes is the current channel mode string per channel ("+nt"), and
+	// prefixOverrides records mode changes received before the member list that
+	// they apply to: ergo can send MODE before our 353 for a channel we just
+	// joined, and a prefix change for a nick we have not listed yet would be lost.
+	modes  map[string]string
 	active string
 
 	outq chan string
@@ -71,6 +76,7 @@ func Dial(addr string) (*Transport, error) {
 		own:     make(map[string]bool),
 		members: make(map[string]map[string]string),
 		topics:  make(map[string]string),
+		modes:   make(map[string]string),
 		active:  "status",
 		outq:    make(chan string, 64),
 		msgs:    make(chan tea.Msg, 256),
@@ -388,20 +394,40 @@ func (t *Transport) handle(raw []byte) {
 		return
 
 	case "MODE":
-		// Membership changes are status events rather than conversation, unless
-		// they happen in a window the user is in — the model has no per-window
-		// membership table, so status is the honest place.
-		t.push(Incoming(Line{
-			Window: "status",
-			Text:   strings.TrimSpace(from + " " + verb + " " + params),
-			Kind:   LineSystem,
-		}))
+		// A MODE line is three different things depending on what it targets:
+		//
+		//   MODE #chan +nt            channel modes, which replace the mode string
+		//   MODE #chan +o nick        a member gaining a prefix
+		//   MODE mynick +i            our own user modes, which we do not draw
+		//
+		// All three are state, so none belongs in the scrollback. The first two
+		// also change something visible, so the nicklist and mode string are
+		// republished.
+		fields := strings.Fields(params)
+		if len(fields) >= 2 && strings.HasPrefix(fields[0], "#") {
+			channel, modeStr := fields[0], fields[1]
+			t.applyModes(channel, modeStr, fields[2:])
+			t.publishMembers(channel)
+			return
+		}
+		// Our own user modes are the only thing left that matters, and the status
+		// bar does not show them, so they are recorded and not drawn.
 		return
 
 	case "PING":
 		// The bouncer normally answers its own PINGs, but a direct connection to
 		// an IRCd does not; answering here keeps both cases working.
 		t.Send("PONG " + params)
+		return
+	}
+
+	// 324 is the channel mode reply: "324 me #chan +nt". It is state, for the same
+	// reason a topic is: the current answer, replaced when it changes.
+	if verb == "324" {
+		fields := strings.SplitN(params, " ", 3)
+		if len(fields) >= 3 {
+			t.setModes(fields[1], fields[2])
+		}
 		return
 	}
 
@@ -533,6 +559,104 @@ func rank(prefix string) int {
 		return 1
 	}
 	return 0
+}
+
+// setModes records a channel's mode string and tells the UI.
+//
+// The reply is normalised through the same fold a live MODE uses, because the server
+// writes the letters in whatever order it likes: without this, "+tn" from 324 and
+// "+nt" after a change are the same channel shown differently, which reads as a
+// change that did not happen.
+func (t *Transport) setModes(channel, modes string) {
+	normalised := "+"
+	for _, r := range strings.TrimPrefix(modes, "+") {
+		normalised = foldMode(normalised, r, true)
+	}
+	t.mu.Lock()
+	t.modes[channel] = normalised
+	t.mu.Unlock()
+	t.push(ChannelModes{Window: channel, Modes: normalised})
+}
+
+// applyModes folds one MODE change into a channel's state: the mode letters go into
+// the channel's mode string, and any mode in PREFIXES moves a nick's prefix.
+//
+// It handles the multi-change form ("+o-v nick1 nick2") because that is one line
+// carrying two independent facts, and handling only the first would silently miss
+// the rest - which is the kind of bug that shows as "the ops list is wrong
+// sometimes".
+func (t *Transport) applyModes(channel, modeStr string, args []string) {
+	t.mu.Lock()
+	current := t.modes[channel]
+	if current == "" {
+		current = "+"
+	}
+	set, ok := t.members[channel]
+	if !ok {
+		set = make(map[string]string)
+		t.members[channel] = set
+	}
+	argi := 0
+	adding := true
+	for _, r := range modeStr {
+		switch r {
+		case '+':
+			adding = true
+		case '-':
+			adding = false
+		default:
+			if prefix, ok := prefixModes[r]; ok {
+				if argi < len(args) {
+					nick := args[argi]
+					argi++
+					if adding {
+						if rank(string(prefix)) > rank(set[nick]) {
+							set[nick] = string(prefix)
+						}
+					} else {
+						// Removing a prefix means the next-highest one applies,
+						// which we do not know: the honest answer is "no prefix"
+						// until the next NAMES, and guessing would invent rank.
+						set[nick] = ""
+					}
+				}
+				continue
+			}
+			// A list mode (+b, +e, +I) takes an argument we do not track, but the
+			// argument still has to be consumed or the next mode in the line gets
+			// the wrong one.
+			if strings.ContainsRune("beIk", r) && argi < len(args) {
+				argi++
+				continue
+			}
+			current = foldMode(current, r, adding)
+		}
+	}
+	t.modes[channel] = current
+	modes := current
+	t.mu.Unlock()
+	t.push(ChannelModes{Window: channel, Modes: modes})
+}
+
+// prefixModes maps the mode letters that grant a membership prefix to that prefix.
+var prefixModes = map[rune]string{'q': "~", 'a': "&", 'o': "@", 'h': "%", 'v': "+"}
+
+// foldMode adds or removes one letter from a mode string, keeping it sorted so
+// "+nt" and "+tn" are the same state. A mode string that changes order on every
+// update would look like it is changing when it is not.
+func foldMode(modes string, letter rune, adding bool) string {
+	has := strings.ContainsRune(modes, letter)
+	switch {
+	case adding && !has:
+		modes += string(letter)
+	case !adding && has:
+		modes = strings.ReplaceAll(modes, string(letter), "")
+	}
+	// Rebuild as "+" plus sorted letters: no "-" section is tracked, because a
+	// channel's modes are a set and the reply (324) is the truth.
+	letters := []rune(strings.TrimPrefix(modes, "+"))
+	sort.Slice(letters, func(i, j int) bool { return letters[i] < letters[j] })
+	return "+" + string(letters)
 }
 
 // setTopic records a channel's current topic and tells the UI. An empty topic is a

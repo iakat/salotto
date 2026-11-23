@@ -80,6 +80,13 @@ type Topic struct {
 	Text   string
 }
 
+// ChannelModes is the message a transport sends when a channel's mode string is
+// known or changes. It is state: "+nt" is replaced, not appended.
+type ChannelModes struct {
+	Window string
+	Modes  string
+}
+
 // Sent is the message a transport sends when the user submitted a line.
 type Sent struct{ Text string }
 
@@ -110,6 +117,12 @@ type Model struct {
 	// absent header, and inventing a third state would be a distinction with no
 	// visible difference.
 	topics map[string]string
+
+	// modes is the channel mode string per window ("+nt"), shown in the header next
+	// to the topic: the two together are "what is this channel", and a user who
+	// cannot see that a channel is +m cannot tell that their message failed for a
+	// reason.
+	modes map[string]string
 
 	input   []rune
 	scroll  int
@@ -185,6 +198,13 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+
+	case ChannelModes:
+		if m.modes == nil {
+			m.modes = make(map[string]string, 4)
+		}
+		m.modes[msg.Window] = msg.Modes
 		return m, nil
 
 	case Topic:
@@ -385,6 +405,11 @@ func (m Model) View() string {
 	}
 	// The topic sits on the title row, which is where every IRC client puts it and
 	// the only place it can be seen without stealing a line from the conversation.
+	// Modes first: they are short and fixed-width-ish, so they survive truncation
+	// where a long topic would not.
+	if modes := m.modes[m.active]; modes != "" && modes != "+" {
+		b.WriteString(topicStyle.Render("  " + modes))
+	}
 	if topic := m.topics[m.active]; topic != "" {
 		room := width - lipgloss.Width(b.String()) - 6
 		if room > 12 {
@@ -654,3 +679,7 @@ func (m Model) NickCounts() map[string]int {
 // Topic returns the current topic of a window, "" if it has none or we have not
 // been told.
 func (m Model) Topic(window string) string { return m.topics[window] }
+
+// Modes returns a window's channel mode string ("+nt"), "" if not a channel or not
+// known.
+func (m Model) Modes(window string) string { return m.modes[window] }

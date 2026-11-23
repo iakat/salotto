@@ -52,6 +52,11 @@ type Frame struct {
 	// than appended, and the client shows one.
 	Topic string `json:"topic,omitempty"`
 
+	// Modes is the active window's channel mode string ("+nt"). Sent beside the
+	// topic because together they answer "what is this channel", and a user who
+	// cannot see +m cannot tell why their message did not appear.
+	Modes string `json:"modes,omitempty"`
+
 	// Input mirrors the model's input buffer, so a second device attached to the
 	// same bouncer sees what is being typed. Empty means nothing in flight.
 	Input string `json:"input,omitempty"`
@@ -126,6 +131,7 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 			Nicks:      p.model.Nicklist(p.model.Active()),
 			NickCounts: p.model.NickCounts(),
 			Topic:      p.model.Topic(p.model.Active()),
+			Modes:      p.model.Modes(p.model.Active()),
 		}, p.rev
 	}
 

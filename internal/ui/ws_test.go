@@ -788,3 +788,169 @@ func TestTopicSurvivesAWindowSwitch(t *testing.T) {
 		t.Fatalf("on #two the topic is %q", f.Topic)
 	}
 }
+
+// TestChannelModesAreState pins that 324 is recorded and republished, not written
+// into the conversation: "+nt" is the current answer, and a scrollback full of every
+// mode string the channel ever had tells a user nothing about now.
+func TestChannelModesAreState(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":irc.test 324 me #c +nt")
+
+	got := collectModes(t, tr)
+	if got.Window != "#c" || got.Modes != "+nt" {
+		t.Fatalf("modes = %+v", got)
+	}
+}
+
+// TestModeGrantsAPrefix pins the operation a user actually notices: somebody gets
+// opped and the nicklist shows it. Without this the @ appears only after a rejoin.
+func TestModeGrantsAPrefix(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":irc.test 353 me = #c :alice bob")
+	fb.inject(t, ":irc.test 366 me #c :End of /NAMES list")
+	collectNicklist(t, tr)
+
+	fb.inject(t, ":chanop!o@h MODE #c +o bob")
+	nl := collectNicklist(t, tr)
+
+	for _, n := range nl.Nicks {
+		if n.Name == "bob" && n.Prefix != "@" {
+			t.Fatalf("bob has prefix %q, want @", n.Prefix)
+		}
+	}
+}
+
+// TestModeMultiChangeIsFullyApplied pins the multi-change line. "+o-v a b" is one
+// line carrying two independent facts, and applying only the first is the kind of
+// bug that shows up as "the ops list is wrong sometimes" and is never reproducible.
+func TestModeMultiChangeIsFullyApplied(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":irc.test 353 me = #c :@alice +bob carol")
+	fb.inject(t, ":irc.test 366 me #c :End of /NAMES list")
+	collectNicklist(t, tr)
+
+	fb.inject(t, ":chanop!o@h MODE #c +o-v alice bob")
+	nl := collectNicklist(t, tr)
+
+	byName := map[string]string{}
+	for _, n := range nl.Nicks {
+		byName[n.Name] = n.Prefix
+	}
+	if byName["alice"] != "@" {
+		t.Fatalf("alice = %q, want @ (her prefix was already @)", byName["alice"])
+	}
+	if byName["bob"] != "" {
+		t.Fatalf("bob = %q, want no prefix (devoiced)", byName["bob"])
+	}
+}
+
+// TestChannelModesFoldAndSort pins that the mode string is a set, not a transcript.
+// "+nt" and "+tn" are the same channel; a string that reorders on every update looks
+// like it is changing when it is not.
+func TestChannelModesFoldAndSort(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":irc.test 324 me #c +tn")
+	if got := collectModes(t, tr); got.Modes != "+nt" {
+		t.Fatalf("324 +tn folded to %q, want +nt", got.Modes)
+	}
+
+	fb.inject(t, ":op!o@h MODE #c +m")
+	if got := collectModes(t, tr); got.Modes != "+mnt" {
+		t.Fatalf("after +m the modes are %q, want +mnt", got.Modes)
+	}
+	fb.inject(t, ":op!o@h MODE #c -t")
+	if got := collectModes(t, tr); got.Modes != "+mn" {
+		t.Fatalf("after -t the modes are %q, want +mn", got.Modes)
+	}
+
+	// A mode with an argument it does not track (+b) must not eat the next mode
+	// letter, and must not appear in the string: a ban is not a channel-wide flag
+	// a header can show.
+	// The mode string is contiguous ("+b-n mask"), not "+b mask -n": a server sends
+	// all the changes of one MODE in one string, with the arguments after it.
+	fb.inject(t, ":op!o@h MODE #c +b-n bad!*@*")
+	if got := collectModes(t, tr); got.Modes != "+m" {
+		t.Fatalf("after +b-n bad!*@* the modes are %q, want +m", got.Modes)
+	}
+}
+
+// collectNicklist reads until a Nicklist message arrives.
+func collectNicklist(t *testing.T, tr *Transport) Nicklist {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg, ok := <-tr.Msgs():
+			if !ok {
+				t.Fatal("transport closed before a nicklist arrived")
+			}
+			if nl, ok := msg.(Nicklist); ok {
+				return nl
+			}
+		case <-deadline:
+			t.Fatal("no nicklist arrived")
+		}
+	}
+}
+
+// collectModes reads until a ChannelModes message arrives.
+func collectModes(t *testing.T, tr *Transport) ChannelModes {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg, ok := <-tr.Msgs():
+			if !ok {
+				t.Fatal("transport closed before a mode arrived")
+			}
+			if cm, ok := msg.(ChannelModes); ok {
+				return cm
+			}
+		case <-deadline:
+			t.Fatal("no channel modes arrived")
+		}
+	}
+}
+
+// TestModesReachTheFrame pins that the browser is told. A user who cannot see that a
+// channel is +m cannot tell that their message did not appear for a reason.
+func TestModesReachTheFrame(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "hi"}))
+	p.Step(ChannelModes{Window: "#c", Modes: "+mnt"})
+
+	srv := newWSServer(t, p)
+	_, f := wsDial(t, srv)
+	if f.Modes != "+mnt" {
+		t.Fatalf("frame modes = %q", f.Modes)
+	}
+}
