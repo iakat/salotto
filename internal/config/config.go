@@ -333,6 +333,10 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.MaxWindows, err = parseInt(value)
 	case "max_clients":
 		c.MaxClients, err = parseInt(value)
+	case "max_buffer_lines":
+		c.MaxBufferLines, err = parseInt(value)
+	case "strip_controls":
+		c.StripControls, err = parseBool(value)
 	case "motd_blocked":
 		c.MOTDBlocked, err = parseBool(value)
 	case "motd_missing":
@@ -383,10 +387,6 @@ func (c *Config) parseNetworkKey(n *Network, key, value string) error {
 		n.Perform, err = parseStringList(value)
 	case "clearbufferonmsg":
 		n.ClearBufferOnMsg, err = parseBool(value)
-	case "max_buffer_lines":
-		c.MaxBufferLines, err = parseInt(value)
-	case "strip_controls":
-		c.StripControls, err = parseBool(value)
 	case "away":
 		n.Away, err = parseBool(value)
 	case "away_reason":
