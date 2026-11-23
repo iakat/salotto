@@ -22,9 +22,21 @@ buildkite's `terminal.css`, embedded in the binary.
 
 | front end | input | output | code |
 |---|---|---|---|
-| SSH TUI | a real terminal over SSH | terminal | `cmd/salotto-ssh`, `wish` + `wish/bubbletea` |
+| SSH TUI | a real terminal over SSH | terminal | `cmd/salotto-ssh`: `wish` for SSH, a `tea.Program` we own for the terminal |
 | Web | browser → HTTP → HTML | HTML | `internal/ui/web.go`, `terminal-to-html/v3` |
 | headless (tests, bots) | synthetic `tea.Msg` | string compare | `ui.Headless` |
+
+All three hold the same `ui.Model`, wrapped by `ui.Program` where a front end also
+needs a bouncer connection. `ui.Program` owns the model and the transport and is
+the only place the two meet; the model itself still knows nothing about sockets,
+which is what keeps the second renderer from existing.
+
+Why `salotto-ssh` builds its own `tea.Program` instead of using wish's bubbletea
+middleware: the middleware constructs the Program internally, so a goroutine
+holding a transport has no way to `Send` into it, and a front end that cannot be
+fed lines is a blank screen. Four lines of Program setup buys an obvious data
+flow — wish handles SSH, bubbletea handles the terminal, `main.go` is where they
+meet.
 
 All three hold the same `ui.Model`. `TestOneModelThreeDrivers` asserts that the
 headless driver's `View()` is byte-identical to the direct one, and that the

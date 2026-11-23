@@ -491,6 +491,7 @@ def run(host: str, port: int, nick: str, dialect: str, password: str | None, cha
         out["listservers"] = case_listservers(b)
         out["listclients"] = case_listclients(b)
         out["traffic"] = case_traffic(b)
+        out["connect_disconnect"] = case_connect_disconnect(b)
         out["chansaver"] = case_chansaver(b, channel)
     finally:
         b.close()
