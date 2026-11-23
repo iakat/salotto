@@ -88,6 +88,23 @@ func (m Model) Init() tea.Cmd { return nil }
 // Active returns the window currently shown.
 func (m Model) Active() string { return m.active }
 
+// SetActive switches to a named window, remembering it in the order list so a
+// window can be selected before any line has arrived in it. A web request knows
+// a window name rather than a keystroke, and without this the browser could only
+// ever switch between windows that already had traffic.
+func (m Model) SetActive(name string) Model {
+	if name == "" {
+		return m
+	}
+	if _, seen := m.windows[name]; !seen {
+		m.windows[name] = nil
+		m.order = append(m.order, name)
+	}
+	m.active = name
+	m.scroll = 0
+	return m
+}
+
 // Input returns the current input line, for a driver that echoes it elsewhere.
 func (m Model) Input() string { return string(m.input) }
 

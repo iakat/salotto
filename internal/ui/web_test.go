@@ -6,16 +6,22 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+// progFor wraps a pre-seeded Model in a Program, so these renderer tests keep
+// asserting on the model they built while going through the same Handler the
+// server uses.
+func progFor(m Model) *Program { return &Program{model: m} }
 
 // TestWebRendersTheTerminalView is the web half of §2.0 end to end over HTTP:
 // the same Model the SSH driver renders, served as HTML with no ESC bytes left
 // and the converter's classes present.
 func TestWebRendersTheTerminalView(t *testing.T) {
 	m := seeded()
-	srv := httptest.NewServer(Handler(m))
+	srv := httptest.NewServer(Handler(progFor(m)))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/")
@@ -69,7 +75,7 @@ func TestWebMatchesHeadlessView(t *testing.T) {
 	_, view := Headless(m)
 	want := HTML(view)
 
-	srv := httptest.NewServer(Handler(m))
+	srv := httptest.NewServer(Handler(progFor(m)))
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/")
 	if err != nil {
@@ -92,7 +98,7 @@ func TestWebResizeIsTheSameWindowSizeMsg(t *testing.T) {
 	want, _ = want.Step(tea.WindowSizeMsg{Width: 60, Height: 14})
 	wantHTML := HTML(want.View())
 
-	srv := httptest.NewServer(Handler(New("status")))
+	srv := httptest.NewServer(Handler(NewProgram("status", nil)))
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/?width=60&height=14")
 	if err != nil {
@@ -110,4 +116,93 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestWebSubmitReachesTheBouncer is the behaviour the browser front end was
+// missing: posting the form actually sends a line. Before this the web UI could
+// render and nothing else.
+func TestWebSubmitReachesTheBouncer(t *testing.T) {
+	Configure()
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	prog := NewProgram("#salotto", tr)
+	srv := httptest.NewServer(Handler(prog))
+	defer srv.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.PostForm(srv.URL+"/", map[string][]string{"line": {"hello from a browser"}})
+	if err != nil {
+		t.Fatalf("POST /: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+
+	if got := fb.expect(t); got != "PRIVMSG #salotto :hello from a browser" {
+		t.Fatalf("sent %q", got)
+	}
+}
+
+// TestWebSubmitRejectsBareGet pins that the form is the only way to write: a GET
+// with ?line= must not send anything, or a prefetcher would post messages.
+func TestWebSubmitRejectsBareGet(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	srv := httptest.NewServer(Handler(NewProgram("#salotto", tr)))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/?line=should+not+send")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	select {
+	case line := <-fb.sent:
+		t.Fatalf("a GET sent %q", line)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestWebWindowSelection: a browser switches windows by name, and the next line
+// must go there.
+func TestWebWindowSelection(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	prog := NewProgram("#salotto", tr)
+	srv := httptest.NewServer(Handler(prog))
+	defer srv.Close()
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	resp, err := client.PostForm(srv.URL+"/", map[string][]string{
+		"window": {"#other"},
+		"line":   {"routed here"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if got := fb.expect(t); got != "PRIVMSG #other :routed here" {
+		t.Fatalf("sent %q, want the selected window", got)
+	}
 }
