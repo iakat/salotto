@@ -1,0 +1,125 @@
+# Long-lived end-to-end environment for salotto, in the hermes-generated-content
+# namespace. Three parts, all restartable and all pinned to a ConfigMap:
+#
+#   ergo   the ircd both bouncers talk to, so the comparison is against the same
+#          server and the same history
+#   znc    the reference implementation, unmodified upstream, for a client to
+#          behave against
+#   salotto our bouncer
+#
+# The point of a long-lived deployment rather than a test-time spawn is that a
+# bouncer's interesting behaviour happens *between* connections: playback depends
+# on lines that arrived while nobody was attached. A pod that lives for days is
+# the only honest way to test that.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: salotto-e2e-ergo
+  namespace: hermes-generated-content
+data:
+  ergo.yaml: |
+    name: salotto-e2e
+    network:
+      name: SalottoE2E
+    server:
+      name: ircd.e2e.local
+      listeners:
+        "0.0.0.0:6667": { }
+      check-ident: false
+    accounts:
+      authentication-enabled: true
+      registration:
+        enabled: true
+        allow-before-connect: true
+        email-verification:
+          enabled: false
+      login-throttling:
+        enabled: false
+    channels:
+      registration:
+        enabled: true
+    operators:
+      e2e:
+        password: "e2e-oper-password"
+        modes: "+o"
+    limits:
+      nicklen: 32
+      identlen: 20
+      realnamelen: 200
+      channellen: 64
+      awaylen: 200
+      kicklen: 200
+      topiclen: 390
+    fakelag:
+      enabled: false
+    history:
+      enabled: true
+      channel-length: 4096
+      client-length: 512
+      autoresize-window: 7d
+      autoreplay-on-join: 0
+    logging:
+      - method: stderr
+        type: "* -userinput -useroutput"
+        level: info
+    datastore:
+      path: /ircd/data/ircd.db
+      autoupgrade: true
+    languages:
+      enabled: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: salotto-e2e-ergo-data
+  namespace: hermes-generated-content
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: salotto-e2e-ergo
+  namespace: hermes-generated-content
+  labels: {app: salotto-e2e-ergo}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: salotto-e2e-ergo}
+  template:
+    metadata:
+      labels: {app: salotto-e2e-ergo}
+    spec:
+      containers:
+        - name: ergo
+          image: ghcr.io/ergochat/ergo:v2.14.0
+          args: ["run", "--conf", "/etc/ergo/ergo.yaml"]
+          ports:
+            - {name: irc, containerPort: 6667}
+          resources:
+            limits: {memory: 256Mi, cpu: 300m}
+            requests: {memory: 32Mi, cpu: 20m}
+          volumeMounts:
+            - {name: conf, mountPath: /etc/ergo}
+            - {name: data, mountPath: /ircd/data}
+      volumes:
+        - name: conf
+          configMap: {name: salotto-e2e-ergo}
+        - name: data
+          persistentVolumeClaim: {claimName: salotto-e2e-ergo-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: salotto-e2e-ergo
+  namespace: hermes-generated-content
+spec:
+  selector: {app: salotto-e2e-ergo}
+  ports:
+    - {name: irc, port: 6667, targetPort: 6667}

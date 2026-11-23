@@ -46,6 +46,18 @@ type Config struct {
 	// (IRCNetwork.cpp:998 checks IsDisabled before JoinChan; CClient::AddBuffer
 	// never does, so a disabled channel keeps buffering and replaying).
 	JoinChannels func() []string
+	// Perform, when non-nil, is asked for the lines to send immediately after
+	// registration and before the joins, which is ZNC's perform module
+	// (perform.cpp: OnIRCConnected → PutIRC for each stored line). It runs on
+	// every connect, so a line that was wrong last time is retried.
+	Perform func() []string
+	// AltNick is the nick to try when the primary one is in use (433), which is
+	// ZNC's IRCNetwork Nick/AltNick pair. Empty means accept whatever the server
+	// assigned.
+	AltNick string
+	// KeepNick enables ZNC's keepnick module: retry the configured nick every
+	// 30 s while the server has us under a different one.
+	KeepNick bool
 	// TrustFingerprint, when non-nil, is consulted only after the normal PKI
 	// verification fails: ZNC's CheckSSLCert (Socket.cpp) accepts a certificate
 	// whose SHA-256 fingerprint the operator pinned, so a self-signed server can
@@ -168,6 +180,10 @@ type Conn struct {
 
 	mu   sync.Mutex
 	regC chan struct{}
+
+	// selfNick is the nick the server gave us, read by keepnick and by anything
+	// that must tell our own messages apart.
+	selfNick atomic.Value // string
 
 	capsMu sync.RWMutex
 	caps   map[string]bool

@@ -2,6 +2,7 @@ package facade
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -38,6 +39,10 @@ type Config struct {
 	MOTDBlocked bool
 	// MOTDMissing answers login with 422 instead of a MOTD, as missingmotd does.
 	MOTDMissing bool
+	// ClearBuffersOnMsg clears every channel and query buffer when the user
+	// speaks, which is ZNC's clearbufferonmsg module. The module's default rule
+	// set is every message type except QUIT, so a QUIT does not clear.
+	ClearBuffersOnMsg bool
 }
 
 // BindHosts is the bind-host state the wire commands mutate. Resolution is
@@ -900,7 +905,41 @@ func (c *client) forward(line []byte) bool {
 	if err := nets[0].net.Send(line); err != nil {
 		return c.notConnected()
 	}
+	c.clearOnSpeak(line)
 	return true
+}
+
+// clearOnSpeak implements ZNC's clearbufferonmsg: while the user is talking,
+// playback should start at the current conversation, so every channel and query
+// buffer is dropped on a message the user sends. ZNC's module clears on msg,
+// ctcp, action, notice, part and topic but explicitly not on quit
+// (clearbufferonmsg.cpp: m_bRules[RULE_QUIT] = false), and it skips detached
+// channels because those had not been read yet.
+func (c *client) clearOnSpeak(line []byte) {
+	if !c.srv.cfg.ClearBuffersOnMsg {
+		return
+	}
+	_, rest := ircline.Tags(line)
+	_, rest = ircline.Prefix(rest)
+	verb := ircline.Verb(rest)
+	switch {
+	case bytes.EqualFold(verb, []byte("PRIVMSG")),
+		bytes.EqualFold(verb, []byte("NOTICE")),
+		bytes.EqualFold(verb, []byte("PART")),
+		bytes.EqualFold(verb, []byte("TOPIC")):
+	default:
+		return
+	}
+	network := c.commandNetwork()
+	if network == "" {
+		return
+	}
+	for _, window := range c.srv.windows.knownWindows(network) {
+		if !c.srv.windows.isAttached(c.sub, windowKey(network, window)) {
+			continue
+		}
+		_, _ = c.srv.ClearBuffer(network, window)
+	}
 }
 
 func (c *client) notConnected() bool {

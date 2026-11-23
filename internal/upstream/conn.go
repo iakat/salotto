@@ -190,6 +190,22 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 		c.cfg.OnConnect()
 	}
 
+	// Perform lines go first, before the joins: they are the commands that make
+	// the session what the user expects (identify, set modes), and a JOIN that
+	// races an IDENTIFY is the classic ordering bug. ZNC runs perform on
+	// OnIRCConnected, which fires on 001 just like this block.
+	if c.cfg.Perform != nil {
+		for _, line := range c.cfg.Perform() {
+			if err := c.enqueue([]byte(line)); err != nil {
+				close(stop)
+				conn.Close()
+				<-writerDone
+				c.drainWrites()
+				return true, err
+			}
+		}
+	}
+
 	join := c.cfg.Channels
 	if c.cfg.JoinChannels != nil {
 		join = c.cfg.JoinChannels()
@@ -205,7 +221,16 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 	}
 	c.markRegistered()
 
+	keepStop := make(chan struct{})
+	keepDone := make(chan struct{})
+	go func() {
+		defer close(keepDone)
+		c.keepNickLoop(keepStop)
+	}()
+
 	err = c.readLoop(br, scratch)
+	close(keepStop)
+	<-keepDone
 
 	if c.cfg.OnDisconnect != nil {
 		c.cfg.OnDisconnect()

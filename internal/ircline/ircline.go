@@ -167,3 +167,20 @@ func lowerASCII(c byte) byte {
 	}
 	return c
 }
+
+// Nick returns the nickname from a prefix ("nick!user@host" -> "nick"). An empty
+// prefix, or a server prefix with no "!", returns "".
+func Nick(prefix []byte) string {
+	if len(prefix) == 0 {
+		return ""
+	}
+	i := 0
+	for i < len(prefix) && prefix[i] != '!' && prefix[i] != '@' {
+		i++
+	}
+	if i == len(prefix) || prefix[i] == '@' {
+		// A server name has no "!", so a prefix without one is not a nick.
+		return ""
+	}
+	return string(prefix[:i])
+}

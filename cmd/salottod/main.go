@@ -126,6 +126,10 @@ func run() int {
 		MaxClients:  maxClients,
 		MOTDBlocked: cfg.MOTDBlocked,
 		MOTDMissing: cfg.MOTDMissing,
+		// clearbufferonmsg is a per-network knob in ZNC; here it is process-wide
+		// because the daemon is single-user. Any network asking for it turns it
+		// on.
+		ClearBuffersOnMsg: cfg.ClearBufferOnMsg(),
 	})
 	if err != nil {
 		logger.Error("facade config invalid", "err", err)

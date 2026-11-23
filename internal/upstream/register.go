@@ -103,7 +103,20 @@ func (c *Conn) register(conn net.Conn, br *bufio.Reader, scratch []byte) error {
 			continue
 		}
 		if ircline.IsVerb(rest, "001") {
+			if p := ircline.Params(rest); len(p) > 0 {
+				c.selfNick.Store(strings.TrimSpace(string(bytes.Fields(p)[0])))
+			}
 			return nil
+		}
+		if ircline.IsVerb(rest, "433") {
+			// Nick in use: take the alternative rather than looping on the same
+			// rejected NICK. ZNC has the same two-step (nick, then altnick) and
+			// keepnick's retry of the primary is a separate, later attempt.
+			if c.cfg.AltNick != "" && c.cfg.AltNick != c.cfg.Nick {
+				if err := c.writeLine(conn, []byte("NICK "+c.cfg.AltNick)); err != nil {
+					return err
+				}
+			}
 		}
 	}
 }

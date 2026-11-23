@@ -591,7 +591,9 @@ Dependency order, not priority-by-excitement. Each line is roughly one milestone
 7. **W1–W3**: WebSocket transport, client state engine, rendering. First usable
    web UI, and the PWA shell (§2.0.1) with it.
 8. **W10 + §2.3**: admin panel and audit log.
-9. **B6-EXTERNAL, B14, B15** and the `Keep — implement` module set.
+9. **B6-EXTERNAL, B14, B15** — **done**. SASL EXTERNAL with a client
+   certificate, trusted server fingerprints, MOTD block/missing. The
+   `Keep — implement` module set below is the last piece of this line.
 10. **W4–W9**: search UI, previews (safely), **uploads (§2.0.3)**, push,
     typing/mentions, themes.
 11. **Anti-abuse** (`fail2ban`, `ctcpflood`, `flooddetach`) if the deployment is

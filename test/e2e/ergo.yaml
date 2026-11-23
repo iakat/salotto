@@ -1,0 +1,71 @@
+# E2E test ircd: a single-node ergo with no TLS, no ident, in-memory history.
+# It exists so salotto and ZNC can be pointed at the same server and compared.
+
+name: salotto-e2e
+
+network:
+    name: SalottoE2E
+
+server:
+    listeners:
+        "127.0.0.1:16667": { }
+
+accounts:
+    authentication-enabled: false
+    registration:
+        enabled: true
+        allow-before-connect: true
+        email-verification:
+            enabled: false
+    registration-messages: false
+    login-throttling:
+        enabled: false
+
+channels:
+    default-modes: +nt
+    registration:
+        enabled: false
+
+operators:
+    e2e:
+        password: "e2e-oper-password"
+        whois-line: "e2e operator"
+        modes: "+o"
+
+limits:
+    nicklen: 32
+    identlen: 20
+    realnamelen: 200
+    channellen: 64
+    awaylen: 200
+    kicklen: 200
+    topiclen: 390
+    monitor-entries: 100
+    whowas-entries: 100
+    chan-list-modes: 60
+    multiline:
+        max-bytes: 4096
+        max-lines: 100
+
+fakelag:
+    enabled: false
+
+history:
+    enabled: true
+    channel-length: 2048
+    client-length: 256
+    autoresize-window: 3d
+    autoreplay-on-join: 0
+    chathistory-maxmessages: 1000
+
+logging:
+    - method: stderr
+      type: "* -userinput -useroutput"
+      level: debug
+
+datastore:
+    path: /tmp/salotto-e2e/ergo/ircd.db
+    autoupgrade: true
+
+languages:
+    enabled: false

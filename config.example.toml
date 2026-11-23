@@ -52,6 +52,10 @@ pass = ""
 # Or authenticate with a client certificate instead (SASL EXTERNAL, ZNC's *cert
 # setup): set sasl_external and point at a PEM certificate plus key. The identity
 # comes from the certificate, so no username or password is sent.
+# altnick = "mynick_"       # tried on 433 nick-in-use
+# keepnick = true           # retry nick every 30s while connected (ZNC keepnick)
+# perform = ["PRIVMSG NickServ :IDENTIFY hunter2"]   # run on every connect
+# clearbufferonmsg = true   # drop buffers when you speak (ZNC clearbufferonmsg)
 # sasl_external = true
 # cert_file = "/etc/salotto/client.pem"
 # key_file = "/etc/salotto/client.key"

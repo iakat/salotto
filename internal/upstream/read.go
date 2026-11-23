@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 
 	"github.com/iakat/salotto/internal/ircline"
@@ -33,8 +34,33 @@ func (c *Conn) readLoop(br *bufio.Reader, scratch []byte) error {
 			continue
 		}
 
+		c.trackSelf(rest)
 		c.linesIn.Add(1)
 		c.store(line, false)
+	}
+}
+
+// trackSelf keeps the nick the server actually gave us. ZNC needs the same value
+// for keepnick ("do we already have the nick we want?"), and so does anything
+// that has to tell our own messages from someone else's.
+func (c *Conn) trackSelf(rest []byte) {
+	if ircline.IsVerb(rest, "001") {
+		if f := bytes.Fields(ircline.Params(rest)); len(f) > 0 {
+			c.selfNick.Store(string(f[0]))
+		}
+		return
+	}
+	if !ircline.IsVerb(rest, "NICK") {
+		return
+	}
+	_, pfx := ircline.Tags(rest)
+	pfx, _ = ircline.Prefix(pfx)
+	from := ircline.Nick(pfx)
+	if from == "" || from != c.selfNick.Load() {
+		return
+	}
+	if f := bytes.Fields(ircline.Params(rest)); len(f) > 0 {
+		c.selfNick.Store(string(f[0]))
 	}
 }
 

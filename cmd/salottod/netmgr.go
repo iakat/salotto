@@ -133,6 +133,8 @@ func (m *netmgr) Start(nc config.Network) error {
 		SASLUser:           nc.SASLUser,
 		SASLPass:           nc.SASLPass,
 		SASLExternal:       nc.SASLExternal,
+		AltNick:            nc.AltNick,
+		KeepNick:           nc.KeepNick,
 		CertFile:           nc.CertFile,
 		KeyFile:            nc.KeyFile,
 		Channels:           append([]string(nil), nc.Channels...),
@@ -146,6 +148,9 @@ func (m *netmgr) Start(nc config.Network) error {
 		JoinChannels: func() []string {
 			return joinableChannels(nc.Channels, m.srv, netName)
 		},
+		// ZNC's perform module: the lines run on every connect, before the
+		// joins, because a JOIN that races an IDENTIFY is the classic bug.
+		Perform: func() []string { return append([]string(nil), nc.Perform...) },
 		// Read at every handshake, so a pin added with
 		// AddTrustedServerFingerprint applies to the next reconnect.
 		TrustFingerprint: func(fp string) bool {

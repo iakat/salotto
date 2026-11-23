@@ -35,8 +35,19 @@ type Network struct {
 	// certificate, not a password pair.
 	SASLExternal bool
 	// CertFile/KeyFile are the client certificate presented to the network.
-	CertFile           string
-	KeyFile            string
+	CertFile string
+	KeyFile  string
+	// AltNick is tried when Nick is in use (ZNC's Nick/AltNick pair).
+	AltNick string
+	// KeepNick retries Nick every 30 s while the server has us under another
+	// one (ZNC's keepnick module).
+	KeepNick bool
+	// Perform are IRC lines sent on every connect, before the joins (ZNC's
+	// perform module).
+	Perform []string
+	// ClearBufferOnMsg clears every channel and query buffer as soon as the user
+	// speaks (ZNC's clearbufferonmsg).
+	ClearBufferOnMsg   bool
 	Channels           []string
 	BindHost           string
 	InsecureSkipVerify bool
@@ -348,6 +359,16 @@ func (c *Config) parseNetworkKey(n *Network, key, value string) error {
 		n.Pass, err = parseString(value)
 	case "sasl_user":
 		n.SASLUser, err = parseString(value)
+	case "altnick":
+		n.AltNick, err = parseString(value)
+	case "keepnick":
+		n.KeepNick, err = parseBool(value)
+	case "perform":
+		// perform = ["PRIVMSG NickServ :IDENTIFY hunter2", ...] — sent on every
+		// connect, before the joins.
+		n.Perform, err = parseStringList(value)
+	case "clearbufferonmsg":
+		n.ClearBufferOnMsg, err = parseBool(value)
 	case "sasl_external":
 		n.SASLExternal, err = parseBool(value)
 	case "cert_file":
@@ -501,4 +522,16 @@ func parseInt(value string) (int, error) {
 		return 0, fmt.Errorf("expected an integer, got %q", strings.TrimSpace(value))
 	}
 	return v, nil
+}
+
+// ClearBufferOnMsg reports whether any network asked for ZNC's
+// clearbufferonmsg behaviour. The facade is process-wide and single-user, so one
+// network asking for it is enough.
+func (c *Config) ClearBufferOnMsg() bool {
+	for _, n := range c.Networks {
+		if n.ClearBufferOnMsg {
+			return true
+		}
+	}
+	return false
 }

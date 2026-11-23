@@ -1,0 +1,144 @@
+# ZNC, unmodified upstream, as the reference implementation.
+#
+# Its config is generated at start from the environment rather than committed with
+# a password in it: the container renders $ZNC_PASS (already a plain#zNC hash as
+# ZNC's config parser accepts) into znc.conf, then execs znc. That keeps the
+# reference honest — same auth path as a real deployment — without a secret in
+# git.
+#
+# The user is "e2e" and the only network points at the e2e ergo Service, so a
+# client talking to either bouncer sees the same channel and the same server.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: salotto-e2e-znc
+  namespace: hermes-generated-content
+data:
+  entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+    # ZNC 1.10 reads <datadir>/configs/znc.conf, not <datadir>/znc.conf.
+    mkdir -p /znc-data/configs /znc-data/moddata /znc-data/users
+    cat > /znc-data/configs/znc.conf <<EOF
+    Version = 1.10.2
+    AnonIPLimit = 16
+    MaxBufferSize = 500
+    ProtectWebSessions = true
+        ServerThrottle = 30
+    Skin = dark-clouds
+    ConnectDelay = 5
+    ServerTimeout = 60
+    AuthOnlyViaModule = false
+
+    <Listener l>
+        Port = 6667
+        IPv4 = true
+        IPv6 = false
+        SSL = false
+        URIPrefix = /
+    </Listener>
+
+    <User e2e>
+        Admin = true
+        Nick = e2e
+        AltNick = e2e_
+        Ident = e2e
+        RealName = e2e bouncer
+        StatusPrefix = *
+        ChanBufferSize = 250
+        QueryBufferSize = 250
+        MultiClients = true
+        Timestamp = true
+        Timezone = Europe/Amsterdam
+        AppendTimestamp = false
+        PrependTimestamp = true
+        DCCLookupMethod = default
+        JoinTries = 10
+        MaxJoins = 110
+        MaxNetworks = 8
+        MaxQueryBuffers = 50
+        KeepBuffer = true
+        AutoClearChanBuffer = false
+        AutoClearQueryBuffer = false
+        Pass = ${ZNC_PASS}
+
+        <Network ircd>
+            LoadModule = chansaver
+            LoadModule = keepnick
+            LoadModule = buffextras
+            IRCConnectEnabled = true
+            Server = salotto-e2e-ergo:6667
+            Encoding = ^UTF-8
+            <Chan #e2e>
+            </Chan>
+        </Network>
+    </User>
+    EOF
+    exec /opt/znc/bin/znc --foreground --datadir /znc-data --no-color --allow-root
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: salotto-e2e-znc-data
+  namespace: hermes-generated-content
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: salotto-e2e-znc
+  namespace: hermes-generated-content
+  labels: {app: salotto-e2e-znc}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: salotto-e2e-znc}
+  template:
+    metadata:
+      labels: {app: salotto-e2e-znc}
+    spec:
+      # znc's image entrypoint insists on a writable datadir owned by its user.
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: znc
+          image: docker.io/library/znc:1.10.2
+          command: ["/bin/sh", "/opt/e2e/entrypoint.sh"]
+          env:
+            # ZNC's config parser splits Pass on '#': <method>#<value>.
+            - name: ZNC_PASS
+              value: "plain#e2e-client-password"
+          ports:
+            - {name: irc, containerPort: 6667}
+          resources:
+            limits: {memory: 256Mi, cpu: 300m}
+            requests: {memory: 32Mi, cpu: 20m}
+          volumeMounts:
+            - {name: e2e, mountPath: /opt/e2e}
+            - {name: data, mountPath: /znc-data}
+          readinessProbe:
+            tcpSocket: {port: 6667}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: e2e
+          configMap: {name: salotto-e2e-znc, defaultMode: 0755}
+        - name: data
+          persistentVolumeClaim: {claimName: salotto-e2e-znc-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: salotto-e2e-znc
+  namespace: hermes-generated-content
+spec:
+  selector: {app: salotto-e2e-znc}
+  ports:
+    - {name: irc, port: 6667, targetPort: 6667}
