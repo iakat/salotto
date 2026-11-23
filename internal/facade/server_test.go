@@ -669,3 +669,31 @@ func TestOtherUserLineIsByteIdentical(t *testing.T) {
 		t.Fatalf("third-party line changed: got %q, want %q", buf.Bytes(), line)
 	}
 }
+
+// TestTwoClientsMayHoldTheUsersNick pins the ZNC model: every attached client of a
+// user is that user. The bouncer holds the nick upstream; the clients are views on
+// the same identity, so they all register with the same nick.
+//
+// This matters beyond bookkeeping. Our own upstream lines are prefixed with the
+// upstream nick, so a client registered under a different nick cannot recognise its
+// own JOINs or a line that names it - which is exactly how the web front end lost
+// both its window list and its mentions.
+func TestTwoClientsMayHoldTheUsersNick(t *testing.T) {
+	s, _, sub1, _ := newWindowFixture(t)
+	_, _, sub2, _ := newWindowFixture(t)
+	_ = s
+
+	// Two clients, same nick, both register. Nothing rejects the second.
+	for i, sub := range []*Subscriber{sub1, sub2} {
+		c := &client{srv: s, sub: sub, nick: "alice", user: "alice"}
+		if !c.maybeRegister() {
+			t.Fatalf("client %d failed to register as alice", i)
+		}
+		if !c.registered {
+			t.Fatalf("client %d did not register", i)
+		}
+		if c.nick != "alice" {
+			t.Fatalf("client %d registered as %q", i, c.nick)
+		}
+	}
+}

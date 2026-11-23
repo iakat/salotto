@@ -138,6 +138,40 @@ class WS:
                 return f
         raise RuntimeError("no matching state frame within %.0fs" % within)
 
+    def frame(self, within=20.0, want=None):
+        """Read until a frame matching want, of ANY type.
+
+        state() filters to state frames because that is what a render check wants.
+        A search answer is a "results" frame, so a probe that can only see states
+        reports a working search as a timeout.
+        """
+        end = time.time() + within
+        pending, pending_op = b"", None
+        while time.time() < end:
+            self.sock.settimeout(max(0.5, end - time.time()))
+            fin, op, payload = self._frame()
+            if op == 0x8:
+                raise RuntimeError("server closed the socket")
+            if op in (0x9, 0xA):
+                continue
+            if op == 0x0:
+                if pending_op is None:
+                    continue
+                pending += payload
+                if not fin:
+                    continue
+                payload, pending, pending_op = pending, b"", None
+            elif op == 0x1:
+                if not fin:
+                    pending, pending_op = payload, op
+                    continue
+            else:
+                continue
+            f = json.loads(payload)
+            if want is None or want(f):
+                return f
+        raise RuntimeError("no matching frame within %.0fs" % within)
+
     def close(self):
         try:
             self.sock.close()

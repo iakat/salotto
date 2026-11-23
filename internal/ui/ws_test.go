@@ -439,3 +439,49 @@ func TestWSCommandImmediatelyAfterConnectIsNotSwallowed(t *testing.T) {
 		t.Fatalf("active = %q, want %q", f.Active, target)
 	}
 }
+
+// TestMentionsReachTheFrame is the full path: wire line in, frame out. The unit
+// tests either side of it pass while the middle is broken, which is what a live
+// probe found - the line arrived and the frame had no mention in it.
+func TestMentionsReachTheFrame(t *testing.T) {
+	Configure()
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	p := NewProgram("status", tr)
+	srv := newWSServer(t, p)
+	c, _ := wsDial(t, srv)
+
+	// Drive the transport's own read path, then let the Program consume it.
+	fb.inject(t, ":irc.test 001 alice :welcome")
+	fb.inject(t, ":bob!b@h JOIN #c")
+	fb.inject(t, ":bob!b@h PRIVMSG #c :alice: are you there")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case msg := <-tr.Msgs():
+			p.Step(msg)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no transport message; model unread=%v mentions=%v",
+				p.Model().Unread(), p.Model().Mentions())
+		}
+		if got := p.Model().Mentions(); len(got) > 0 {
+			break
+		}
+	}
+	if !p.Model().Mentions()["#c"] {
+		t.Fatalf("the model has no mention for #c; model unread=%v", p.Model().Unread())
+	}
+
+	// And the frame the browser reads carries it.
+	p.Step(Incoming(Line{Window: "#other", Nick: "x", Text: "force a revision"}))
+	f := readState(t, c, 5*time.Second, func(f Frame) bool { return true })
+	if !f.Mentions["#c"] {
+		t.Fatalf("frame mentions = %v, want #c", f.Mentions)
+	}
+}

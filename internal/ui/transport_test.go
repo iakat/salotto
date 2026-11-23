@@ -391,3 +391,32 @@ func TestTransportExtendedJoinOpensTheWindow(t *testing.T) {
 		t.Fatalf("extended join routed to %q", got[1].Window)
 	}
 }
+
+// TestSelfNickLearnedFrom001DrivesMentions pins the join between the two halves:
+// 001 is where we learn our own nick, and mention detection depends on knowing it.
+// Without this link the mention highlight never fires in a real session, even
+// though mentionsUs itself works - which is exactly the kind of gap a unit test of
+// the helper alone cannot see.
+func TestSelfNickLearnedFrom001DrivesMentions(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 alice :welcome")
+	fb.inject(t, ":bob!b@h PRIVMSG #c :alice: ping")
+	fb.inject(t, ":bob!b@h PRIVMSG #c :unrelated")
+
+	got := collectIncoming(t, tr, 3)
+	if got[0].Window != "status" {
+		t.Fatalf("001 routed to %q", got[0].Window)
+	}
+	if !got[1].Mention {
+		t.Fatalf("a line naming our nick was not flagged as a mention: %+v", got[1])
+	}
+	if got[2].Mention {
+		t.Fatalf("an unrelated line was flagged as a mention: %+v", got[2])
+	}
+}
