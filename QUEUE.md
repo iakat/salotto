@@ -306,8 +306,20 @@ recording because they are not obvious from a feature list:
   9 allocs; twice = 595.9 ns/op, 240 B/op, 19 allocs, i.e. ≈ +345 ns, +128 B,
   +10 allocs per logged line. Fixed in the B2 change: routing now calls
   `logfile.Route` once and hands the `[]Entry` to the writer (`Writer.OnRouted`),
-  so the drain never re-parses. The old measurement is kept as history; no new
-  benchmark was added.
+  so the drain never re-parses. Re-measured after the change on this host
+  (8 vCPU, Go 1.27.4): `Format` once 300.8 ns/op / 152 B / 9 allocs,
+  `Format` twice 693.1 ns/op / 304 B / 18 allocs, `Route` (parse + observe,
+  what a routed line now costs) 442.8 ns/op / 184 B / 10 allocs. So a routed
+  line pays one parse plus the observe the drain used to do, and the second
+  parse — the ≈ +345 ns half — is gone.
+- **Q5. Routing and observation must not be split across goroutines.** Moving
+  the parse onto the reading goroutine (Q4) left `Tracker.Observe` in the drain,
+  which is asynchronous. A `JOIN` could therefore be unobserved when the next
+  `PRIVMSG` in that channel was routed (the message fell to `status`), and a
+  `QUIT` observed after its own membership was erased lost its fan-out. Parsing
+  and observing now happen together in `Writer.Route`, in arrival order, and the
+  drain skips a line routing already observed. Any future consumer that needs
+  membership must go through the same call, not a second tracker.
 
 ---
 
