@@ -90,7 +90,15 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     border-top: 1px solid #2a2a3a;
     font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  @media (max-width: 640px) { aside.windows { display: none; } }
+  aside.nicks { width: 150px; flex: 0 0 150px; background: #14141d;
+    border-left: 1px solid #2a2a3a; overflow-y: auto; padding: 8px 0; }
+  aside.nicks h2 { margin: 4px 12px 8px; font: 600 11px ui-monospace, monospace;
+    letter-spacing: .08em; text-transform: uppercase; color: #7a7a95; }
+  aside.nicks .nick { padding: 2px 12px; font: 12px ui-monospace, monospace;
+    color: #b8b8d0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  aside.nicks .nick.op { color: #7ddc8a; font-weight: 600; }
+  aside.windows .count-nicks { color: #5c5c78; font-size: 11px; }
+  @media (max-width: 640px) { aside.windows, aside.nicks { display: none; } }
 </style>
 </head>
 <body>
@@ -108,6 +116,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 </form>
 <footer class="status" id="status">{{.Status}}</footer>
 </div>
+<aside class="nicks" id="nicks" hidden></aside>
 <script src="/client.js"></script>
 </body>
 </html>

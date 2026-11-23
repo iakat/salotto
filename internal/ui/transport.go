@@ -3,6 +3,7 @@ package ui
 import (
 	"bufio"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,8 +38,13 @@ type Transport struct {
 	windows map[string]bool
 	// own is the set of nicks this connection holds. A bouncer can be holding
 	// more than one during a nick collision, so this is a set and not a string.
-	own    map[string]bool
-	active string
+	own map[string]bool
+	// members is per-channel membership, as the wire tells it to us: 353 replies
+	// name the channel and the nicks with their prefix modes, and JOIN/PART/QUIT/
+	// KICK/NICK keep it current after that. It lives in the transport because it is
+	// wire knowledge - the model does not know what a "353" is, and should not.
+	members map[string]map[string]string
+	active  string
 
 	outq chan string
 	msgs chan tea.Msg
@@ -59,6 +65,7 @@ func Dial(addr string) (*Transport, error) {
 		br:      bufio.NewReaderSize(conn, 64*1024),
 		windows: make(map[string]bool),
 		own:     make(map[string]bool),
+		members: make(map[string]map[string]string),
 		active:  "status",
 		outq:    make(chan string, 64),
 		msgs:    make(chan tea.Msg, 256),
@@ -262,6 +269,13 @@ func (t *Transport) handle(raw []byte) {
 		// sends the extended-join form (":ournick JOIN #chan account :realname").
 		channel, _, _ := strings.Cut(strings.TrimPrefix(params, ":"), " ")
 		channel = strings.TrimSuffix(channel, ",")
+		if channel != "" && from != "" && !t.isSelf(from) {
+			// Somebody else joined a channel we know about: membership changed,
+			// so the nicklist has to follow or it lists people who left and misses
+			// people who arrived.
+			t.addMember(channel, from)
+			t.publishMembers(channel)
+		}
 		if channel != "" && t.isSelf(from) {
 			t.note(channel)
 			t.push(Incoming(Line{
@@ -286,6 +300,14 @@ func (t *Transport) handle(raw []byte) {
 				t.noteSelf(fields[0])
 			}
 		}
+		// A rename is a departure from every list and an arrival under a new name.
+		var to string
+		if fields := strings.Fields(strings.TrimPrefix(params, ":")); len(fields) > 0 {
+			to = fields[0]
+		}
+		if to != "" && from != "" {
+			t.renameEverywhere(from, to)
+		}
 		t.push(Incoming(Line{
 			Window: "status",
 			Text:   strings.TrimSpace(from + " " + verb + " " + params),
@@ -293,7 +315,50 @@ func (t *Transport) handle(raw []byte) {
 		}))
 		return
 
-	case "PART", "QUIT", "KICK", "MODE":
+	case "KICK":
+		// A kick removes one nick from one channel. The channel is the first
+		// parameter and the victim the second.
+		fields := strings.Fields(params)
+		if len(fields) >= 2 {
+			channel := strings.TrimSuffix(fields[0], ",")
+			t.removeMember(channel, fields[1])
+			t.publishMembers(channel)
+		}
+		t.push(Incoming(Line{
+			Window: "status",
+			Text:   strings.TrimSpace(from + " " + verb + " " + params),
+			Kind:   LineSystem,
+		}))
+		return
+
+	case "PART":
+		// A part removes the parting nick from the channel it names.
+		fields := strings.Fields(params)
+		if len(fields) >= 1 && from != "" {
+			for _, channel := range strings.Split(fields[0], ",") {
+				t.removeMember(channel, from)
+				t.publishMembers(channel)
+			}
+		}
+		t.push(Incoming(Line{
+			Window: "status",
+			Text:   strings.TrimSpace(from + " " + verb + " " + params),
+			Kind:   LineSystem,
+		}))
+		return
+
+	case "QUIT":
+		// A quit removes the nick from every channel: one departure, several
+		// lists.
+		t.removeEverywhere(from)
+		t.push(Incoming(Line{
+			Window: "status",
+			Text:   strings.TrimSpace(from + " " + verb + " " + params),
+			Kind:   LineSystem,
+		}))
+		return
+
+	case "MODE":
 		// Membership changes are status events rather than conversation, unless
 		// they happen in a window the user is in — the model has no per-window
 		// membership table, so status is the honest place.
@@ -308,6 +373,24 @@ func (t *Transport) handle(raw []byte) {
 		// The bouncer normally answers its own PINGs, but a direct connection to
 		// an IRCd does not; answering here keeps both cases working.
 		t.Send("PONG " + params)
+		return
+	}
+
+	// 353 is the NAMES reply: "353 us = #chan :@op +voice plain". It is the
+	// membership of a channel, not conversation, so it becomes a Nicklist message
+	// instead of a scrollback line. The channel is the third parameter and the
+	// names are everything after the colon.
+	if verb == "353" {
+		t.noteMembers(params)
+		return
+	}
+
+	// 366 is end-of-NAMES, which is the moment the list is complete and worth
+	// sending. Sending on every 353 would redraw a large channel once per reply.
+	if verb == "366" {
+		if fields := strings.Fields(params); len(fields) > 1 {
+			t.publishMembers(fields[1])
+		}
 		return
 	}
 
@@ -344,6 +427,151 @@ func (t *Transport) windowFor(target, from string) string {
 	}
 	t.note(from)
 	return from
+}
+
+// noteMembers records the nicks from one 353 reply. Repeated 353s for the same
+// channel accumulate, which is how a channel with more members than fit one line
+// is delivered.
+func (t *Transport) noteMembers(params string) {
+	// params: "<us> <symbol> <#channel> :nick nick nick"
+	fields := strings.SplitN(params, " ", 4)
+	if len(fields) < 4 {
+		return
+	}
+	channel := fields[2]
+	names := strings.TrimPrefix(fields[3], ":")
+	t.mu.Lock()
+	set, ok := t.members[channel]
+	if !ok {
+		set = make(map[string]string)
+		t.members[channel] = set
+	}
+	for _, raw := range strings.Fields(names) {
+		name, prefix := splitPrefix(raw)
+		if name == "" {
+			continue
+		}
+		// Keep the highest prefix seen: a nick is either opped or not, and a
+		// repeated reply must not demote someone because it listed them later
+		// with a symbol from a different reply.
+		if prev, seen := set[name]; !seen || rank(prefix) > rank(prev) {
+			set[name] = prefix
+		}
+	}
+	t.mu.Unlock()
+}
+
+// splitPrefix separates a NAMES entry's prefix modes from the nick. IRC prefixes
+// are ~ & @ % + in descending order of power.
+func splitPrefix(raw string) (name, prefix string) {
+	i := 0
+	for i < len(raw) && strings.ContainsRune("~&@%+", rune(raw[i])) {
+		i++
+	}
+	return raw[i:], raw[:i]
+}
+
+// rank orders prefixes so "highest wins" is a comparison and not a lookup table.
+func rank(prefix string) int {
+	switch {
+	case strings.Contains(prefix, "~"):
+		return 5
+	case strings.Contains(prefix, "&"):
+		return 4
+	case strings.Contains(prefix, "@"):
+		return 3
+	case strings.Contains(prefix, "%"):
+		return 2
+	case strings.Contains(prefix, "+"):
+		return 1
+	}
+	return 0
+}
+
+// addMember records one nick in one channel.
+func (t *Transport) addMember(channel, nick string) {
+	t.mu.Lock()
+	set, ok := t.members[channel]
+	if !ok {
+		set = make(map[string]string)
+		t.members[channel] = set
+	}
+	if _, seen := set[nick]; !seen {
+		set[nick] = ""
+	}
+	t.mu.Unlock()
+}
+
+// removeMember drops one nick from one channel.
+func (t *Transport) removeMember(channel, nick string) {
+	t.mu.Lock()
+	if set, ok := t.members[channel]; ok {
+		delete(set, nick)
+	}
+	t.mu.Unlock()
+}
+
+// removeEverywhere drops a nick from every channel it is in, which is what QUIT
+// means. It also publishes each affected list, because a quiet quit that leaves a
+// stale nicklist is worse than no nicklist.
+func (t *Transport) removeEverywhere(nick string) {
+	t.mu.Lock()
+	affected := make([]string, 0, 4)
+	for channel, set := range t.members {
+		if _, ok := set[nick]; ok {
+			delete(set, nick)
+			affected = append(affected, channel)
+		}
+	}
+	t.mu.Unlock()
+	for _, channel := range affected {
+		t.publishMembers(channel)
+	}
+}
+
+// renameEverywhere applies a nick change to every list holding the old name.
+func (t *Transport) renameEverywhere(from, to string) {
+	t.mu.Lock()
+	affected := make([]string, 0, 4)
+	for channel, set := range t.members {
+		if prefix, ok := set[from]; ok {
+			delete(set, from)
+			set[to] = prefix
+			affected = append(affected, channel)
+		}
+	}
+	t.mu.Unlock()
+	for _, channel := range affected {
+		t.publishMembers(channel)
+	}
+}
+
+// publishMembers sends the membership of a channel to the UI, sorted so the render
+// is stable: an unsorted list reshuffles on every redraw and looks like it is
+// changing when it is not.
+func (t *Transport) publishMembers(channel string) {
+	t.mu.Lock()
+	set := make(map[string]string, len(t.members[channel]))
+	for name, prefix := range t.members[channel] {
+		set[name] = prefix
+	}
+	t.mu.Unlock()
+	if len(set) == 0 {
+		return
+	}
+	nicks := make([]Nick, 0, len(set))
+	for name, prefix := range set {
+		nicks = append(nicks, Nick{Name: name, Prefix: prefix})
+	}
+	sort.Slice(nicks, func(i, j int) bool {
+		// Ops first, then by name: a nicklist is read top-down for "who is in
+		// charge", and an alphabetical list buries the ops.
+		if ri, rj := rank(nicks[i].Prefix), rank(nicks[j].Prefix); ri != rj {
+			return ri > rj
+		}
+		return strings.ToLower(nicks[i].Name) < strings.ToLower(nicks[j].Name)
+	})
+	t.push(Nicklist{Window: channel, Nicks: nicks})
 }
 
 // isSelf reports whether a prefix nick is one of ours. A bouncer can hold more

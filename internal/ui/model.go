@@ -48,6 +48,25 @@ const (
 // one from a literal.
 type Incoming Line
 
+// Nicklist is the message a transport sends when the membership of a window
+// changes. Nicks are sorted and carry their prefix modes ("@", "+", "") so the
+// renderer can show who is opped without a second lookup.
+//
+// It is a message of its own rather than a Line because membership is not
+// conversation: it has no scrollback, it is replaced wholesale, and a window shows
+// exactly one of them.
+type Nicklist struct {
+	Window string
+	Nicks  []Nick
+}
+
+// Nick is one member of a channel: a name and its highest prefix mode, "" for an
+// ordinary member.
+type Nick struct {
+	Name   string
+	Prefix string
+}
+
 // Sent is the message a transport sends when the user submitted a line.
 type Sent struct{ Text string }
 
@@ -67,6 +86,11 @@ type Model struct {
 	// there anything for me" - and the second is the one worth a colour.
 	unread  map[string]int
 	mention map[string]bool
+
+	// nicks is the membership of each channel, replaced wholesale by a Nicklist
+	// message. It is separate from windows because membership is not scrollback:
+	// it has no history, and a channel window shows exactly one of them.
+	nicks map[string][]Nick
 
 	input   []rune
 	scroll  int
@@ -142,6 +166,19 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+
+	case Nicklist:
+		if m.nicks == nil {
+			m.nicks = make(map[string][]Nick, 4)
+		}
+		// Replace, never merge: the transport sends the complete list at 366, so a
+		// merge would keep people who left.
+		if len(msg.Nicks) == 0 {
+			delete(m.nicks, msg.Window)
+		} else {
+			m.nicks[msg.Window] = msg.Nicks
+		}
 		return m, nil
 
 	case Incoming:
@@ -269,16 +306,18 @@ var (
 	// addresses us, so it stands out without a background fill that would fight
 	// the terminal's own theme.
 	mentionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("222")).Bold(true)
-	borderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
-	nickStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
-	timeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	bodyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
-	actionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
-	noticeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
-	systemStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	gapStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	inputStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
-	barStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
+	// opStyle marks channel operators in the nick column, in the same palette.
+	opStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
+	borderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+	nickStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
+	timeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	bodyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
+	actionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
+	noticeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
+	systemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	gapStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	inputStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
+	barStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 )
 
 // View renders the whole screen: a titled box with the scrollback and an input
@@ -293,8 +332,21 @@ func (m Model) View() string {
 		height = 6
 	}
 
-	inner := width - 4 // border plus padding on each side
+	// The nicklist takes a column on the right when the window has members. It is
+	// drawn inside the same border as the conversation, so the TUI shows what the
+	// browser shows in its sidebar rather than something a little different: one
+	// model, three renderers, and this is the third one agreeing.
+	nickWidth := 0
+	nicks := m.nicks[m.active]
+	if len(nicks) > 0 && width >= 60 {
+		nickWidth = 18
+		if width < 90 {
+			nickWidth = 14
+		}
+	}
+	inner := width - 4 - nickWidth // border, padding, and the nick column
 	body := m.bodyLines(inner, height-6)
+	nickCol := nickColumn(nicks, nickWidth, height-6)
 
 	var b strings.Builder
 	b.WriteString(borderStyle.Render("╭─ "))
@@ -308,11 +360,25 @@ func (m Model) View() string {
 	}
 	b.WriteString("\n")
 
-	for _, line := range body {
+	for i, line := range body {
 		b.WriteString(borderStyle.Render("│ "))
 		b.WriteString(line)
 		if pad := inner - lipgloss.Width(line); pad > 0 {
 			b.WriteString(strings.Repeat(" ", pad))
+		}
+		if nickWidth > 0 {
+			b.WriteString(borderStyle.Render("│"))
+			cell := ""
+			if i < len(nickCol) {
+				cell = nickCol[i]
+			}
+			b.WriteString(" ")
+			b.WriteString(cell)
+			// Pad on display width, not byte length: a nick with a wide glyph must
+			// not push the border out.
+			if pad := nickWidth - 2 - lipgloss.Width(cell); pad > 0 {
+				b.WriteString(strings.Repeat(" ", pad))
+			}
 		}
 		b.WriteString(borderStyle.Render(" │"))
 		b.WriteString("\n")
@@ -357,6 +423,35 @@ func (m Model) bodyLines(width, n int) []string {
 	}
 	for len(out) < n {
 		out = append(out, "")
+	}
+	return out
+}
+
+// nickColumn renders the member list as n rows of at most width-2 columns. Ops keep
+// their prefix; ordinary members are plain. It is truncated rather than wrapped:
+// a nicklist that runs off the bottom of the screen would push the conversation out
+// of view, which is the wrong trade for a list you can scroll by asking NAMES again.
+func nickColumn(nicks []Nick, width, n int) []string {
+	if width <= 2 || n <= 0 {
+		return nil
+	}
+	out := make([]string, 0, n)
+	for _, nick := range nicks {
+		if len(out) >= n {
+			break
+		}
+		label := nick.Name
+		if nick.Prefix != "" {
+			label = nick.Prefix + nick.Name
+		}
+		if lipgloss.Width(label) > width-2 {
+			label = lipgloss.NewStyle().MaxWidth(width - 2).Render(label)
+		}
+		if nick.Prefix != "" {
+			out = append(out, opStyle.Render(label))
+		} else {
+			out = append(out, nickStyle.Render(label))
+		}
 	}
 	return out
 }
@@ -485,6 +580,24 @@ func (m Model) Search(query string) []SearchResult {
 				out = append(out, SearchResult{Window: window, Line: line})
 			}
 		}
+	}
+	return out
+}
+
+// Nicklist returns the members of the active window, or of a named one. An empty
+// result means "not a channel" - a query window has no membership.
+func (m Model) Nicklist(window string) []Nick {
+	out := make([]Nick, len(m.nicks[window]))
+	copy(out, m.nicks[window])
+	return out
+}
+
+// NickCounts reports how many members each window has, for a sidebar that shows
+// "how busy is this channel" without shipping every name to the browser.
+func (m Model) NickCounts() map[string]int {
+	out := make(map[string]int, len(m.nicks))
+	for window, nicks := range m.nicks {
+		out[window] = len(nicks)
 	}
 	return out
 }

@@ -41,6 +41,13 @@ type Frame struct {
 	SearchResults []SearchHit `json:"results,omitempty"`
 	Query         string      `json:"query,omitempty"`
 
+	// Nicks is the membership of the active window and NickCounts the size of every
+	// channel, so a sidebar can show how busy a channel is without being sent every
+	// name in it. Only the active window's full list travels: a browser showing one
+	// channel needs one nicklist.
+	Nicks      []Nick         `json:"nicks,omitempty"`
+	NickCounts map[string]int `json:"nickcounts,omitempty"`
+
 	// Input mirrors the model's input buffer, so a second device attached to the
 	// same bouncer sees what is being typed. Empty means nothing in flight.
 	Input string `json:"input,omitempty"`
@@ -103,15 +110,17 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		return Frame{
-			Type:      "state",
-			Render:    p.model.View(),
-			Windows:   p.model.Windows(),
-			Active:    p.model.Active(),
-			Input:     p.model.Input(),
-			Connected: p.model.Connected(),
-			Status:    p.model.Status(),
-			Unread:    p.model.Unread(),
-			Mentions:  p.model.Mentions(),
+			Type:       "state",
+			Render:     p.model.View(),
+			Windows:    p.model.Windows(),
+			Active:     p.model.Active(),
+			Input:      p.model.Input(),
+			Connected:  p.model.Connected(),
+			Status:     p.model.Status(),
+			Unread:     p.model.Unread(),
+			Mentions:   p.model.Mentions(),
+			Nicks:      p.model.Nicklist(p.model.Active()),
+			NickCounts: p.model.NickCounts(),
 		}, p.rev
 	}
 

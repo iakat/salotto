@@ -18,6 +18,7 @@
   var statusEl = document.getElementById("status");
   var searchEl = document.getElementById("search");
   var resultsEl = document.getElementById("results");
+  var nicksEl = document.getElementById("nicks");
 
   // -- ANSI → HTML ----------------------------------------------------------
   // Only the sequences the server actually emits: SGR colour (8-bit, which the
@@ -130,7 +131,9 @@
         var label = esc(name);
         // "status" is the bouncer's own window and is always present; a badge on
         // it would be noise, since every NOTICE lands there.
+        var count = (f.nickcounts || {})[name] || 0;
         var badge = "";
+        if (count > 0) badge = '<span class="count-nicks">' + count + "</span>";
         if (name !== "status") {
           if (mentions[name]) badge = '<span class="badge">@</span>';
           else if (unread[name] > 0) badge = '<span class="badge count">' + unread[name] + "</span>";
@@ -139,6 +142,25 @@
           '<span class="name">' + label + "</span>" + badge + "</div>";
       }
       listEl.innerHTML = html;
+    }
+
+    // The nick panel is the browser's version of the TUI's nick column: same data,
+    // same order (ops first, then alphabetical), drawn where a browser expects it.
+    if (nicksEl) {
+      var list = f.nicks || [];
+      if (!list.length) {
+        nicksEl.innerHTML = "";
+        nicksEl.hidden = true;
+      } else {
+        var nh = '<h2>' + list.length + " here</h2>";
+        for (var j = 0; j < list.length; j++) {
+          var n = list[j];
+          var cls = n.prefix ? "nick op" : "nick";
+          nh += '<div class="' + cls + '">' + esc(n.prefix || "") + esc(n.name) + "</div>";
+        }
+        nicksEl.innerHTML = nh;
+        nicksEl.hidden = false;
+      }
     }
 
     // The connected flag is the transport's report. A UI that shows green while

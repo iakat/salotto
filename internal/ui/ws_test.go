@@ -485,3 +485,142 @@ func TestMentionsReachTheFrame(t *testing.T) {
 		t.Fatalf("frame mentions = %v, want #c", f.Mentions)
 	}
 }
+
+// TestNamesReplyBecomesANicklist pins the parse of 353/366. The membership of a
+// channel is not conversation: a 353 line in the scrollback would be noise, and the
+// nickname list has to be a list, not lines to scrape.
+func TestNamesReplyBecomesANicklist(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":irc.test 353 me = #c :@alice +bob carol")
+	fb.inject(t, ":irc.test 366 me #c :End of /NAMES list")
+
+	// No Nicklist until 366: a large channel is split across several 353 replies,
+	// and publishing each one would redraw the list once per reply.
+	got := collectNicks(t, tr)
+	if got.Window != "#c" {
+		t.Fatalf("nicklist for %q", got.Window)
+	}
+	if len(got.Nicks) != 3 {
+		t.Fatalf("nicks = %+v", got.Nicks)
+	}
+	// Ops first, then alphabetical: a nicklist is read for "who is in charge".
+	if got.Nicks[0].Name != "alice" || got.Nicks[0].Prefix != "@" {
+		t.Fatalf("first nick = %+v, want @alice", got.Nicks[0])
+	}
+	if got.Nicks[1].Name != "bob" || got.Nicks[2].Name != "carol" {
+		t.Fatalf("order = %+v", got.Nicks)
+	}
+}
+
+// TestNicklistFollowsMembership pins that the list stays true after the initial
+// NAMES: a nicklist that only ever reflects the join moment is worse than none,
+// because it looks authoritative and is stale.
+func TestNicklistFollowsMembership(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":irc.test 353 me = #c :alice bob")
+	fb.inject(t, ":irc.test 366 me #c :End of /NAMES list")
+	if n := collectNicks(t, tr); len(n.Nicks) != 2 {
+		t.Fatalf("initial nicks = %+v", n.Nicks)
+	}
+
+	// Arrival.
+	fb.inject(t, ":dave!d@h JOIN #c")
+	if n := collectNicks(t, tr); len(n.Nicks) != 3 {
+		t.Fatalf("after join nicks = %+v", n.Nicks)
+	}
+
+	// Departure.
+	fb.inject(t, ":bob!b@h PART #c")
+	if n := collectNicks(t, tr); len(n.Nicks) != 2 {
+		t.Fatalf("after part nicks = %+v", n.Nicks)
+	}
+
+	// A rename moves the entry rather than duplicating it.
+	fb.inject(t, ":dave!d@h NICK david")
+	if n := collectNicks(t, tr); len(n.Nicks) != 2 {
+		t.Fatalf("after nick nicks = %+v", n.Nicks)
+	}
+
+	// And a quit clears the nick from the list it was in.
+	fb.inject(t, ":david!d@h QUIT :bye")
+	if n := collectNicks(t, tr); len(n.Nicks) != 1 || n.Nicks[0].Name != "alice" {
+		t.Fatalf("after quit nicks = %+v", n.Nicks)
+	}
+}
+
+// collectNicks reads until a Nicklist arrives, failing if none does.
+func collectNicks(t *testing.T, tr *Transport) Nicklist {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg, ok := <-tr.Msgs():
+			if !ok {
+				t.Fatal("transport closed before a nicklist arrived")
+			}
+			if n, ok := msg.(Nicklist); ok {
+				return n
+			}
+		case <-deadline:
+			t.Fatal("no nicklist arrived")
+		}
+	}
+}
+
+// TestNicklistReachesTheFrame pins that the browser is told. The sidebar draws its
+// member list from the frame, so a nicklist the frame lacks is a nicklist the user
+// does not have.
+func TestNicklistReachesTheFrame(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "hi"}))
+	p.Step(Nicklist{Window: "#c", Nicks: []Nick{
+		{Name: "alice", Prefix: "@"}, {Name: "bob"},
+	}})
+
+	srv := newWSServer(t, p)
+	_, f := wsDial(t, srv)
+	if len(f.Nicks) != 2 {
+		t.Fatalf("frame nicks = %+v", f.Nicks)
+	}
+	if f.Nicks[0].Name != "alice" || f.Nicks[0].Prefix != "@" {
+		t.Fatalf("frame nicks = %+v", f.Nicks)
+	}
+	if f.NickCounts["#c"] != 2 {
+		t.Fatalf("nickcounts = %v", f.NickCounts)
+	}
+}
+
+// TestNicklistReplacesRatherThanMerges pins the update semantics. The transport
+// sends the complete list, so merging would keep people who left - the failure mode
+// of every nicklist that is "maintained" instead of "replaced".
+func TestNicklistReplacesRatherThanMerges(t *testing.T) {
+	m := New("#c")
+	m, _ = m.Step(Nicklist{Window: "#c", Nicks: []Nick{{Name: "alice"}, {Name: "bob"}}})
+	if got := m.Nicklist("#c"); len(got) != 2 {
+		t.Fatalf("nicks = %+v", got)
+	}
+	m, _ = m.Step(Nicklist{Window: "#c", Nicks: []Nick{{Name: "alice"}}})
+	if got := m.Nicklist("#c"); len(got) != 1 || got[0].Name != "alice" {
+		t.Fatalf("after replace nicks = %+v", got)
+	}
+	// An empty list means the channel has nobody: the entry goes away.
+	m, _ = m.Step(Nicklist{Window: "#c"})
+	if got := m.Nicklist("#c"); len(got) != 0 {
+		t.Fatalf("after empty nicks = %+v", got)
+	}
+}
