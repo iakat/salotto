@@ -161,11 +161,14 @@ The beginning of the output from that command in the live run:
 :salotto 375 x :- salotto Message of the day -
 :salotto 372 x :- salotto proof of concept: replayed history follows.
 :salotto 376 x :End of /MOTD command.
-:salotto BATCH +replay libera-replay
-@batch=libera-replay;time=2026-11-22T15:18:55.719Z :tantalum.libera.chat 002 salottopoc7q2 :Your host is tantalum.libera.chat[93.158.237.2/6697], running version solanum-1.0-dev
-@batch=libera-replay;time=2026-11-22T15:18:55.719Z :tantalum.libera.chat 003 salottopoc7q2 :This server was created Fri Nov 13 2026 at 07:28:59 UTC
+:salotto BATCH +replay libera-status-replay
+@batch=libera-status-replay;time=2026-11-22T15:18:55.719Z :tantalum.libera.chat 002 salottopoc7q2 :Your host is tantalum.libera.chat[93.158.237.2/6697], running version solanum-1.0-dev
+@batch=libera-status-replay;time=2026-11-22T15:18:55.719Z :tantalum.libera.chat 003 salottopoc7q2 :This server was created Fri Nov 13 2026 at 07:28:59 UTC
 ...
-:salotto BATCH -replay libera-replay
+:salotto BATCH -replay libera-status-replay
+salotto BATCH +replay libera-#hermes-replay
+...
+:salotto BATCH -replay libera-#hermes-replay
 ```
 
 ## Benchmarks on this machine
