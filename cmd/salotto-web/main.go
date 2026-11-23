@@ -84,7 +84,12 @@ func run() int {
 	// dies with the session and a closed tab closes its client - which is what any IRC
 	// client does, and what a shared in-process Program could not do.
 	cmdFor := func(cols, rows int) *exec.Cmd {
-		args := []string{"-cols", fmt.Sprint(cols), "-rows", fmt.Sprint(rows)}
+		// No size arguments: the PTY was created at the size the browser asked for, and
+		// the child learns it from the terminal (TIOCGWINSZ) the same way it learns every
+		// resize. Passing it on the command line as well would be a second source of truth
+		// for the one thing the kernel already knows - and, as it happened, a flag the
+		// child did not define, so every session died on the first frame.
+		var args []string
 		if *bouncer != "" {
 			args = append(args, "-bouncer", *bouncer, "-nick", *nick)
 		}

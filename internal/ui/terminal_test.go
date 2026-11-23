@@ -3,6 +3,7 @@ package ui_test
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
@@ -288,6 +289,92 @@ func TestTheFramesAreBytesNotJSON(t *testing.T) {
 	got := tm.waitFor("red", 5*time.Second)
 	if !strings.Contains(got, "\x1b[31m") {
 		t.Fatalf("the escape sequences did not survive the bridge: %q", got)
+	}
+}
+
+// TestTheChildGetsNoArgumentsItDoesNotUnderstand is the test the deployed bug asked for.
+//
+// The bridge shipped passing -cols and -rows to a binary that never defined them, so
+// every session died on the first frame and the browser said "[session ended]". The local
+// tests all built the child with no arguments, which is why they were all green: the bug
+// lived in the call site the tests did not exercise. This runs the real web binary for
+// real, which is the only way to know the arguments it builds are arguments the child
+// accepts.
+func TestTheWebFrontEndCanStartItsChild(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go binary not available")
+	}
+	dir := t.TempDir()
+	web := filepath.Join(dir, "salotto-web")
+	build := exec.Command("go", "build", "-o", web, "github.com/iakat/salotto/cmd/salotto-web")
+	build.Env = append(build.Environ(), "CGO_ENABLED=0")
+	if b, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build web: %v\n%s", err, b)
+	}
+	tui := filepath.Join(dir, "salotto-tui")
+	build = exec.Command("go", "build", "-o", tui, "github.com/iakat/salotto/cmd/salotto-tui")
+	build.Env = append(build.Environ(), "CGO_ENABLED=0")
+	if b, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build tui: %v\n%s", err, b)
+	}
+
+	// Run the front end as it runs in the cluster, then open a session and read it. A
+	// child that rejects its arguments prints usage and exits, so "no output at all"
+	// is the failure this catches.
+	addr := "127.0.0.1:0"
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	addr = fmt.Sprintf("127.0.0.1:%d", port)
+
+	cmd := exec.Command(web, "-addr", addr)
+	cmd.Env = ui.SessionEnv()
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+
+	// Wait for the listener.
+	deadline := time.Now().Add(15 * time.Second)
+	var conn *websocket.Conn
+	for time.Now().Before(deadline) {
+		c, _, err := websocket.DefaultDialer.Dial("ws://"+addr+"/ws?cols=80&rows=24", nil)
+		if err == nil {
+			conn = c
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if conn == nil {
+		t.Fatalf("the front end never accepted a session; stderr: %s", errBuf.String())
+	}
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	var seen strings.Builder
+	for {
+		var m struct {
+			Type string `json:"type"`
+			Data []byte `json:"data"`
+			Text string `json:"text"`
+		}
+		if err := conn.ReadJSON(&m); err != nil {
+			t.Fatalf("session ended before the model drew anything (%v); child stderr: %s", err, errBuf.String())
+		}
+		if m.Type == "error" {
+			t.Fatalf("bridge reported %q; child stderr: %s", m.Text, errBuf.String())
+		}
+		if m.Type == "output" {
+			seen.Write(m.Data)
+			if strings.Contains(seen.String(), "╰") {
+				return // the model drew its frame: the child accepted its arguments
+			}
+		}
 	}
 }
 
