@@ -688,6 +688,25 @@ func (s *Server) ClearBuffer(network, window string) (bool, string) {
 	return true, ""
 }
 
+// ResizeWindow sets one window's replay capacity, which is SETBUFFER. ZNC stores
+// a per-window line count; here capacity is ring geometry, so the network's
+// ring set rebuilds that window's ring at the requested size and keeps what
+// still fits. It reports false when the size cannot be expressed, so the caller
+// can answer with ZNC's failure text.
+func (s *Server) ResizeWindow(network, window string, lines int) bool {
+	ne := s.network(network)
+	if ne == nil {
+		return false
+	}
+	rs, ok := ne.net.(interface {
+		ResizeWindow(window string, lines int) bool
+	})
+	if !ok {
+		return false
+	}
+	return rs.ResizeWindow(window, lines)
+}
+
 func appendGapLine(dst []byte, server, network, window string, from, to uint64) []byte {
 	dst = append(dst, ':')
 	dst = append(dst, server...)

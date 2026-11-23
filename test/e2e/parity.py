@@ -197,8 +197,18 @@ def case_listchans(b: Bouncer, channel: str) -> dict:
 
 
 def case_setbuffer(b: Bouncer, channel: str) -> dict:
+    """SetBuffer answers with ZNC's exact sentence and a real size.
+
+    The wording is the parity question: "Size of every buffer was set to N
+    lines" is what a client or script greps for. That the size took effect is
+    checked by the winring test on our side, because ZNC exposes no way to read
+    a buffer's capacity back over the wire.
+    """
     got = b.cmd("SetBuffer", channel, "50", seconds=2.0)
-    return {"answered": bool(got)}
+    return {
+        "answered": bool(got),
+        "says_set": says(got, "size of every buffer was set to 50"),
+    }
 
 
 def case_disable(b: Bouncer, channel: str) -> dict:

@@ -24,16 +24,25 @@ type fakeNet struct {
 	server    string
 	mask      string
 	connected bool
+	resized   map[string]bool
 	in        uint64
 	out       uint64
 }
 
 func newFakeNet(name string) *fakeNet {
 	return &fakeNet{
-		name:  name,
-		state: "registered",
-		set:   winring.New(8, 4, 4096),
+		name:    name,
+		state:   "registered",
+		set:     winring.New(8, 4, 4096),
+		resized: make(map[string]bool),
 	}
+}
+
+func (f *fakeNet) ResizeWindow(window string, lines int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resized[window] = true
+	return true
 }
 
 func (f *fakeNet) Name() string { return f.name }

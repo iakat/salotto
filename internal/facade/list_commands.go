@@ -2,7 +2,10 @@ package facade
 
 import (
 	"net"
+	"strconv"
 	"strings"
+
+	"github.com/iakat/salotto/internal/ircline"
 )
 
 // The list commands. Every one answers with ZNC's grid table — LISTCLIENTS
@@ -135,6 +138,70 @@ func (c *client) handleTraffic() bool {
 	t.add("<ZNC>", byteStr(0), byteStr(0), byteStr(0))
 	t.add("<Total>", byteStr(in), byteStr(out), byteStr(in+out))
 	return c.sendTable(t)
+}
+
+// handleSetBuffer implements SETBUFFER: a glob over window names sets each
+// matching window's buffer size, and the answer counts the failures rather than
+// reporting per window (ClientCommand.cpp:1532-1574). The glob is ZNC's
+// MatchChans rule, already implemented for CLEARBUFFER, so the two agree.
+func (c *client) handleSetBuffer(rest []byte) bool {
+	network, ok := c.requireNetwork()
+	if network == "" {
+		return ok
+	}
+	pattern := string(ircline.FirstParam(ircline.Params(rest)))
+	if pattern == "" {
+		return c.status("Usage: SetBuffer <#chan|query> [linecount]")
+	}
+	countStr := string(ircline.FirstParam(afterFirst(ircline.Params(rest))))
+	count := 0
+	if countStr != "" {
+		n, err := strconv.Atoi(countStr)
+		if err != nil || n < 0 {
+			n = 0
+		}
+		count = n
+	}
+	if count > c.srv.cfg.MaxBufferLines {
+		// ZNC refuses above GetMaxBufferSize and says what the cap is.
+		return c.status("Setting buffer size failed for ",
+			itoa(uint64(len(c.srv.matchWindows(network, pattern)))), " buffers") &&
+			c.status("Maximum buffer size is ", itoa(uint64(c.srv.cfg.MaxBufferLines)), " lines")
+	}
+
+	names := c.srv.matchWindows(network, pattern)
+	failed := 0
+	for _, name := range names {
+		if !c.srv.ResizeWindow(network, name, count) {
+			failed++
+		}
+	}
+	if failed > 0 {
+		if !c.status("Setting buffer size failed for ", itoa(uint64(failed)),
+			plural(failed, " buffer", " buffers")) {
+			return false
+		}
+		return c.status("Maximum buffer size is ", itoa(uint64(c.srv.cfg.MaxBufferLines)),
+			plural(c.srv.cfg.MaxBufferLines, " line", " lines"))
+	}
+	return c.status("Size of every buffer was set to ", itoa(uint64(count)),
+		plural(count, " line", " lines"))
+}
+
+// afterFirst returns params with its first whitespace-delimited token removed,
+// so the next FirstParam reads the second argument.
+func afterFirst(params []byte) []byte {
+	i := 0
+	for i < len(params) && params[i] == ' ' {
+		i++
+	}
+	for i < len(params) && params[i] != ' ' {
+		i++
+	}
+	for i < len(params) && params[i] == ' ' {
+		i++
+	}
+	return params[i:]
 }
 
 // sendTable writes every line of a table as a STATUS notice, in order. ZNC's

@@ -64,6 +64,10 @@ func (n *networkAdapter) Traffic() (in, out uint64) { return n.conn.Traffic() }
 
 func (n *networkAdapter) SetConnectEnabled(enabled bool) { n.conn.SetConnectEnabled(enabled) }
 
+func (n *networkAdapter) ResizeWindow(window string, lines int) bool {
+	return n.set.Resize(window, lines)
+}
+
 func main() {
 	os.Exit(run())
 }

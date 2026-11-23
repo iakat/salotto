@@ -33,6 +33,10 @@ type entry struct {
 	// a well-formed gap, not a silent rewind to an old sequence.
 	base uint64
 	used uint64
+	// segs and segSize are the window's own ring geometry when SETBUFFER
+	// resized it; zero means "use the Set's defaults".
+	segs    int
+	segSize int
 }
 
 // New returns a Set holding at most maxWindows live rings, each built with the
@@ -60,13 +64,22 @@ func (s *Set) Append(window string, line []byte, ts int64) uint64 {
 	if e == nil {
 		e = s.create(window)
 	} else if e.ring == nil {
-		e.ring = ring.New(s.segs, s.segSize)
+		e.ring = ring.New(s.geo(e))
 		s.live++
 	}
 	seq := e.base + e.ring.AppendStamp(line, ts)
 	s.clock++
 	e.used = s.clock
 	return seq
+}
+
+// geo returns a window's ring geometry, falling back to the Set's defaults when
+// SETBUFFER has not resized it.
+func (s *Set) geo(e *entry) (int, int) {
+	if e.segs > 0 && e.segSize > 0 {
+		return e.segs, e.segSize
+	}
+	return s.segs, s.segSize
 }
 
 // create returns a new entry for window, evicting the least recently used live
@@ -167,6 +180,73 @@ func (s *Set) Clear(window string) {
 	}
 	s.clock++
 	e.used = s.clock
+}
+
+// ResizeWindow is the interface method form of Resize.
+func (s *Set) ResizeWindow(window string, lines int) bool { return s.Resize(window, lines) }
+
+// Resize rebuilds one window's ring so it holds about lineCount lines. ZNC's
+// SetBuffer sets a per-window line count (CChan::SetBufferCount); here the
+// capacity is ring geometry, so the equivalent is a ring sized for that count.
+// Buffered lines are carried over oldest-first, so a resize keeps what the user
+// asked to keep and drops only what no longer fits.
+//
+// It reports false when the count cannot be expressed, which is what makes the
+// command answer with ZNC's "Setting buffer size failed" instead of pretending.
+func (s *Set) Resize(window string, lineCount int) bool {
+	segs, segSize, ok := geometryFor(lineCount)
+	if !ok {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e := s.windows[window]
+	if e == nil {
+		// Nothing buffered yet: remember the geometry so the ring is built at
+		// the requested size when the window first sees a line.
+		e = &entry{}
+		s.windows[window] = e
+	}
+	if e.ring != nil {
+		fresh := ring.New(segs, segSize)
+		e.ring.Replay(e.ring.Oldest(), func(_ uint64, line []byte) bool {
+			fresh.Append(line)
+			return true
+		})
+		// The kept lines were re-appended into a fresh ring, so their new
+		// ordinal is 1..M while their old display sequence was the tail of the
+		// old ring's. Re-point the base so the newest kept line still reports
+		// the sequence the client last saw: display = base + ordinal, and the
+		// last kept line must read old.Newest(), so base = old.Newest() - M.
+		// Growth keeps every line, so M == old.Newest() and the base is 0 —
+		// which is why a resize never disturbs a cursor that is still valid.
+		if newest, kept := e.ring.Newest(), fresh.Newest(); newest >= kept {
+			e.base = newest - kept
+		} else {
+			e.base = 0
+		}
+		e.ring = fresh
+	}
+	e.segs, e.segSize = segs, segSize
+	s.clock++
+	e.used = s.clock
+	return true
+}
+
+// geometryFor converts a line count into ring geometry. A segment holds
+// segSize/4 entries (ring.New's own rule), so segSize == lineCount*4 gives one
+// segment's worth of lines. The clamps mirror ring.New.
+func geometryFor(lineCount int) (segs, segSize int, ok bool) {
+	if lineCount < 0 {
+		return 0, 0, false
+	}
+	segSize = lineCount * 4
+	if segSize < 512 {
+		segSize = 512
+	}
+	return 2, segSize, true
 }
 
 // Windows returns the window names that currently have a live ring, sorted.

@@ -158,6 +158,56 @@ func TestTrafficReportsBytesToTheUser(t *testing.T) {
 	}
 }
 
+// TestSetBufferAnswersAndResizes pins SETBUFFER's two halves: the wording a
+// client reads (ClientCommand.cpp:1570) and that the size actually reached the
+// window. A command that answers "set" without resizing is the failure mode
+// this test exists for.
+func TestSetBufferAnswersAndResizes(t *testing.T) {
+	s, fn, sub, _ := smallRings(t)
+	markKnown(s, "libera", "#a", "#b")
+
+	joined := strings.Join(notices(runWindowCmd(t, s, sub, "SETBUFFER #a 5")), "\n")
+	if !strings.Contains(joined, "Size of every buffer was set to 5 lines") {
+		t.Fatalf("wording: %q", joined)
+	}
+	if !fn.resized["#a"] {
+		t.Fatal("SETBUFFER answered but did not resize the window")
+	}
+	if fn.resized["#b"] {
+		t.Fatal("SETBUFFER touched a window the pattern did not match")
+	}
+}
+
+// TestSetBufferGlobResizesEveryMatch checks the glob fans out, which is ZNC's
+// FindChans behaviour.
+func TestSetBufferGlobResizesEveryMatch(t *testing.T) {
+	s, fn, sub, _ := smallRings(t)
+	markKnown(s, "libera", "#a", "#b")
+
+	joined := strings.Join(notices(runWindowCmd(t, s, sub, "SETBUFFER #* 7")), "\n")
+	if !strings.Contains(joined, "7 lines") {
+		t.Fatalf("wording: %q", joined)
+	}
+	if !fn.resized["#a"] || !fn.resized["#b"] {
+		t.Fatalf("glob did not resize every match: %v", fn.resized)
+	}
+}
+
+// TestSetBufferAboveTheCapFails is ZNC's GetMaxBufferSize branch
+// (ClientCommand.cpp:1562): the answer names the maximum instead of pretending.
+func TestSetBufferAboveTheCapFails(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	markKnown(s, "libera", "#a")
+
+	joined := strings.Join(notices(runWindowCmd(t, s, sub, "SETBUFFER #a 999999")), "\n")
+	if !strings.Contains(joined, "Setting buffer size failed") {
+		t.Fatalf("wording: %q", joined)
+	}
+	if !strings.Contains(joined, "Maximum buffer size is") {
+		t.Fatalf("cap not reported: %q", joined)
+	}
+}
+
 // TestDisconnectThenConnect pins the pair's wording and that DISCONNECT reaches
 // the network. ZNC answers with the same two sentences
 // (ClientCommand.cpp:387, :336).

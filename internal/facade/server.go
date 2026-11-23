@@ -43,6 +43,9 @@ type Config struct {
 	// speaks, which is ZNC's clearbufferonmsg module. The module's default rule
 	// set is every message type except QUIT, so a QUIT does not clear.
 	ClearBuffersOnMsg bool
+	// MaxBufferLines is the largest buffer SETBUFFER will accept, which is
+	// ZNC's GetMaxBufferSize. Zero means the default.
+	MaxBufferLines int
 	// UserName is the name TRAFFIC prints for the single local user. ZNC's
 	// TRAFFIC is admin-only and takes the name from the user map; this daemon
 	// has one user, so the name is configuration.
@@ -215,6 +218,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
+	}
+	if cfg.MaxBufferLines <= 0 {
+		cfg.MaxBufferLines = 10000
 	}
 
 	s := &Server{
@@ -569,6 +575,8 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleDisableChan(rest, true)
 	case ircline.IsVerb(rest, "ENABLECHAN"):
 		return c.handleDisableChan(rest, false)
+	case ircline.IsVerb(rest, "SETBUFFER"):
+		return c.handleSetBuffer(rest)
 	case ircline.IsVerb(rest, "LISTCHANS"):
 		return c.handleListChans()
 	case ircline.IsVerb(rest, "LISTNETWORKS"):
