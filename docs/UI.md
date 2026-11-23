@@ -83,6 +83,8 @@ driver sends, not a parallel path (`TestWebResizeIsTheSameWindowSizeMsg`).
   §8 lands; it has no authentication of its own and must not be exposed.
 - **No PWA shell.** §2.0.1 needs the WebSocket first, because a cached shell that
   cannot reconnect is worse than no shell.
-- **The model does no IRC.** It renders `ui.Incoming` values; the transport that
-  produces them from `salotto.v1` frames is the next milestone. The seam is the
-  right one: `Incoming` is a plain struct a wire decoder can build.
+- **No `salotto.v1` frames yet.** `internal/ui/transport.go` speaks plain IRC to a
+  bouncer today and produces `ui.Incoming` values. The seam is the right one:
+  `Incoming` is a plain struct, so a protobuf decoder can build the same values
+  without the model changing. `docs/UI-E2E.md` covers how the wiring is proven
+  against a deployed bouncer.

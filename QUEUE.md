@@ -367,7 +367,7 @@ plus ANSI. Three front ends feed the same value:
 
 | front end | input | output | how |
 |---|---|---|---|
-| **SSH TUI** | a real terminal over SSH | terminal | `wish` + `wish/bubbletea.Middleware` on port 2222 |
+| **SSH TUI** | a real terminal over SSH | terminal | `wish` + a `tea.Program` we own, on port 2222 |
 | **Web** | browser keystrokes over WebSocket | HTML | call `Update()` ourselves, pass `View()` through ANSI→HTML |
 | **headless** (tests, bots) | synthetic `tea.Msg` | string compare | call `Update()` in a loop |
 
@@ -419,6 +419,18 @@ The browser side is then thin enough to be honest about: one WebSocket that
 speaks the existing `salotto.v1` frames, one `<pre>` target, a keystroke encoder
 and a resize observer. It is glue, not a client — and it is the same reason
 `docs/SPEC.md` §13 already says the client is transport-agnostic.
+
+**Status: the model, the three drivers and the wire are all real.** What was
+missing for a while was the last one: the model and every renderer were complete
+and tested, and both front ends faithfully drew an empty screen because nothing
+connected either of them to a bouncer. `internal/ui/transport.go` is that half
+(socket, per-window routing, `tea.Msg` emission) and `internal/ui/program.go` is
+the bridge that drives one model from it; `cmd/salotto-ssh` and `cmd/salotto-web`
+both take `-bouncer`. Proven against the deployed bouncer in
+`hermes-generated-content`, both directions, by `test/e2e/probe_ui.py` and
+`test/e2e/probe_ssh.py` — see `docs/UI-E2E.md`. Still open in this section: the
+WebSocket (W1) and the PWA shell (§2.0.1), which change the transport and not the
+model.
 
 ### 2.0.1 PWA, first class
 
