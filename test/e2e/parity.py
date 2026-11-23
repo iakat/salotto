@@ -334,29 +334,54 @@ def case_connect_disconnect(b: Bouncer) -> dict:
 
 
 def case_chansaver(b: Bouncer, channel: str) -> dict:
-    """Part a channel, then force a reconnect: chansaver's job is that what the
-    saved list says is what comes back. Observable through Disconnect/Connect,
-    which exercises the same rejoin path on both sides without restarting either
-    bouncer.
+    """Does a channel the client joined inside the session survive a reconnect,
+    and does a channel the client parted stay gone?
 
-    The parity question is not "did it save the part" (ZNC's module flips a
-    per-channel InConfig flag on our own PART, chansaver.cpp:69-92) but "does a
-    PART inside a session survive a reconnect" — it must, and then the channel
-    must not come back.
+    Both halves are needed. chansaver's job is that the saved list follows our own
+    JOIN and PART (chansaver.cpp:69-92), and Disconnect/Connect drives the same
+    rejoin path as a real reconnect without restarting either bouncer.
+
+    The negative half alone cannot distinguish "chansaver forgot the parted
+    channel" from "reconnect rejoins nothing at all" — exactly the difference
+    between a working feature and a dead one. So a throwaway channel is joined
+    first as a positive control: if reconnect does not bring *that* back, the
+    negative result below means nothing and the case fails loudly instead of
+    agreeing with itself.
     """
+    keep = channel + "-keep"
+    b.send("JOIN " + keep)
+    b.drain(1.5)
+
+    # Positive control: joined in-session, so a reconnect must bring it back.
+    b.cmd("Disconnect", seconds=1.5)
+    b.cmd("Connect", seconds=3.0)
+    lines = b.drain(6.0)
+    kept = any((" JOIN " in l) and (keep.lower() in l.lower()) for l in lines)
+
+    # Negative: a PART must evict the channel from the saved list.
     b.send("PART " + channel)
     b.drain(1.0)
     b.cmd("Disconnect", seconds=1.5)
     b.cmd("Connect", seconds=3.0)
     lines = b.drain(6.0)
-    rejoin = any((" JOIN " in l) and (channel.lower() in l.lower()) for l in lines)
-    # Restore the fixture. The probe deliberately perturbs persistent state (the
-    # saved channel list), so it has to put it back or every later case runs
-    # against a bouncer that no longer auto-joins the channel — which is exactly
-    # how this case first made `playback` fail in the next run.
+    parts_back = any((" JOIN " in l) and (channel.lower() in l.lower()) for l in lines)
+
+    # Restore the fixture: this case perturbs persistent state (the saved channel
+    # list), so it has to put it back or every later case runs against a bouncer
+    # that no longer auto-joins the channel — which is how it first made
+    # `playback` fail in the next run.
     b.send("JOIN " + channel)
-    b.drain(2.0)
-    return {"rejoined_after_part": rejoin}
+    b.drain(1.5)
+    b.send("PART " + keep)
+    b.drain(1.5)
+
+    return {
+        "kept_after_reconnect": kept,
+        "parted_channel_came_back": parts_back,
+        # A single verdict the harness can compare, and one that is False if the
+        # positive control failed, so the case cannot pass on silence twice.
+        "chansaver_ok": kept and not parts_back,
+    }
 
 
 # ZNC's away reason format, from simple_away + CUtils::CTime: a C-locale %c plus
@@ -498,6 +523,22 @@ def run(host: str, port: int, nick: str, dialect: str, password: str | None, cha
     return out
 
 
+# Some predicates must be TRUE on both sides. Parity alone cannot catch a case
+# that fails identically on both bouncers: `{"x": false} == {"x": false}` is a
+# matching pair and the harness would call it agreement. Every key listed here is
+# asserted true on each side before the comparison runs, and a false one is a real
+# failure even when both sides agree. This exists because `chansaver` reported
+# `rejoined_after_part: false` on both sides while the feature was working — the
+# negative half is correct, but only a positive control can prove it.
+MUST_BE_TRUE: dict[str, dict[str, bool]] = {
+    "chansaver": {"kept_after_reconnect": True},
+    "join": {"joined": True},
+    "playback": {"played": True},
+    "registration": {"welcome": True},
+    "clear": {"cleared": True},
+    "setbuffer": {"says_set": True},
+}
+
 # KNOWN_DEVIATIONS are cases where the two bouncers are supposed to differ. A
 # deviation is a claim someone can check, so each one carries the reason and the
 # ZNC source line that makes the difference deliberate rather than a bug. Any
@@ -546,6 +587,21 @@ def main() -> int:
     znc["away"] = run_away(zh, zp, args.nick, "znc", args.znc_pass, args.channel, eh, ep)
     sal["away"] = run_away(sh, sp, args.nick, "salotto", None, args.channel, eh, ep)
 
+    # A predicate that must hold, checked per side *before* the comparison: two
+    # identical failures are not parity, they are a broken fixture.
+    unmet = []
+    for case, fields in MUST_BE_TRUE.items():
+        for field, want in fields.items():
+            for side, got in (("znc", znc), ("salotto", sal)):
+                value = (got.get(case) or {}).get(field)
+                if value != want:
+                    unmet.append({"case": case, "field": field, "side": side,
+                                  "got": value, "want": want})
+    if unmet:
+        for u in unmet:
+            print("UNMET: %(side)s %(case)s.%(field)s = %(got)r, want %(want)r" % u,
+                  file=sys.stderr)
+
     diffs, same, deviations = [], [], []
     for case in sorted(set(znc) | set(sal)):
         z, s = znc.get(case), sal.get(case)
@@ -563,6 +619,7 @@ def main() -> int:
         "same": same,
         "deviations": deviations,
         "different": diffs,
+        "unmet": unmet,
         "znc": znc,
         "salotto": sal,
     }
@@ -570,7 +627,7 @@ def main() -> int:
         with open(args.json, "w") as fh:
             json.dump(report, fh, indent=2, sort_keys=True)
     print(json.dumps(report, indent=2, sort_keys=True))
-    return 1 if diffs else 0
+    return 1 if (diffs or unmet) else 0
 
 
 if __name__ == "__main__":

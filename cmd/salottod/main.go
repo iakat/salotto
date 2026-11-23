@@ -57,6 +57,13 @@ func (n *networkAdapter) Bytes() int { return n.set.Bytes() }
 
 func (n *networkAdapter) Server() string { return n.conn.Server() }
 
+// Nick is what the facade uses to attribute a line to ourselves. Without it
+// KnownNick is always empty, so every consumer of "is this our own line?" — the
+// chansaver, which must follow our own JOIN and PART, and the self-kick that
+// disables a channel — silently never fires. The adapter grew the method when
+// upstream.Conn learned it; this is the wiring that makes it reachable.
+func (n *networkAdapter) Nick() string { return n.conn.CurrentNick() }
+
 func (n *networkAdapter) NickMask() string { return n.conn.NickMask() }
 
 func (n *networkAdapter) HasPassword() bool { return n.conn.HasPassword() }
