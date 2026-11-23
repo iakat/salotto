@@ -36,10 +36,13 @@ type Config struct {
 	// must not retain line. An empty result means the line is not buffered (a
 	// CAP reply or a suppressed echo).
 	Route func(line []byte, outbound bool) []logfile.Entry
-	// OnLine is called once per buffered line with the window list, the
-	// per-window sequence each append returned, and the entries routing already
-	// parsed. The line slice is only valid for the duration of the call: it
-	// aliases an internal read buffer, so copy it if it is retained.
+	// OnLine is called once for every non-PING line the connection reads, with
+	// the window list, the per-window sequence each append returned, and the
+	// entries routing already parsed. The window list is empty for a line that
+	// is not buffered (a CAP reply, a suppressed own echo); the callback still
+	// sees it so the live status stream stays complete. The line slice is only
+	// valid for the duration of the call: it aliases an internal read buffer,
+	// so copy it if it is retained.
 	OnLine func(windows []string, seqs []uint64, entries []logfile.Entry, line []byte)
 	// OnSend is called for every line sent to the network via Send.
 	OnSend func(line []byte)
@@ -64,15 +67,13 @@ type Config struct {
 
 // store routes line to its replay windows and appends it to each window's ring.
 // One line shared by several windows is stored in each ring, with independent
-// per-window sequences. It reports whether the line was buffered.
+// per-window sequences. It reports whether the line was buffered. OnLine fires
+// even for an unbuffered line, with an empty window list.
 func (c *Conn) store(line []byte, outbound bool) bool {
 	if c.cfg.Windows == nil || c.cfg.Route == nil {
 		return false
 	}
 	entries := c.cfg.Route(line, outbound)
-	if len(entries) == 0 {
-		return false
-	}
 	ts := time.Now().UnixNano()
 	if cap(c.windows) < len(entries) {
 		c.windows = make([]string, len(entries))
@@ -91,7 +92,7 @@ func (c *Conn) store(line []byte, outbound bool) bool {
 	if c.cfg.OnLine != nil {
 		c.cfg.OnLine(windows, seqs, entries, line)
 	}
-	return true
+	return len(entries) > 0
 }
 
 // State is the current connection state.

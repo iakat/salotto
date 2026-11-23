@@ -387,7 +387,9 @@ func trMembersMap(tr *Tracker) map[string]map[string]bool {
 func Route(tr *Tracker, line []byte, outbound bool, hasEcho bool, server string) []Entry {
 	entries := Format(tr, nil, line, outbound, hasEcho, server)
 	if len(entries) == 0 {
-		return nil
+		// Non-nil on purpose: an empty slice means "parsed, no entries", which
+		// lets the writer skip a second parse. A nil slice means unparsed.
+		return []Entry{}
 	}
 	seen := make(map[string]bool, len(entries))
 	out := make([]Entry, 0, len(entries))
