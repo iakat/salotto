@@ -46,7 +46,7 @@ written here. Nothing gets to be quietly missing.
 | B2 | Replay buffer per window with per-client pointer | `CBuffer`, `CChan`, `CQuery` | **have** (one ring per window, per-client cursors, `GAP` on cursor loss) |
 | B3 | Attach/detach without a visible disconnect to the network | `CClient`, `CUser::AddClient` | **have** |
 | B4 | Multiple concurrent clients on one session | `ListClients` | **have** (hub, `clients_attached`) |
-| B5 | Multi-network per user with independent state | `AddNetwork`/`DelNetwork`/`ListNetworks` | **partial**: config-file networks only, no runtime add/remove |
+| B5 | Multi-network per user with independent state | `AddNetwork`/`DelNetwork`/`ListNetworks` | **yes**: `facade.AddNetwork`/`RemoveNetwork`/`Networks` with a mutex-guarded sorted list, and `cmd/salottod/netmgr.go` owning the per-network lifecycle (`Start` builds rings/writer/ident/`upstream.New` and registers with the facade; `Stop` cancels, waits for the dial goroutine, closes the writer, then unregisters). `/stats` reads the manager, so a runtime network shows up immediately. Runtime networks are in-memory only until the admin surface (§2.0.2) persists them; removal forgets every per-client cursor/attach/mute/disabled key under the network. Tests: `TestAddRemoveNetworkRoundTrip`, `TestNetworksStress` (-race), `TestStartStopLeavesNoGoroutine`, `TestStatsReflectsRuntimeNetworks`. |
 | B6 | SASL PLAIN + EXTERNAL (cert) | `modules/sasl.cpp`, `modules/cert.cpp`, `modules/certauth.cpp` | **partial**: SASL PLAIN only |
 | B7 | Channel re-join on reconnect | `modules/chansaver.cpp` | **have** (config `channels`) |
 | B8 | PING answered by the bouncer, not forwarded | `CIRCSock::ReadLine` | **have** |

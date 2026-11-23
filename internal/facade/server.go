@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -132,7 +133,8 @@ type Server struct {
 	cfg     Config
 	log     *slog.Logger
 	hub     *Hub
-	nets    []networkEntry
+	netsMu  sync.RWMutex
+	nets    []*networkEntry
 	windows *windowState
 	created string
 	active  atomic.Int64
@@ -194,18 +196,11 @@ func New(cfg Config) (*Server, error) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	s.nets = make([]networkEntry, 0, len(names))
+	s.nets = make([]*networkEntry, 0, len(names))
 	for _, name := range names {
-		s.nets = append(s.nets, networkEntry{name: name, net: *cfg.Networks[name], nick: &nickCache{}})
+		s.nets = append(s.nets, &networkEntry{name: name, net: *cfg.Networks[name], nick: &nickCache{}})
 	}
 
-	if s.cfg.Network == "" {
-		if len(s.nets) == 1 {
-			s.cfg.Network = s.nets[0].name
-		} else {
-			s.cfg.Network = s.cfg.ServerName
-		}
-	}
 	if s.cfg.Hub == nil {
 		max := s.cfg.MaxClients
 		if max <= 0 {
@@ -281,12 +276,96 @@ func (s *Server) Broadcast(netName string, seq uint64, line []byte, ts int64) {
 }
 
 func (s *Server) network(name string) *networkEntry {
-	for i := range s.nets {
-		if s.nets[i].name == name {
-			return &s.nets[i]
+	s.netsMu.RLock()
+	defer s.netsMu.RUnlock()
+	for _, ne := range s.nets {
+		if ne.name == name {
+			return ne
 		}
 	}
 	return nil
+}
+
+// Networks returns the network names in sorted order.
+func (s *Server) Networks() []string {
+	s.netsMu.RLock()
+	names := make([]string, len(s.nets))
+	for i, ne := range s.nets {
+		names[i] = ne.name
+	}
+	s.netsMu.RUnlock()
+	return names
+}
+
+// AddNetwork registers a network with an already-dialling upstream. Runtime
+// networks exist so the admin surface (§2.0.2) can create one without a
+// restart; there is no IRC command for this because ZNC has none either.
+// The caller owns the connection lifecycle: the facade only routes.
+func (s *Server) AddNetwork(name string, net Network) error {
+	if name == "" {
+		return errors.New("facade: empty network name")
+	}
+	if net == nil {
+		return errors.New("facade: nil network " + name)
+	}
+	s.netsMu.Lock()
+	defer s.netsMu.Unlock()
+	for _, ne := range s.nets {
+		if ne.name == name {
+			return fmt.Errorf("facade: network %q already exists", name)
+		}
+	}
+	s.nets = append(s.nets, &networkEntry{name: name, net: net, nick: &nickCache{}})
+	sort.Slice(s.nets, func(i, j int) bool { return s.nets[i].name < s.nets[j].name })
+	return nil
+}
+
+// RemoveNetwork forgets a network and every piece of per-client state keyed
+// under it, so a name reused later cannot inherit another network's cursors,
+// attaches or disabled flags. Clients stay connected: the removal is a routing
+// fact, not a client-visible event.
+func (s *Server) RemoveNetwork(name string) error {
+	s.netsMu.Lock()
+	idx := -1
+	for i, ne := range s.nets {
+		if ne.name == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		s.netsMu.Unlock()
+		return fmt.Errorf("facade: unknown network %q", name)
+	}
+	s.nets = append(s.nets[:idx], s.nets[idx+1:]...)
+	s.netsMu.Unlock()
+
+	s.windows.forgetNetwork(name)
+	return nil
+}
+
+// netSnapshot is the current network list under the lock: readers that iterate
+// (replay, forward) must not hold the lock while writing to a subscriber.
+func (s *Server) netSnapshot() []*networkEntry {
+	s.netsMu.RLock()
+	out := make([]*networkEntry, len(s.nets))
+	copy(out, s.nets)
+	s.netsMu.RUnlock()
+	return out
+}
+
+// networkName is the name shown in 001/005. It follows the live network list
+// rather than a value frozen at boot, because a runtime network (B5) can change
+// what the single network is. An explicit cfg.Network always wins.
+func (s *Server) networkName() string {
+	if s.cfg.Network != "" {
+		return s.cfg.Network
+	}
+	names := s.Networks()
+	if len(names) == 1 {
+		return names[0]
+	}
+	return s.cfg.ServerName
 }
 
 // Attached returns the number of clients currently attached to the hub.
@@ -435,10 +514,11 @@ func (c *client) handle(line, rest []byte) bool {
 // forward, the proof of concept has no in-band network selector: it is the first
 // network in sorted order.
 func (c *client) commandNetwork() string {
-	if len(c.srv.nets) == 0 {
+	nets := c.srv.netSnapshot()
+	if len(nets) == 0 {
 		return ""
 	}
-	return c.srv.nets[0].name
+	return nets[0].name
 }
 
 func (c *client) bindHosts() BindHosts {
@@ -681,7 +761,7 @@ func (c *client) maybeRegister() bool {
 
 func (c *client) sendRegistration() bool {
 	srv := c.srv.cfg.ServerName
-	net := c.srv.cfg.Network
+	net := c.srv.networkName()
 	nick := c.nick
 
 	return c.send(":", srv, " 001 ", nick, " :Welcome to ", net, " ", nick, "!", c.user, "@salotto") &&
@@ -695,7 +775,7 @@ func (c *client) sendRegistration() bool {
 }
 
 func (c *client) replayAll() bool {
-	for _, ne := range c.srv.nets {
+	for _, ne := range c.srv.netSnapshot() {
 		if !c.replayNetwork(ne) {
 			return false
 		}
@@ -706,7 +786,7 @@ func (c *client) replayAll() bool {
 // replayNetwork replays every known window as its own batch, in sorted window
 // order. There is no merged per-network stream any more: a line shared by two
 // windows was buffered into both rings and is replayed once per window.
-func (c *client) replayNetwork(ne networkEntry) bool {
+func (c *client) replayNetwork(ne *networkEntry) bool {
 	windows := ne.net.Windows()
 	un := ne.knownNick()
 	if un == "" {
@@ -772,10 +852,11 @@ func (c *client) replayNetwork(ne networkEntry) bool {
 // protocol to choose a network. No 402 is emitted because the choice is never
 // ambiguous.
 func (c *client) forward(line []byte) bool {
-	if len(c.srv.nets) == 0 {
+	nets := c.srv.netSnapshot()
+	if len(nets) == 0 {
 		return c.notConnected()
 	}
-	if err := c.srv.nets[0].net.Send(line); err != nil {
+	if err := nets[0].net.Send(line); err != nil {
 		return c.notConnected()
 	}
 	return true

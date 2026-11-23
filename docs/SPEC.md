@@ -247,6 +247,15 @@ independent sequences. At most `max_windows` rings exist per network
 cap is exceeded. Each ring uses `ring_segments` × `ring_segment_size`, so those
 settings apply **per window**.
 
+Networks themselves may be created and removed at runtime (B5): the facade keeps
+a mutex-guarded, sorted list (`AddNetwork`/`RemoveNetwork`/`Networks`) and the
+daemon owns the lifecycle in a `netmgr` (dial loop, log writer, rings, ident
+registration), so `Start`/`Stop` reuse the exact construction the boot path uses.
+**A runtime network is in-memory only**: it is lost on restart until the admin
+surface (§2.0.2) is the thing that writes the config, and removing one forgets
+every per-client cursor, attach, mute and disabled flag keyed under it, so a
+later network reusing the name starts clean.
+
 The bouncer tracks cursors per client **per window**. Only the last
 acknowledged `seq` per client/window is kept, in memory; nothing is persisted.
 A client that is not attached has no cursor and starts at `oldest_seq`.

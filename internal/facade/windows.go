@@ -162,6 +162,39 @@ func (ws *windowState) forget(sub *Subscriber) {
 	ws.mu.Unlock()
 }
 
+// forgetNetwork drops every piece of per-client state keyed under a network:
+// cursors, attaches, mutes and the disabled flags. Removing a network while a
+// client is attached must not leave orphans that a later network with the same
+// name would inherit.
+func (ws *windowState) forgetNetwork(network string) {
+	prefix := network + "/"
+	ws.mu.Lock()
+	for key := range ws.known {
+		if strings.HasPrefix(key, prefix) {
+			delete(ws.known, key)
+			delete(ws.disabled, key)
+		}
+	}
+	for _, cw := range ws.clients {
+		for key := range cw.attached {
+			if strings.HasPrefix(key, prefix) {
+				delete(cw.attached, key)
+			}
+		}
+		for key := range cw.muted {
+			if strings.HasPrefix(key, prefix) {
+				delete(cw.muted, key)
+			}
+		}
+		for key := range cw.cursors {
+			if strings.HasPrefix(key, prefix) {
+				delete(cw.cursors, key)
+			}
+		}
+	}
+	ws.mu.Unlock()
+}
+
 // liveState is a client's explicit relationship to one window.
 type liveState int
 

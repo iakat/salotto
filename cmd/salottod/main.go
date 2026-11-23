@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,14 +53,6 @@ func (n *networkAdapter) Window(name string) (facade.WindowRing, bool) {
 func (n *networkAdapter) Windows() []string { return n.set.Windows() }
 
 func (n *networkAdapter) Bytes() int { return n.set.Bytes() }
-
-type networkRuntime struct {
-	name   string
-	addr   string
-	conn   *upstream.Conn
-	set    *winring.Set
-	writer *logfile.Writer
-}
 
 func main() {
 	os.Exit(run())
@@ -118,125 +109,18 @@ func run() int {
 
 	start := time.Now()
 
-	runtimes := make([]*networkRuntime, 0, len(cfg.Networks))
-	networks := make(map[string]*facade.Network, len(cfg.Networks))
-	var srv *facade.Server
-
 	reg := ident.NewRegistry()
 
 	bindState := bindhost.New(cfg.User.BindHost, cfg.User.DenySetBindHost)
-	for i := range cfg.Networks {
-		bindState.Seed(cfg.Networks[i].Name, cfg.Networks[i].BindHost)
-	}
-	conns := make(map[string]*upstream.Conn, len(cfg.Networks))
-	bindState.SetOnChange(func(network, host string) {
-		if conn := conns[network]; conn != nil {
-			if err := conn.SetBindHost(host); err != nil {
-				logger.Error("invalid bind host from wire command", "network", network, "host", host, "err", err)
-			}
-		}
-	})
-
-	for i := range cfg.Networks {
-		nc := cfg.Networks[i]
-		netName := nc.Name
-		bindHost, _ := bindState.Resolve(netName)
-		// Per-network resolved ident, read at dial time. When it is empty the
-		// pair is not registered at all: NO-USER is more honest than inventing
-		// a value.
-		identStr := cfg.Ident
-		if identStr == "" {
-			identStr = nc.Nick
-		}
-		maxWindows := cfg.MaxWindows
-		if maxWindows <= 0 {
-			maxWindows = 64
-		}
-		set := winring.New(maxWindows, cfg.RingSegments, cfg.RingSegmentSize)
-
-		var serverStr string
-		var conn *upstream.Conn
-		w := logfile.New(netName, cfg.LogDir, cfg.LogQueue, time.Now)
-		w.SetNick(nc.Nick)
-		w.SetServer(nc.Addr)
-
-		ucfg := upstream.Config{
-			Name:               netName,
-			Addr:               nc.Addr,
-			TLS:                nc.TLS,
-			InsecureSkipVerify: nc.InsecureSkipVerify,
-			Nick:               nc.Nick,
-			RealName:           nc.RealName,
-			Pass:               nc.Pass,
-			SASLUser:           nc.SASLUser,
-			SASLPass:           nc.SASLPass,
-			Channels:           append([]string(nil), nc.Channels...),
-			BindHost:           bindHost,
-			Windows:            set,
-			Route:              w.Route,
-			Log:                logger.With("network", netName),
-			// Read at every (re)connect: a channel the operator disabled must
-			// not be re-joined, which is the only effect ZNC's disabled flag
-			// has. Buffering and replay are unaffected.
-			JoinChannels: func() []string {
-				return joinableChannels(nc.Channels, srv, netName)
-			},
-			OnLine: func(windows []string, seqs []uint64, entries []logfile.Entry, line []byte) {
-				dispatchRouted(srv, netName, windows, line)
-				w.OnRouted(entries, line, false)
-				noteSelfKick(srv, netName, line)
-			},
-			OnSend: func(line []byte) {
-				entries := w.Route(line, true)
-				dispatchEntries(srv, netName, entries, line)
-				w.OnRouted(entries, line, true)
-			},
-			OnConnect: func() {
-				w.Connect(serverStr)
-			},
-			OnDisconnect: func() {
-				w.Disconnect(serverStr)
-			},
-			OnOpen: func(conn net.Conn) func() {
-				if identStr == "" {
-					return nil
-				}
-				return reg.Add(conn.LocalAddr(), conn.RemoteAddr(), identStr)
-			},
-		}
-		if ucfg.RealName == "" {
-			ucfg.RealName = nc.Nick
-		}
-		conn, err = upstream.New(ucfg)
-		if err != nil {
-			logger.Error("upstream config invalid", "network", netName, "err", err)
-			return 1
-		}
-		serverStr = conn.ServerString()
-		w.SetServer(serverStr)
-		w.SetHasCap(conn.HasCap)
-		conns[netName] = conn
-
-		runtimes = append(runtimes, &networkRuntime{
-			name:   netName,
-			addr:   nc.Addr,
-			conn:   conn,
-			set:    set,
-			writer: w,
-		})
-		var n facade.Network = &networkAdapter{name: netName, conn: conn, set: set}
-		networks[netName] = &n
-	}
 
 	maxClients := cfg.MaxClients
 	if maxClients <= 0 {
 		maxClients = 64
 	}
 	hub := facade.NewHub(maxClients)
-	srv, err = facade.New(facade.Config{
+	srv, err := facade.New(facade.Config{
 		ServerName: cfg.ServerName,
 		Hub:        hub,
-		Networks:   networks,
 		BindHosts:  bindState,
 		Log:        logger,
 		MaxClients: maxClients,
@@ -246,6 +130,17 @@ func run() int {
 		return 1
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := newNetmgr(cfg, srv, logger, reg, bindState, ctx)
+	for i := range cfg.Networks {
+		if err := mgr.Start(cfg.Networks[i]); err != nil {
+			logger.Error("network start failed", "network", cfg.Networks[i].Name, "err", err)
+			mgr.StopAll()
+			return 1
+		}
+	}
 	plainLn, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		logger.Error("listen failed", "addr", cfg.Listen, "err", err)
@@ -283,7 +178,7 @@ func run() int {
 			return 1
 		}
 		statsSrv = &http.Server{
-			Handler:           statsHandler(start, runtimes, hub, srv, reg, cfg.IdentListen != ""),
+			Handler:           statsHandler(start, mgr, hub, srv, reg, cfg.IdentListen != ""),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 	}
@@ -326,19 +221,7 @@ func run() int {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	var wg sync.WaitGroup
-
-	for _, rt := range runtimes {
-		wg.Add(1)
-		go func(rt *networkRuntime) {
-			defer wg.Done()
-			logger.Info("upstream starting", "network", rt.name, "addr", rt.addr)
-			rt.conn.Run(ctx)
-		}(rt)
-	}
 
 	wg.Add(1)
 	go func() {
@@ -401,13 +284,11 @@ func run() int {
 	sig := <-sigCh
 	logger.Info("signal received", "signal", sig.String())
 
-	cancel()
 	logger.Info("shutting down")
-	for _, rt := range runtimes {
-		if rt.writer != nil {
-			rt.writer.Close()
-		}
-	}
+	// Stop cancels each dial loop, waits for it, closes that network's writer and
+	// only then unregisters it, so no line can reach a closed writer.
+	mgr.StopAll()
+	cancel()
 
 	_ = plainLn.Close()
 	if tlsRaw != nil {
@@ -573,7 +454,7 @@ func validateStatsAddr(addr string) error {
 	return nil
 }
 
-func statsHandler(start time.Time, runtimes []*networkRuntime, hub *facade.Hub, srv *facade.Server, reg *ident.Registry, identEnabled bool) http.Handler {
+func statsHandler(start time.Time, mgr *netmgr, hub *facade.Hub, srv *facade.Server, reg *ident.Registry, identEnabled bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -583,8 +464,9 @@ func statsHandler(start time.Time, runtimes []*networkRuntime, hub *facade.Hub, 
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 
-		sorted := append([]*networkRuntime(nil), runtimes...)
-		sort.Slice(sorted, func(i, j int) bool { return sorted[i].name < sorted[j].name })
+		// Read from the manager, not a startup slice: /stats must reflect a
+		// network added or removed at runtime.
+		sorted := mgr.Snapshot()
 
 		var b strings.Builder
 		fmt.Fprintf(&b, "uptime_seconds=%d\n", int64(time.Since(start).Seconds()))
