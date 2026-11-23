@@ -217,7 +217,7 @@ Grouped, because 59 rows is a wall, and the grouping *is* the decision.
 | `awaynick` | change nick when away | needs an away concept (B18) |
 | `awaystore` | store and replay away messages | pairs with B18 |
 | `simple_away` | auto-away on detach | pairs with B18 |
-| `buffextras` | put joins/parts/modes into the replay buffer | matters once B2 splits windows |
+| `buffextras` | put joins/parts/modes into the replay buffer | windows are split (B2); wiring the extra modes is still open |
 | `savebuff` | persist the buffer across restarts | the "M5 mmapped rings" item, in effect |
 | `clearbufferonmsg` | clear buffer when you speak | a client preference, cheap |
 | `stripcontrols` | strip control codes before logging | relevant to `log` |
