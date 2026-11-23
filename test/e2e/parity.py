@@ -328,6 +328,11 @@ def case_connect_disconnect(b: Bouncer) -> dict:
     dis = b.cmd("Disconnect", seconds=2.0)
     # ZNC stops the upstream then reconnects; give it a moment either way.
     con = b.cmd("Connect", seconds=2.5)
+    # Leave the fixture connected. The next case joins channels and expects them to
+    # reach the IRCd; if this case returned while the upstream was still dialling, the
+    # next one measures a dropped JOIN and reports a feature as broken. Cases must not
+    # depend on each other's timing, so this one waits for its own aftermath.
+    wait_connected(b)
     return {
         "disconnect_answered": says(dis, "disconnected"),
         "connect_answered": says(con, "connect"),
