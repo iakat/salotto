@@ -34,90 +34,160 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 <title>salotto</title>
 <link rel="stylesheet" href="/terminal.css">
 <style>
-  html, body { margin: 0; height: 100%; background: #12121a; }
-  body { display: flex; align-items: stretch; color: #e6e6f0; }
+  /* Every colour is a variable. A theme is then a set of values, which is the only
+     version of theming that does not turn into a stylesheet per theme and a bug in
+     seventeen of them. The defaults are the dark palette salotto has always drawn. */
+  :root {
+    --bg: #12121a;
+    --bg-panel: #16161f;
+    --bg-inset: #0e0e15;
+    --bg-raised: #2d2d44;
+    --bg-hover: #1e1e2b;
+    --fg: #e6e6f0;
+    --fg-dim: #7a7a95;
+    --fg-muted: #6f6f8a;
+    --accent: #9ecbff;
+    --mention: #ffd76b;
+    --border: #2a2a3a;
+    --alert-bg: #5a2020;
+    --alert-fg: #ffdede;
+    --window-bg: #14141d;
+    --card-bg: #10101a;
+    --result-fg: #c6c6dd;
+    --nick: #8fb7ff;
+    --op: #7ddc8a;
+    --badge-bg: #3a3a55;
+    --badge-fg: #cfcfe8;
+    --badge-mention-fg: #22190a;
+    --font: 14px ui-monospace, SFMono-Regular, Menlo, monospace;
+    --font-small: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  /* light is the other theme that exists. It is a variable swap and nothing else,
+     which is the test of whether the palette was extracted properly. */
+  body.light {
+    --bg: #f7f7fa;
+    --bg-panel: #eeeef4;
+    --bg-inset: #ffffff;
+    --bg-raised: #d8d8e6;
+    --bg-hover: #e2e2ee;
+    --fg: #1b1b26;
+    --fg-dim: #5c5c73;
+    --fg-muted: #6b6b80;
+    --accent: #1a5fb4;
+    --mention: #8a5a00;
+    --border: #d4d4e0;
+    --alert-bg: #ffd9d9;
+    --alert-fg: #6b1414;
+    --window-bg: #e8e8f0;
+    --card-bg: #f0f0f6;
+    --result-fg: #2a2a3a;
+    --nick: #1a5fb4;
+    --op: #1e7a3a;
+    --badge-bg: #d8d8e6;
+    --badge-fg: #2a2a3a;
+    --badge-mention-fg: #fff8e0;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); }
+  body { display: flex; align-items: stretch; color: var(--fg);
+    position: relative; }
   /* The sidebar is the one thing a terminal rendering cannot express, so it is
      real DOM and not part of the <pre>. It mirrors the model's window list. */
-  aside.windows { width: 180px; flex: 0 0 180px; background: #16161f;
-    border-right: 1px solid #2a2a3a; overflow-y: auto; padding: 8px 0; }
+  aside.windows { width: 180px; flex: 0 0 180px; background: var(--bg-panel);
+    border-right: 1px solid var(--border); overflow-y: auto; padding: 8px 0; }
+  aside.windows h2 button.theme { float: right; background: none; border: 0;
+    color: var(--fg-dim); cursor: pointer; font-size: 13px; padding: 0 2px; }
+  aside.windows h2 button.theme:hover { color: var(--fg); }
   aside.windows h2 { margin: 4px 12px 8px; font: 600 11px ui-monospace, monospace;
-    letter-spacing: .08em; text-transform: uppercase; color: #7a7a95; }
+    letter-spacing: .08em; text-transform: uppercase; color: var(--fg-dim); }
   aside.windows .win { padding: 5px 12px; cursor: pointer;
     font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  aside.windows .win:hover { background: #1e1e2b; }
-  aside.windows .win.active { background: #2d2d44; color: #fff; font-weight: 600; }
+  aside.windows .win:hover { background: var(--bg-hover); }
+  aside.windows .win.active { background: var(--bg-raised); color: var(--fg); font-weight: 600; }
   aside.windows .win { display: flex; justify-content: space-between; gap: 6px; }
   aside.windows .win .name { overflow: hidden; text-overflow: ellipsis; }
   /* A mention is the strongest signal in the sidebar: something was said to you.
      It outranks "there is something new", so the mention class wins over unread
      and the count is not drawn at all. */
-  aside.windows .win.mention { color: #ffd76b; font-weight: 700; }
+  aside.windows .win.mention { color: var(--mention); font-weight: 700; }
   aside.windows .badge { flex: 0 0 auto; min-width: 16px; text-align: center;
     border-radius: 8px; padding: 0 4px; font-size: 11px; line-height: 15px;
-    background: #3a3a55; color: #cfcfe8; }
-  aside.windows .win.mention .badge { background: #ffd76b; color: #22190a; }
+    background: var(--badge-bg); color: var(--badge-fg); }
+  aside.windows .win.mention .badge { background: var(--mention); color: var(--badge-mention-fg); }
   /* Search sits above the terminal: a query is about the scrollback, and the
      results overlay it rather than replacing it, so context is not lost. */
   div.searchbar { display: flex; gap: 8px; padding: 6px 12px;
-    border-bottom: 1px solid #2a2a3a; background: #16161f; }
-  div.searchbar input { flex: 1; background: #0e0e15; color: #e6e6f0;
-    border: 1px solid #2a2a3a; border-radius: 4px; padding: 4px 8px;
+    border-bottom: 1px solid var(--border); background: var(--bg-panel); }
+  div.searchbar input { flex: 1; background: var(--bg-inset); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px;
     font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  div.results { max-height: 40%; overflow-y: auto; background: #13131c;
-    border-bottom: 1px solid #2a2a3a;
+  div.results { max-height: 40%; overflow-y: auto; background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
     font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  div.results .head { padding: 6px 12px; color: #7a7a95; font-size: 11px;
+  div.results .head { padding: 6px 12px; color: var(--fg-dim); font-size: 11px;
     text-transform: uppercase; letter-spacing: .06em; }
-  div.results .hit { padding: 4px 12px; cursor: pointer; color: #c6c6dd; }
-  div.results .hit:hover { background: #1e1e2b; }
-  div.results .hl { color: #ffd76b; font-weight: 600; }
-  div.results .hn { color: #8fb7ff; }
+  div.results .hit { padding: 4px 12px; cursor: pointer; color: var(--result-fg); }
+  div.results .hit:hover { background: var(--bg-hover); }
+  div.results .hl { color: var(--mention); font-weight: 600; }
+  div.results .hn { color: var(--nick); }
   div.wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; }
-  div.topic { padding: 4px 12px; background: #14141d; color: #8e8eaa;
-    border-bottom: 1px solid #2a2a3a;
+  div.topic { padding: 4px 12px; background: var(--window-bg); color: var(--fg-dim);
+    border-bottom: 1px solid var(--border);
     font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   div.previews { display: flex; flex-direction: column; gap: 2px;
-    padding: 4px 12px; background: #10101a; border-bottom: 1px solid #2a2a3a; }
+    padding: 4px 12px; background: var(--card-bg); border-bottom: 1px solid var(--border); }
   div.previews a.card { display: flex; gap: 8px; align-items: baseline;
     padding: 3px 6px; border-radius: 4px; text-decoration: none;
     font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  div.previews a.card:hover { background: #1b1b28; }
-  div.previews .site { color: #6f6f8a; flex: none; }
-  div.previews .title { color: #9ecbff; overflow: hidden; text-overflow: ellipsis;
+  div.previews a.card:hover { background: var(--bg-hover); }
+  div.previews .site { color: var(--fg-muted); flex: none; }
+  div.previews .title { color: var(--accent); overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; }
-  div.banner { padding: 6px 12px; background: #5a2020; color: #ffdede;
+  /* A hint is the answer to a keybind, in the same place every time, and it goes
+     away by itself: it is confirmation, not a notification. */
+  div.hint { position: absolute; right: 16px; bottom: 60px; z-index: 20;
+    padding: 6px 12px; border-radius: 4px; background: var(--bg-raised);
+    color: var(--fg); border: 1px solid var(--border);
+    font: var(--font-small); pointer-events: none; }
+  /* Compact density trims the paddings rather than the font: shrinking type to fit
+     more lines is how a chat client becomes unreadable on a laptop. */
+  body.compact aside.windows .win { padding: 2px 12px; }
+  body.compact pre.term-container { padding: 6px 10px; line-height: 1.25; }
+  body.compact div.topic, body.compact div.previews { padding: 2px 10px; }
+  div.banner { padding: 6px 12px; background: var(--alert-bg); color: var(--alert-fg);
     font: 13px ui-monospace, monospace; }
   pre.term-container { flex: 1; margin: 0; padding: 12px; overflow: auto;
     font: 14px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
   form.input { display: flex; gap: 8px; padding: 8px 12px;
-    border-top: 1px solid #2a2a3a; background: #16161f; }
-  form.input input { flex: 1; background: #0e0e15; color: #e6e6f0;
-    border: 1px solid #2a2a3a; border-radius: 4px; padding: 6px 8px;
+    border-top: 1px solid var(--border); background: var(--bg-panel); }
+  form.input input { flex: 1; background: var(--bg-inset); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px;
     font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  form.input button { background: #2d2d44; color: #e6e6f0; border: 0;
+  form.input button { background: var(--bg-raised); color: var(--fg); border: 0;
     border-radius: 4px; padding: 6px 14px; font: 14px ui-monospace, monospace;
     cursor: pointer; }
-  footer.status { padding: 4px 12px; background: #0e0e15; color: #7a7a95;
-    border-top: 1px solid #2a2a3a;
+  footer.status { padding: 4px 12px; background: var(--bg-inset); color: var(--fg-dim);
+    border-top: 1px solid var(--border);
     font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  aside.nicks { width: 150px; flex: 0 0 150px; background: #14141d;
-    border-left: 1px solid #2a2a3a; overflow-y: auto; padding: 8px 0; }
+  aside.nicks { width: 150px; flex: 0 0 150px; background: var(--window-bg);
+    border-left: 1px solid var(--border); overflow-y: auto; padding: 8px 0; }
   aside.nicks h2 { margin: 4px 12px 8px; font: 600 11px ui-monospace, monospace;
-    letter-spacing: .08em; text-transform: uppercase; color: #7a7a95; }
+    letter-spacing: .08em; text-transform: uppercase; color: var(--fg-dim); }
   aside.nicks .nick { padding: 2px 12px; font: 12px ui-monospace, monospace;
-    color: #b8b8d0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  aside.nicks .nick.op { color: #7ddc8a; font-weight: 600; }
-  aside.windows .count-nicks { color: #5c5c78; font-size: 11px; }
+    color: var(--result-fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  aside.nicks .nick.op { color: var(--op); font-weight: 600; }
+  aside.windows .count-nicks { color: var(--fg-muted); font-size: 11px; }
   @media (max-width: 640px) { aside.windows, aside.nicks { display: none; } }
 </style>
 </head>
 <body>
-<aside class="windows" id="windows"><h2>windows</h2></aside>
+<aside class="windows" id="windows"><h2>windows
+  <button class="theme" id="theme" type="button" title="toggle theme (Alt-T)">◐</button></h2></aside>
 <div class="wrap">
 <div class="banner" id="banner" hidden></div>
+<div class="hint" id="hint" hidden></div>
 <div class="topic" id="topic" hidden></div>
 <div class="previews" id="previews" hidden></div>
 <div class="searchbar">

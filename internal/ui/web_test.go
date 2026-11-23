@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -205,4 +206,157 @@ func TestWebWindowSelection(t *testing.T) {
 	if got := fb.expect(t); got != "PRIVMSG #other :routed here" {
 		t.Fatalf("sent %q, want the selected window", got)
 	}
+}
+
+// TestEveryColourIsAVariable pins the property that makes theming possible: the
+// stylesheet has no literal colours outside the palette blocks. One hard-coded hex
+// is a theme where that element stays dark in light mode, and it is invisible until
+// somebody switches.
+func TestEveryColourIsAVariable(t *testing.T) {
+	css := pageHTML(t)
+	// Strip the palette blocks first; they are where literals belong.
+	body := css
+	for _, marker := range []string{":root {", "body.light {"} {
+		for {
+			i := strings.Index(body, marker)
+			if i < 0 {
+				break
+			}
+			j := strings.Index(body[i:], "}")
+			if j < 0 {
+				break
+			}
+			body = body[:i] + body[i+j:]
+		}
+	}
+	if strings.Contains(body, "background: #") || strings.Contains(body, "color: #") {
+		idx := strings.Index(body, "color: #")
+		if idx < 0 {
+			idx = strings.Index(body, "background: #")
+		}
+		t.Fatalf("literal colour outside the palette at %q", body[max(0, idx-60):idx+40])
+	}
+}
+
+// TestLightThemeRedefinesTheWholePalette pins that the two palettes have the same
+// keys. A variable defined in one and missing from the other falls back to the
+// inherited value, which shows as one element that did not change theme.
+func TestLightThemeRedefinesTheWholePalette(t *testing.T) {
+	css := pageHTML(t)
+	dark := paletteKeys(t, css, ":root {")
+	light := paletteKeys(t, css, "body.light {")
+	if len(dark) == 0 {
+		t.Fatal("no dark palette found")
+	}
+	// Only the colour half has to match: --font and friends are shared and live in
+	// :root once. The rule that matters is that no COLOUR is defined in one theme
+	// and missing from the other, because it would fall back to the inherited value
+	// and show as one element that did not change theme.
+	for k := range dark {
+		if !strings.HasPrefix(k, "--") || strings.HasPrefix(k, "--font") {
+			continue
+		}
+		if _, ok := light[k]; !ok {
+			t.Fatalf("light theme does not define %s", k)
+		}
+	}
+	for k := range light {
+		if !strings.HasPrefix(k, "--") || strings.HasPrefix(k, "--font") {
+			continue
+		}
+		if _, ok := dark[k]; !ok {
+			t.Fatalf("light theme defines %s, which the dark one does not", k)
+		}
+	}
+}
+
+// paletteKeys lists the --variables defined in the block that starts at marker.
+func paletteKeys(t *testing.T, css, marker string) map[string]bool {
+	t.Helper()
+	i := strings.Index(css, marker)
+	if i < 0 {
+		return nil
+	}
+	j := strings.Index(css[i:], "}")
+	if j < 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, line := range strings.Split(css[i:i+j], ";") {
+		line = strings.TrimSpace(line)
+		if name, _, ok := strings.Cut(line, ":"); ok && strings.HasPrefix(name, "--") {
+			out[strings.TrimSpace(name)] = true
+		}
+	}
+	return out
+}
+
+// TestClientHasNoLiteralColoursInJS pins that the browser half does not hard-code a
+// colour either: a colour set from JavaScript is a theme the stylesheet cannot reach.
+func TestClientHasNoLiteralColoursInJS(t *testing.T) {
+	js := clientJSSource(t)
+	for _, bad := range []string{"#ffd76b", "#12121a", "#16161f", "style.color"} {
+		if strings.Contains(js, bad) {
+			t.Fatalf("client.js sets %q; colours belong in the stylesheet's variables", bad)
+		}
+	}
+}
+
+// TestThemeToggleIsWired pins that the control exists in the markup the server sends
+// and that the client binds it. A button with no handler is a UI that lies.
+func TestThemeToggleIsWired(t *testing.T) {
+	html := pageHTML(t)
+	if !strings.Contains(html, `id="theme"`) {
+		t.Fatal("no theme control in the page")
+	}
+	js := clientJSSource(t)
+	if !strings.Contains(js, `getElementById("theme")`) || !strings.Contains(js, "toggleTheme") {
+		t.Fatal("the client never binds the theme control")
+	}
+}
+
+// TestKeybindsAreDocumented pins that every bind is reachable and named the same in
+// the handler and the hint text. A bind that exists but is undiscoverable is unused.
+func TestKeybindsAreDocumented(t *testing.T) {
+	js := clientJSSource(t)
+	for _, key := range []string{`case "t"`, `case "k"`, `case "j"`, `case "i"`, `case "c"`} {
+		if !strings.Contains(js, key) {
+			t.Fatalf("keybind %s is missing", key)
+		}
+	}
+	if !strings.Contains(js, "Alt-T") && !strings.Contains(pageHTML(t), "Alt-T") {
+		t.Fatal("the theme keybind is not documented anywhere the user can see")
+	}
+}
+
+// TestSettingsSurviveACorruptStore pins that a broken localStorage cannot break the
+// client. Preferences are not worth a blank page, and localStorage is shared with
+// anything else on the origin.
+func TestSettingsSurviveACorruptStore(t *testing.T) {
+	js := clientJSSource(t)
+	if !strings.Contains(js, "JSON.parse") || !strings.Contains(js, "catch") {
+		t.Fatal("setting parsing has no error path")
+	}
+	if !strings.Contains(js, "var defaults") {
+		t.Fatal("there is no defaults object to fall back to")
+	}
+}
+
+// pageHTML renders the page and returns it, so the tests read what the browser gets.
+func pageHTML(t *testing.T) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := pageTemplate.Execute(&buf, nil); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
+// clientJSSource returns the embedded client.
+func clientJSSource(t *testing.T) string {
+	t.Helper()
+	if clientJS == "" {
+		t.Fatal("client.js is empty")
+	}
+	return clientJS
 }

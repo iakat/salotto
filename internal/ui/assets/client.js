@@ -107,8 +107,14 @@
   // The render is a full screen. Redrawing it replaces the whole <pre>, which is
   // why there is no incremental line logic here to get wrong.
   var lastRender = "";
+  // The last frame the server sent, for the keybinds: it already carries the window
+  // list and which one is active, so no keybind needs to read the DOM.
+  var lastFrame = null;
 
   function draw(f) {
+    // Remembered so the keybinds can cycle windows without parsing the DOM: the
+    // frame already carries the list and which one is active.
+    lastFrame = f;
     if (typeof f.render === "string" && f.render !== lastRender) {
       lastRender = f.render;
       termEl.innerHTML = ansiToHTML(f.render);
@@ -227,6 +233,101 @@
     ws.onerror = function () { try { ws.close(); } catch (e) {} };
   }
 
+
+  // ---- theme and keybinds -------------------------------------------------
+  //
+  // Both are client-side settings, so both live in localStorage: they are
+  // preferences about this browser, not state the bouncer should hold. Server-side
+  // settings would mean a per-device session table for something that has no
+  // business being shared between devices.
+  var SETTINGS_KEY = "salotto.settings";
+  var defaults = { theme: "dark", density: "normal" };
+  var settings = defaults;
+
+  function loadSettings() {
+    try {
+      var raw = localStorage.getItem(SETTINGS_KEY);
+      if (raw) {
+        var parsed = JSON.parse(raw);
+        settings = Object.assign({}, defaults, parsed);
+      }
+    } catch (e) {
+      // A corrupt or blocked localStorage must not break the client: the defaults
+      // are a working UI, and preferences are not worth a broken page.
+      settings = defaults;
+    }
+    applyTheme();
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    } catch (e) {}
+  }
+
+  function applyTheme() {
+    // The light theme is a class on <body>, because the palette is a set of CSS
+    // variables and swapping them is the whole theme.
+    document.body.classList.toggle("light", settings.theme === "light");
+    document.body.classList.toggle("compact", settings.density === "compact");
+  }
+
+  function toggleTheme() {
+    settings.theme = settings.theme === "light" ? "dark" : "light";
+    applyTheme();
+    saveSettings();
+    setHint("theme: " + settings.theme);
+  }
+
+  var hintTimer = null;
+  function setHint(text) {
+    var el = document.getElementById("hint");
+    if (!el) return;
+    el.textContent = text;
+    el.hidden = !text;
+    if (hintTimer) clearTimeout(hintTimer);
+    if (text) hintTimer = setTimeout(function () { el.hidden = true; }, 1800);
+  }
+
+  // Keybinds. Alt is the modifier rather than Ctrl because Ctrl+digit and Ctrl+M
+  // are taken by the browser and the terminal respectively, and a bind that the
+  // browser eats is worse than no bind.
+  function onKey(e) {
+    if (e.altKey && !e.ctrlKey && !e.metaKey) {
+      switch (e.key) {
+      case "t": e.preventDefault(); toggleTheme(); return;
+      case "k": e.preventDefault(); focusSearch(); return;
+      case "j": e.preventDefault(); cycleWindow(1); return;
+      case "i": e.preventDefault(); cycleWindow(-1); return;
+      case "c": e.preventDefault(); clearSearch(); return;
+      }
+    }
+    if (e.key === "Escape") { clearSearch(); }
+  }
+
+  function focusSearch() {
+    var q = document.getElementById("q");
+    if (q) { q.focus(); q.select(); }
+  }
+
+  function clearSearch() {
+    var q = document.getElementById("q");
+    var res = document.getElementById("results");
+    if (q) q.value = "";
+    if (res) { res.hidden = true; res.textContent = ""; }
+    var input = document.getElementById("line");
+    if (input) input.focus();
+  }
+
+  function cycleWindow(delta) {
+    if (!lastFrame || !lastFrame.windows || lastFrame.windows.length < 2) return;
+    var ws = lastFrame.windows;
+    var i = ws.indexOf(lastFrame.active);
+    if (i < 0) return;
+    var next = ws[(i + delta + ws.length) % ws.length];
+    send({ type: "select", active: next });
+  }
+
   function renderPreviews(list) {
     if (!previewsEl) return;
     previewsEl.textContent = "";
@@ -298,6 +399,9 @@
       f.submit();
     }
   });
+
+  // Alt-binds for the things the TUI has keys for, plus the theme. Registered once.
+  document.addEventListener("keydown", onKey);
 
   // Ctrl-N / Ctrl-P cycle windows, matching the TUI, because a browser user who
   // learned the keys in the terminal should not have to relearn them here.
@@ -374,4 +478,9 @@
   }
 
   connect();
+  var themeBtn = document.getElementById("theme");
+  if (themeBtn) themeBtn.addEventListener("click", toggleTheme);
+
+  loadSettings();
+
 })();
