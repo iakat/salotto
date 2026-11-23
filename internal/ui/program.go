@@ -132,27 +132,37 @@ func (p *Program) Model() Model {
 // Step applies one message and returns the command the model asked for. A
 // submitted line is handed to the transport here, which is the only place the
 // two halves meet.
+//
+// resolve is true: a caller with no bubbletea runtime (a test, a headless driver) gets the
+// model's command run and its Sent message applied immediately, or pressing Enter would
+// put nothing on screen. Under a real runtime Update is used instead, and bubbletea runs
+// the command itself.
 func (p *Program) Step(msg tea.Msg) tea.Cmd {
-	return p.step(msg, true)
+	return p.step(msg, true, true)
 }
 
-// step is Step with the active-window sync made optional, so the internal
-// re-feed of a Sent message does not do the same work twice.
-func (p *Program) step(msg tea.Msg, sync bool) tea.Cmd {
+// Update is bubbletea's entry point. It must NOT resolve the model's command: the runtime
+// already does that, feeds the resulting Sent back in here, and resolving it a second time
+// applies the local echo twice. That was the duplicated message - the same line appended
+// once by step() and once by the runtime's own dispatch of the command it returned.
+func (p *Program) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	return p, p.step(msg, false, true)
+}
+
+// step is Step with the command resolution and the active-window sync made optional.
+func (p *Program) step(msg tea.Msg, resolve, sync bool) tea.Cmd {
 	p.mu.Lock()
 	next, cmd := p.model.Step(msg)
 	p.model = next
 	p.rev++
 	p.mu.Unlock()
 
-	if cmd != nil {
-		// The model answers Enter with a command that resolves to Sent. In a real
-		// Program the runtime resolves it and feeds it back through Update; here
-		// it is resolved immediately and fed back to the model, because otherwise
-		// the local echo never happens: the user would press Enter, the line would
-		// go to the bouncer, and their own screen would stay empty until the
-		// bouncer echoed it — which it only does with echo-message, which salotto
-		// deliberately does not request upstream.
+	if cmd != nil && resolve {
+		// The model answers Enter with a command that resolves to Sent. With no runtime to
+		// resolve it, do it here and apply the Sent to the model, or the local echo never
+		// happens: the user presses Enter, the line goes to the bouncer, and their screen
+		// stays empty until the bouncer echoes it - which it only does with echo-message,
+		// which salotto deliberately does not request upstream.
 		if sent, ok := cmd().(Sent); ok {
 			p.mu.Lock()
 			p.model, _ = p.model.Step(sent)
@@ -183,9 +193,13 @@ func (p *Program) submit(text string) {
 		return
 	}
 	line := p.tr.Command(text)
-	if line != "" {
-		p.tr.Send(line)
+	if line == "" {
+		// Nothing to send: a bare line with no window to say it in. The local echo has
+		// already been drawn, so the user sees what they typed and it simply does not go
+		// anywhere - which is better than a mangled command reaching the server.
+		return
 	}
+	p.tr.Send(line)
 }
 
 // WindowName is the active window, so a driver can tell where the user is.
@@ -299,10 +313,3 @@ func (p *Program) Next() (tea.Msg, bool) {
 // already reading by the time a front end runs, because a bouncer connection
 // owned by the model would be a connection the model could not close.
 func (p *Program) Init() tea.Cmd { return nil }
-
-// Update satisfies tea.Model, so a front end can run this as a bubbletea Program
-// directly. It returns the same *Program rather than a copy, so the runtime's
-// assertion back to the value it started with always succeeds.
-func (p *Program) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	return p, p.Step(msg)
-}

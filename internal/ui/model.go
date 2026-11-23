@@ -67,6 +67,12 @@ const (
 	LineNick
 	LineTopic
 	LineMode
+	// LineSelfJoin is our own JOIN. It is separate from LineJoin because it does something
+	// no other line does: it switches the active window. Joining a channel and staying in
+	// the status window means the next thing you type goes out as a bouncer command - the
+	// user joins #chan, says "hello", and the server answers "421 Unknown command".
+	LineSelfJoin
+
 	// LinePreview is a link card. It is a line and not a panel because a terminal
 	// has no panels: the one thing a terminal can show beside a message is another
 	// line, and putting it there means the SSH and PTY front ends get previews for
@@ -295,6 +301,16 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// Our own line coming back from the bouncer confirms the pending echo instead of
 		// being drawn beside it. A bouncer echoes the sender - that is how a second
 		// client sees the same conversation - so anything else shows every message twice.
+		if line.Kind == LineSelfJoin {
+			// Switch to the channel we just joined. This is what every IRC client does, and
+			// not doing it is why a message sent after /join turned into "421 Unknown
+			// command": the view stayed on status, and a bare line there is a bouncer
+			// command.
+			m.append(line)
+			m.active = line.Window
+			m.scroll = 0
+			return m, nil
+		}
 		if !line.Pending {
 			if m.confirmPending(line) {
 				if line.Mention {
@@ -829,7 +845,7 @@ func lineLines(l Line, width int) []string {
 		return wrapStyled(noticeStyle, "<"+l.Nick+"> "+l.Text, width, "")
 	case LineAction:
 		return wrapStyled(actionStyle, "* "+l.Nick+" "+l.Text, width, "")
-	case LineJoin:
+	case LineJoin, LineSelfJoin:
 		return wrapStyled(eventStyle, "→ "+l.Nick+" "+l.Text, width, "")
 	case LinePart:
 		return wrapStyled(eventStyle, "← "+l.Nick+" "+l.Text, width, "")

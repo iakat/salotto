@@ -296,3 +296,94 @@ func TestASpaceReachesTheWire(t *testing.T) {
 		}
 	}
 }
+
+// TestTheRuntimeDoesNotEchoTwice is the duplicate bug where the unit tests were all green.
+//
+// Program.Update delegated to Step, and Step resolved the model's Sent command itself. Under
+// a real bubbletea runtime the command is ALSO dispatched by the runtime and its message fed
+// back through Update - so the local echo happened twice and every message was drawn twice.
+// The headless tests never saw it because they called Step directly, where the runtime does
+// not exist to double-dispatch.
+func TestTheRuntimeDoesNotEchoTwice(t *testing.T) {
+	Configure()
+	p := NewProgram("#test", nil)
+	p.Step(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// What a runtime does: send the key, then dispatch the returned command and feed its
+	// message back in. Doing that by hand is exactly what bubbletea does internally.
+	for _, ru := range "hi" {
+		if _, cmd := p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ru}}); cmd != nil {
+			t.Fatalf("typing returned a command: %T", cmd)
+		}
+	}
+	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter returned no command")
+	}
+	// The runtime runs it and feeds the result back.
+	if msg := cmd(); msg != nil {
+		p.Update(msg)
+	}
+
+	if got := strings.Count(plainText(p.View()), "hi"); got != 1 {
+		t.Fatalf("the local echo is on screen %d times, want 1:\n%s", got, plainText(p.View()))
+	}
+}
+
+// TestABareStatusLineIsACommandAsTyped pins ZNC's behaviour and ours: in the status window
+// a line with no slash is a bouncer command, so "listchans" works. It is sent as typed -
+// upper-casing it turned a sentence typed in the wrong window into "421 Unknown command".
+func TestABareStatusLineIsACommandAsTyped(t *testing.T) {
+	Configure()
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	tr.Register("alice", "")
+
+	tr.SetActive("status")
+	// A bare line in the status window is a bouncer command, as typed. Uppercasing it was
+	// what turned a stray sentence into "421 Unknown command".
+	if got := tr.Command("listchans"); got != "listchans" {
+		t.Fatalf("a bare status line became %q, want %q", got, "listchans")
+	}
+
+	// And in a channel it is still a message.
+	tr.SetActive("#test")
+	if got := tr.Command("hello there"); got != "PRIVMSG #test :hello there" {
+		t.Fatalf("in a channel the line became %q", got)
+	}
+}
+
+// TestJoiningSwitchesToTheChannel is the bug behind "my message disappeared".
+//
+// After /join the view stayed on the status window. A bare line there is a bouncer command,
+// so the next thing typed went out as "HELLO" - answered with "421 Unknown command" - and
+// the message the user thought they sent never existed. Every IRC client switches to the
+// channel on join; not doing it made the input box lie about where it was sending.
+func TestJoiningSwitchesToTheChannel(t *testing.T) {
+	Configure()
+	m := New("status")
+	m, _ = m.Step(Incoming(Line{Window: "#test", Nick: "alice", Text: "joined #test", Kind: LineSelfJoin}))
+
+	if m.Active() != "#test" {
+		t.Fatalf("after joining #test the active window is %q", m.Active())
+	}
+	if m.scroll != 0 {
+		t.Fatalf("scroll = %d after joining, want the bottom", m.scroll)
+	}
+}
+
+// TestSomeoneElsesJoinDoesNotSwitch is the other half: a channel filling up must not drag the
+// view away from what the user is reading.
+func TestSomeoneElsesJoinDoesNotSwitch(t *testing.T) {
+	Configure()
+	m := New("#reading")
+	m, _ = m.Step(Incoming(Line{Window: "#other", Nick: "bob", Text: "joined", Kind: LineJoin}))
+
+	if m.Active() != "#reading" {
+		t.Fatalf("another person's join switched the view to %q", m.Active())
+	}
+}

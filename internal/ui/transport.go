@@ -158,6 +158,12 @@ func (t *Transport) Command(text string) string {
 		window := t.active
 		t.mu.Unlock()
 		if window == "" || window == "status" {
+			// A bare line in the status window is a bouncer command - that is ZNC's
+			// behaviour and ours: someone types "listchans" and expects the channel list.
+			// It goes out as typed, NOT uppercased: upper-casing was a nicety for /commands
+			// and it turns a stray sentence into a command the server answers with "421
+			// Unknown command", which is a confusing way to say "you typed this in the wrong
+			// window".
 			return text
 		}
 		return "PRIVMSG " + window + " :" + text
@@ -314,8 +320,9 @@ func (t *Transport) handle(raw []byte) {
 			t.note(channel)
 			t.push(Incoming(Line{
 				Window: channel,
+				Nick:   from,
 				Text:   "joined " + channel,
-				Kind:   LineSystem,
+				Kind:   LineSelfJoin,
 			}))
 			// 324 only arrives when asked, unlike 332 which the server volunteers
 			// on JOIN. Without this the header shows a topic and no modes, which
