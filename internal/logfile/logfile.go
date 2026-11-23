@@ -41,6 +41,14 @@ type Writer struct {
 	clock   func() time.Time
 	hasCap  func(string) bool
 
+	// stripControls mirrors ZNC's stripcontrols module (modules/stripcontrols.cpp),
+	// which is opt-in: the `log` module writes message text verbatim, tabs and
+	// all, and an operator who wants colours removed loads stripcontrols. Off by
+	// default for the same reason it is off by default there — it is a
+	// presentation choice, and silently rewriting what someone said is not a
+	// decision a logger should make on its own.
+	stripControls atomic.Bool
+
 	mu       sync.Mutex
 	file     *os.File
 	fileDay  string
@@ -58,6 +66,11 @@ type Writer struct {
 	done chan struct{}
 	wg   sync.WaitGroup
 }
+
+// SetStripControls turns on the stripcontrols behaviour: message text is written
+// without IRC colours and control bytes, exactly as ZNC's stripcontrols module
+// does. Off by default; see the field comment.
+func (w *Writer) SetStripControls(on bool) { w.stripControls.Store(on) }
 
 func New(network, logDir string, queueDepth int, clock func() time.Time) *Writer {
 	if clock == nil {
@@ -286,7 +299,23 @@ func (w *Writer) handle(e event) {
 	if !e.out && e.entries == nil {
 		w.tracker.Observe(line)
 	}
+	if w.stripControls.Load() && len(entries) > 0 {
+		entries = stripEntryBodies(entries)
+	}
 	w.writeEntries(day, entries, now)
+}
+
+// stripEntryBodies applies the stripcontrols module's effect to already-formatted
+// entries. Doing it on the entry body rather than on the wire line is what keeps
+// the tracker and the replay rings intact: the colours are removed from what gets
+// written down, not from what the model sees.
+func stripEntryBodies(entries []Entry) []Entry {
+	out := make([]Entry, len(entries))
+	for i, e := range entries {
+		out[i] = e
+		out[i].Body = stripControls(e.Body)
+	}
+	return out
 }
 
 func (w *Writer) writeEntries(day string, entries []Entry, now time.Time) {

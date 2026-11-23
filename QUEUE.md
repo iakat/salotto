@@ -213,16 +213,16 @@ Grouped, because 59 rows is a wall, and the grouping *is* the decision.
 | `chansaver` | persist channel list | **done** — `cmd/salottod/chansaver.go`: our own JOIN adds, our own PART removes (`chansaver.cpp:69-92`); JOIN/PART only, because ZNC has no kick handler there — kicks are B12's disable flag |
 | `perform` | send commands on connect | **done**, before joins (`perform.cpp` `OnIRCConnected`) |
 | `keepnick` | retry the nick you want | **done**, 30 s loop (`keepnick.cpp Start(30000)`) |
-| `stickychan` | keep channels joined | subsumed by chansaver + rejoin |
+| `stickychan` | keep channels joined | **covered, not ported.** The module is a persistent `MCString` of extra channels plus a timer that re-`JOIN`s any not-on channel (`stickychan.cpp:105-124`); salotto's per-network `JoinChannels` does the same job off the channel list at every dial, and chansaver keeps that list honest. Porting the module would be a second channel list that disagrees with the first. |
 | `simple_away` | auto-away on detach | **done** — `internal/facade/away.go`: away after `away_wait` with no client attached, back on attach, never fighting a user-set away (`simple_away.cpp` `m_bClientSetAway`/`m_bWeSetAway`) |
 | `awaynick` | change nick when away | **refuse** — retired in ZNC itself: the module's `OnLoad` returns false with "retired module - see https://wiki.znc.in/awaynick". Implementing it would be inventing behaviour upstream deleted |
 | `awaystore` | store and replay away messages | **done (the useful half)** — `internal/facade/awaystore.go`: the message *store* is redundant because per-window rings plus cursors already replay private queries; what was missing is the accounting, so private PRIVMSG/ACTION that arrive while we set the away are counted and the returning client is told "Welcome back!" / "You have N messages!" (`awaystore.cpp:388-389`). No encrypted on-disk store: that is a password-protected file whose whole purpose is to survive ZNC losing state, and rings + `savebuff` already do |
 | `buffextras` | put joins/parts/modes into the replay buffer | **done** by B2's routing split; `TestBuffExtrasReachesTheReplayRing` |
-| `savebuff` | persist the buffer across restarts | the "M5 mmapped rings" item, in effect |
+| `savebuff` | persist the buffer across restarts | **refuse, matching ZNC.** It is not built in upstream either: it is a loadable module that serialises each window's buffer to disk on shutdown (`savebuff.cpp:199-217`) and replays it on boot (`:99-138`). salotto's rings are in memory by design and its history is the log files, which are already on disk and already searchable — a third copy would be a cache pretending to be history. |
 | `clearbufferonmsg` | clear buffer when you speak | **done** (`clearbufferonmsg.cpp`) |
-| `stripcontrols` | strip control codes before logging | relevant to `log` |
+| `stripcontrols` | strip control codes before logging | **done**, opt-in. `internal/logfile/stripcontrols.go` reproduces `CString::StripControls_n` (`ZNCString.cpp:1452-1498`) including the two cases a regex gets wrong (a comma not followed by digits is text; a trailing code can still emit a comma). Applied to log bodies only when `strip_controls = true`, because in ZNC the module is opt-in and `log` writes what was said — `sanitizeBody` separately and always removes CR/LF/C0 for log integrity, which is a different job. Tests: `TestStripControlsMatchesZNC`, `TestStripControlsModuleIsOptIn`, `TestStripControlsKeepsTheReplayRingIntact`. |
 | `sasl` | SASL PLAIN | **have** |
-| `cert` / `certauth` | SASL EXTERNAL via client cert | B6 |
+| `cert` / `certauth` | SASL EXTERNAL via client cert | **done** as B6: `sasl_external` + `cert_file`/`key_file`, EXTERNAL response is ZNC's single `"+"` (`sasl.cpp:198-213`), no PLAIN fallback when the certificate is missing |
 
 **Refuse — do not implement (9, with reasons)**
 

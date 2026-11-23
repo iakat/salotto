@@ -87,6 +87,11 @@ type Config struct {
 	Networks    []Network
 	// MaxBufferLines caps SETBUFFER, ZNC's GetMaxBufferSize.
 	MaxBufferLines int
+
+	// StripControls mirrors ZNC's stripcontrols module: message text is written
+	// to the logs without IRC colours and control bytes. Off by default, as the
+	// module is in ZNC — the log module writes what was said.
+	StripControls bool
 }
 
 // Default returns the built-in configuration. Networks are intentionally empty:
@@ -380,6 +385,8 @@ func (c *Config) parseNetworkKey(n *Network, key, value string) error {
 		n.ClearBufferOnMsg, err = parseBool(value)
 	case "max_buffer_lines":
 		c.MaxBufferLines, err = parseInt(value)
+	case "strip_controls":
+		c.StripControls, err = parseBool(value)
 	case "away":
 		n.Away, err = parseBool(value)
 	case "away_reason":

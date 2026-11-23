@@ -121,6 +121,7 @@ func (m *netmgr) Start(nc config.Network) error {
 	netName := nc.Name
 	serverStr := nc.Addr
 	w := logfile.New(netName, m.cfg.LogDir, m.cfg.LogQueue, time.Now)
+	w.SetStripControls(m.cfg.StripControls)
 	w.SetNick(nc.Nick)
 	w.SetServer(nc.Addr)
 

@@ -13,6 +13,9 @@ server_name = "salotto"
 stats_listen = "127.0.0.1:6668"
 log_dir = ""                     # empty disables logging
 log_queue = 4096
+# Write message text without IRC colours and control bytes, like ZNC's
+# stripcontrols module. Off by default: the log records what was said.
+strip_controls = false
 log_listen = ""                  # empty disables search; loopback only without token
 log_token = ""
 ident_listen = ""                # RFC 1413 listener, e.g. ":113"; empty disables ident
