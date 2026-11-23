@@ -63,6 +63,9 @@ spec:
       containers:
         - name: salottod
           image: 10.43.135.163:5000/salotto/salottod:e2e
+          # The tag is stable across rebuilds, so the node would otherwise keep
+          # serving the previous binary from its image cache.
+          imagePullPolicy: Always
           args: ["-config", "/etc/salotto/salotto.toml", "-log-level", "info"]
           ports:
             - {name: irc, containerPort: 6667}

@@ -39,9 +39,12 @@ func TestRegistration(t *testing.T) {
 	defer conn.Close()
 	br := bufio.NewReader(conn)
 
+	// echo-message is offered by the server but must NOT be requested: the
+	// bouncer echoes outbound lines itself, and asking the server too would
+	// deliver every message twice.
 	serverRegister(t, conn, br,
 		"server-time message-tags echo-message",
-		"server-time message-tags echo-message",
+		"server-time message-tags",
 		"nick", "USER user 0 * :Real Name")
 	writeServerLines(t, conn, ":srv 005 nick CHANTYPES=# :supported")
 	expectLine(t, conn, br, "JOIN #chan")

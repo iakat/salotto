@@ -5,10 +5,16 @@ import (
 	"strings"
 )
 
+// wantedCaps is what this bouncer asks the *server* for. echo-message is
+// deliberately absent: ZNC does not request it upstream either
+// (IRCSock.cpp's mSupportedCaps has no echo-message entry), because the bouncer
+// already echoes an outbound line itself from its own send path. Asking the
+// server as well makes every message arrive twice — once from our own echo and
+// once from the server's — and the second copy reaches every attached client,
+// including the author who never negotiated the capability.
 var wantedCaps = []string{
 	"server-time",
 	"message-tags",
-	"echo-message",
 	"away-notify",
 	"account-notify",
 	"extended-join",
