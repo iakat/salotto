@@ -86,7 +86,7 @@ func TestDispatchLineUsesWindowPath(t *testing.T) {
 
 	w.Tracker().Observe([]byte(":probebot!p@h JOIN #probe"))
 	line := []byte(":alice!a@h PRIVMSG #probe :hello one")
-	dispatchLine(s, w.Tracker(), false, "probe", 5, line, false)
+	dispatchEntries(s, "probe", logfile.Route(w.Tracker(), line, false, false, ""), line)
 
 	got := flushLines(t, sub, out)
 	if len(got) != 1 {
@@ -116,7 +116,7 @@ func TestDispatchLineNoDuplication(t *testing.T) {
 	}
 
 	w.Tracker().Observe([]byte(":probebot!p@h JOIN #probe"))
-	dispatchLine(s, w.Tracker(), false, "probe", 6, []byte(":alice!a@h PRIVMSG #probe :hello"), false)
+	dispatchEntries(s, "probe", logfile.Route(w.Tracker(), []byte(":alice!a@h PRIVMSG #probe :hello"), false, false, ""), []byte(":alice!a@h PRIVMSG #probe :hello"))
 
 	gotAttached := flushLines(t, attached, out)
 	if len(gotAttached) != 1 || !strings.Contains(gotAttached[0], "PRIVMSG #probe :hello") {
@@ -140,7 +140,7 @@ func TestDispatchLineStatusGoesToEveryoneOnce(t *testing.T) {
 		t.Fatal("hub.Add failed")
 	}
 
-	dispatchLine(s, w.Tracker(), false, "probe", 7, []byte(":srv 254 probebot 0 :channels formed"), false)
+	dispatchEntries(s, "probe", logfile.Route(w.Tracker(), []byte(":srv 254 probebot 0 :channels formed"), false, false, ""), []byte(":srv 254 probebot 0 :channels formed"))
 
 	for name, sub := range map[string]*facade.Subscriber{"attached": attached, "plain": plain} {
 		buf := out
@@ -177,7 +177,7 @@ func newRouteCase(t *testing.T) *routeCase {
 func (fx *routeCase) send(t *testing.T, channel, body string) uint64 {
 	line := []byte(":alice!a@h PRIVMSG " + channel + " :" + body)
 	seq := fx.fn.set.Append(channel, line, time.Now().UnixNano())
-	dispatchLine(fx.s, fx.w.Tracker(), false, "probe", seq, line, false)
+	dispatchEntries(fx.s, "probe", logfile.Route(fx.w.Tracker(), line, false, false, ""), line)
 	return seq
 }
 

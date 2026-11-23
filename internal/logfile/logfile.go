@@ -108,12 +108,25 @@ func (w *Writer) Tracker() *Tracker              { return w.tracker }
 // writer's tracker, server string and negotiated capabilities. The upstream
 // connection uses it to route and buffer a line; the resulting entries are
 // handed back through OnRouted so the drain does not parse it again.
+//
+// Route also observes the line. Parsing and observing have to happen on the
+// same goroutine and in arrival order: Format picks the windows from the
+// membership the line arrived in (a QUIT fans out to the channels the nick
+// shared before it happened), while the next line has to see this one's effect
+// (a JOIN must be known before the PRIVMSG that follows it is routed). The
+// drain goroutine is asynchronous, so observing there let the two race. A line
+// routed here is therefore already observed and the drain skips it; a line the
+// drain parses itself is still observed by the drain.
 func (w *Writer) Route(line []byte, outbound bool) []Entry {
 	hasEcho := false
 	if w.hasCap != nil {
 		hasEcho = w.hasCap("echo-message")
 	}
-	return Route(w.tracker, line, outbound, hasEcho, w.server)
+	entries := Route(w.tracker, line, outbound, hasEcho, w.server)
+	if !outbound {
+		w.tracker.Observe(line)
+	}
+	return entries
 }
 
 func (w *Writer) OnLine(seq uint64, line []byte) {
@@ -225,7 +238,9 @@ func (w *Writer) handle(e event) {
 	if w.logDir == "" && e.buf != nil {
 		// No log files, but the tracker still backs per-window live routing
 		// (logfile.WindowFor), so keep observing. Nothing to format or write.
-		if !e.out {
+		// A routed line was already observed by Writer.Route: entries != nil is
+		// the marker, and observing twice would count a JOIN twice.
+		if !e.out && e.entries == nil {
 			w.tracker.Observe((*e.buf)[:e.n])
 		}
 		return
@@ -262,12 +277,13 @@ func (w *Writer) handle(e event) {
 	// line arrived in: a QUIT or NICK fans out to the channels the nick shared
 	// before it happened. Observing first would erase that membership and log
 	// the event to status while the replay went to the channels, or vice versa.
-	// The routing step normally hands us its entries, so this is the only parse.
+	// A line handed to us by the routing step was parsed and observed there, on
+	// the reading goroutine; entries != nil is how this event says so.
 	entries := e.entries
 	if entries == nil {
 		entries = Format(w.tracker, now, line, e.out, hasEcho, w.server)
 	}
-	if !e.out {
+	if !e.out && e.entries == nil {
 		w.tracker.Observe(line)
 	}
 	w.writeEntries(day, entries, now)

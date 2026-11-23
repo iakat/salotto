@@ -175,12 +175,12 @@ func run() int {
 			Route:              w.Route,
 			Log:                logger.With("network", netName),
 			OnLine: func(windows []string, seqs []uint64, entries []logfile.Entry, line []byte) {
-				dispatchRouted(srv, netName, entries, line)
+				dispatchRouted(srv, netName, windows, line)
 				w.OnRouted(entries, line, false)
 			},
 			OnSend: func(line []byte) {
 				entries := w.Route(line, true)
-				dispatchRouted(srv, netName, entries, line)
+				dispatchEntries(srv, netName, entries, line)
 				w.OnRouted(entries, line, true)
 			},
 			OnConnect: func() {
@@ -433,41 +433,37 @@ func run() int {
 	return 0
 }
 
-// dispatchLine routes one line to the replay windows its log file belongs to,
-// using the same window model the logger uses (logfile.WindowFor). Live status
-// lines (numerics, server notices, MODE on the client) are the status stream and
-// go through Broadcast, which every client receives. A line with channel or
-// query windows goes through BroadcastWindows only: clients attached to one of
-// those windows get it once through the window path and clients with no attach
-// get it once through the status fallback. Nothing is delivered twice.
-func dispatchLine(srv *facade.Server, tr *logfile.Tracker, hasEcho bool, netName string, seq uint64, line []byte, outbound bool) {
-	dispatchRouted(srv, netName, logfile.Route(tr, line, outbound, hasEcho, ""), line)
-}
-
-// dispatchRouted delivers one line live using the entries routing already
-// produced. A line whose only window is status is the status stream; a line
-// with a channel or query window goes through BroadcastWindows.
-func dispatchRouted(srv *facade.Server, netName string, entries []logfile.Entry, line []byte) {
+// dispatchRouted delivers one line live to the windows routing already chose.
+// A line whose only window is status is the status stream; a line with a
+// channel or query window goes through BroadcastWindows. The caller owns
+// windows and must not keep using it after the call.
+func dispatchRouted(srv *facade.Server, netName string, windows []string, line []byte) {
 	if srv == nil {
 		return
 	}
-	windows := make([]string, 0, len(entries))
 	nonStatus := false
-	for _, e := range entries {
-		window := e.Window
-		if window == "" {
-			window = "status"
-		}
-		if window != "status" {
+	for _, window := range windows {
+		if window != "status" && window != "" {
 			nonStatus = true
+			break
 		}
-		windows = append(windows, window)
 	}
 	if !nonStatus {
 		srv.Broadcast(netName, 0, line, time.Now().UnixNano())
 		return
 	}
 	srv.BroadcastWindows(netName, windows, 0, line, time.Now().UnixNano())
+}
+
+// dispatchEntries is dispatchRouted for a caller that has the parsed entries
+// but not the window list. It runs on the outbound path, where the allocation
+// does not matter.
+func dispatchEntries(srv *facade.Server, netName string, entries []logfile.Entry, line []byte) {
+	windows := make([]string, len(entries))
+	for i, e := range entries {
+		windows[i] = e.Window
+	}
+	dispatchRouted(srv, netName, windows, line)
 }
 
 func parseLogLevel(value string) (slog.Level, error) {
