@@ -29,6 +29,21 @@ type Line struct {
 	// already drawing, and a search result carries its own answer to "was this for
 	// me".
 	Mention bool
+
+	// Own marks a line that came from us. The bouncer echoes our own PRIVMSG back, and
+	// that echo is authoritative - it is what makes a second client see the same
+	// conversation - so it must replace the optimistic line rather than join it. Own is
+	// set by the transport, which is the only place that knows which nicks are ours.
+	Own bool
+
+	// Pending marks a local echo: the line the user just typed, shown before the
+	// bouncer has confirmed it. The bouncer echoes our own PRIVMSG back (that is what
+	// a bouncer is for - a second client must see it), so without this flag every
+	// message we send appears twice: once optimistically, once for real.
+	//
+	// The echoed line replaces the pending one rather than being added: that keeps the
+	// message in the place the user saw it and gives it its real nick and timestamp.
+	Pending bool
 }
 
 // LineKind selects the style a line is drawn with. It exists so the model never
@@ -277,6 +292,17 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 
 	case Incoming:
 		line := Line(msg)
+		// Our own line coming back from the bouncer confirms the pending echo instead of
+		// being drawn beside it. A bouncer echoes the sender - that is how a second
+		// client sees the same conversation - so anything else shows every message twice.
+		if !line.Pending {
+			if m.confirmPending(line) {
+				if line.Mention {
+					m = m.NoteMention(line.Window)
+				}
+				return m, nil
+			}
+		}
 		m.append(line)
 		if line.Mention {
 			m = m.NoteMention(line.Window)
@@ -291,7 +317,7 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// A submitted line is echoed as a line of our own: the model is not the
 		// place that decides whether the transport accepted it, so this is a
 		// local echo and nothing more.
-		m.append(Line{Window: m.active, Nick: "me", Text: text, Kind: LineMessage})
+		m.append(Line{Window: m.active, Nick: "me", Text: text, Kind: LineMessage, Pending: true})
 		m.input = m.input[:0]
 		return m, nil
 
@@ -364,6 +390,31 @@ func (m Model) cycle(delta int) Model {
 	m.active = m.order[idx]
 	m.scroll = 0
 	return m
+}
+
+// confirmPending finds the local echo this line confirms and rewrites it in place.
+//
+// It matches on window, text and the sending nick being ours ("me" is the local echo's
+// placeholder). The match is the most recent pending line with the same text in the same
+// window, because sending the same thing twice is a thing people do and the first echo
+// belongs to the first send.
+func (m Model) confirmPending(line Line) bool {
+	// Only our own line can confirm a local echo. Matching on text alone would let the
+	// first person to repeat what we said delete our message, which is a bug you cannot
+	// see until someone says "yes" after you did.
+	if !line.Own {
+		return false
+	}
+	lines := m.windows[line.Window]
+	for i := len(lines) - 1; i >= 0; i-- {
+		l := lines[i]
+		if !l.Pending || l.Text != line.Text || l.Kind != line.Kind {
+			continue
+		}
+		lines[i] = line
+		return true
+	}
+	return false
 }
 
 // append adds a line to its window and makes that window known. Auto-scroll

@@ -103,6 +103,12 @@ func (t *Transport) Err() error {
 // message-tags/time for line timestamps and away-notify so an away set by the
 // bouncer shows up in the window — rather than asking for everything.
 func (t *Transport) Register(nick, pass string) {
+	// Our own nick is known here, before the server confirms it, and it has to be
+	// recorded now: the bouncer echoes our own PRIVMSG back, and until 001 arrives every
+	// such echo looks like a message from a stranger. The 001 handler adds whatever nick
+	// the server actually gave us (it may be the altnick), so this is the first entry in a
+	// set, not the answer.
+	t.noteSelf(nick)
 	if pass != "" {
 		t.Send("PASS " + pass)
 	}
@@ -263,7 +269,7 @@ func (t *Transport) handle(raw []byte) {
 		// flag "alice" inside "malice", and a word-boundary test done properly
 		// needs to know the nick's length anyway, so this walks the text for
 		// standalone occurrences.
-		line := Line{Window: window, Nick: from, Text: text, Kind: kind}
+		line := Line{Window: window, Nick: from, Text: text, Kind: kind, Own: t.isSelf(from)}
 		if kind != LineNotice && t.mentionsUs(from, text) {
 			line.Mention = true
 		}

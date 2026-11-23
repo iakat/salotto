@@ -44,6 +44,18 @@ func main() {
 			os.Exit(1)
 		}
 		defer tr.Close()
+		// Register, or the bouncer holds a connection that never becomes a user: no
+		// window list, no nicklists, no history, and the terminal sits on an empty status
+		// window looking like it works. The old web front end did this in its own dial;
+		// moving the dial into the child meant moving this too, and forgetting it was
+		// invisible until someone opened the page.
+		// A bouncer without a nick is not a session: it would register with an empty
+		// NICK, be rejected, and show a blank terminal. Refuse instead of pretending.
+		if *nick == "" {
+			slog.Error("a bouncer address needs -nick: a client of a bouncer is that user")
+			os.Exit(1)
+		}
+		tr.Register(*nick, "")
 	}
 
 	// The starting window is the user's own status window, which is where a bouncer
