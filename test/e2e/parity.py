@@ -359,58 +359,57 @@ def _reconnect_and_watch(b: Bouncer, needle: str, budget: float = 75.0) -> tuple
 
 def case_chansaver(b: Bouncer, channel: str) -> dict:
     """Does a channel joined inside the session survive a reconnect, and does a
-    parted channel stay gone?
+    channel parted inside the session stay gone?
 
     Both halves are needed. chansaver's job is that the saved list follows our own
     JOIN and PART (chansaver.cpp:69-92), and Disconnect/Connect drives the same
     rejoin path as a real reconnect without restarting either bouncer.
 
-    The negative half alone cannot tell "chansaver forgot the parted channel" from
-    "reconnect rejoins nothing at all", and a dead chansaver produces exactly the
-    negative result. So a throwaway channel is joined first as a positive control:
-    if reconnect does not bring *that* back, the negative result below means
-    nothing. This is not hypothetical — with only the negative half, both bouncers
-    returned false, the harness called it parity, and salotto's chansaver was in
-    fact recording nothing at all (the facade could not tell which lines were
-    ours, so it never saw our JOIN).
+    The negative half cannot use the configured channel: it is in the network
+    config, so it comes back after a reconnect whether chansaver works or not.
+    Both throwaway channels are therefore unique per run and absent from any
+    config file — a channel name reused from a previous run would already be in
+    the saved list, making the join a no-op and the control meaningless.
 
-    The channel name is unique per run: a fixed name would already be in the saved
-    list from the previous run, so the join would be a no-op and the control would
-    pass without proving anything.
+    The negative half alone is not enough either: "nothing came back" is also what
+    a dead chansaver produces. So the positive control comes first, and the case is
+    only a pass if the control holds *and* the parted channel stays away.
     """
-    keep = "%s-keep%d" % (channel, int(time.time()) % 100000)
+    stamp = int(time.time()) % 100000
+    keep = "%s-keep%d" % (channel, stamp)
+    gone = "%s-gone%d" % (channel, stamp)
 
     # Positive control: joined in-session, so a reconnect must bring it back.
     b.send("JOIN " + keep)
     b.drain(2.0)
     kept, seen_keep = _reconnect_and_watch(b, keep)
 
-    # Negative: a PART must evict the channel from the saved list.
-    b.send("PART " + channel)
+    # Negative: joined then parted in-session, so a reconnect must leave it out.
+    b.send("JOIN " + gone)
     b.drain(2.0)
-    back, seen_part = _reconnect_and_watch(b, channel)
+    b.send("PART " + gone)
+    b.drain(2.0)
+    back, seen_part = _reconnect_and_watch(b, gone)
 
     if os.environ.get("CHANSAVER_DEBUG"):
-        for tag, lines in (("keep", seen_keep), ("part", seen_part)):
+        for tag, lines in (("keep", seen_keep), ("gone", seen_part)):
             print("### %s: %d lines" % (tag, len(lines)), file=sys.stderr)
             for l in lines:
                 if "JOIN" in l.upper() or "366" in l:
                     print("###   %r" % l, file=sys.stderr)
 
-    # Restore the fixture: this case perturbs persistent state (the saved channel
-    # list), so it has to put it back or every later case runs against a bouncer
-    # that no longer auto-joins the channel — which is how it first made
-    # `playback` fail in a later run.
-    b.send("JOIN " + channel)
-    b.drain(2.0)
+    # Tidy up: the keep channel is now in the saved list, so remove it, and make
+    # sure the fixture channel is joined for the cases that follow.
     b.send("PART " + keep)
-    b.drain(2.0)
+    b.drain(1.5)
+    b.send("JOIN " + channel)
+    b.drain(1.5)
 
     return {
         "kept_after_reconnect": kept,
         "parted_channel_came_back": back,
-        # One verdict, false if the control failed, so the case cannot pass on
-        # two matching silences.
+        # False whenever the control failed, so two matching silences cannot look
+        # like agreement.
         "chansaver_ok": kept and not back,
     }
 
