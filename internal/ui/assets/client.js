@@ -19,6 +19,7 @@
   var searchEl = document.getElementById("search");
   var resultsEl = document.getElementById("results");
   var nicksEl = document.getElementById("nicks");
+  var topicEl = document.getElementById("topic");
 
   // -- ANSI → HTML ----------------------------------------------------------
   // Only the sequences the server actually emits: SGR colour (8-bit, which the
@@ -142,6 +143,18 @@
           '<span class="name">' + label + "</span>" + badge + "</div>";
       }
       listEl.innerHTML = html;
+    }
+
+    // The topic is a header, not a message: one line per window, replaced when it
+    // changes. The server sends the string; the client decides where it goes.
+    if (topicEl) {
+      if (f.topic) {
+        topicEl.textContent = f.topic;
+        topicEl.hidden = false;
+      } else {
+        topicEl.textContent = "";
+        topicEl.hidden = true;
+      }
     }
 
     // The nick panel is the browser's version of the TUI's nick column: same data,

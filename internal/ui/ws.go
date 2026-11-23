@@ -48,6 +48,10 @@ type Frame struct {
 	Nicks      []Nick         `json:"nicks,omitempty"`
 	NickCounts map[string]int `json:"nickcounts,omitempty"`
 
+	// Topic is the active window's topic. State, not a line: it is replaced rather
+	// than appended, and the client shows one.
+	Topic string `json:"topic,omitempty"`
+
 	// Input mirrors the model's input buffer, so a second device attached to the
 	// same bouncer sees what is being typed. Empty means nothing in flight.
 	Input string `json:"input,omitempty"`
@@ -121,6 +125,7 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 			Mentions:   p.model.Mentions(),
 			Nicks:      p.model.Nicklist(p.model.Active()),
 			NickCounts: p.model.NickCounts(),
+			Topic:      p.model.Topic(p.model.Active()),
 		}, p.rev
 	}
 

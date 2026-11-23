@@ -74,6 +74,10 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   div.results .hl { color: #ffd76b; font-weight: 600; }
   div.results .hn { color: #8fb7ff; }
   div.wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  div.topic { padding: 4px 12px; background: #14141d; color: #8e8eaa;
+    border-bottom: 1px solid #2a2a3a;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   div.banner { padding: 6px 12px; background: #5a2020; color: #ffdede;
     font: 13px ui-monospace, monospace; }
   pre.term-container { flex: 1; margin: 0; padding: 12px; overflow: auto;
@@ -105,6 +109,7 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 <aside class="windows" id="windows"><h2>windows</h2></aside>
 <div class="wrap">
 <div class="banner" id="banner" hidden></div>
+<div class="topic" id="topic" hidden></div>
 <div class="searchbar">
   <input id="search" placeholder="search scrollback (enter to run, esc to clear)">
 </div>

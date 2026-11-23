@@ -72,6 +72,14 @@ type Nick struct {
 	Prefix string `json:"prefix,omitempty"`
 }
 
+// Topic is the message a transport sends when a channel's topic is known or
+// changes. It is a message of its own because a topic is replaced rather than
+// appended: putting it in the scrollback would leave every old topic on screen.
+type Topic struct {
+	Window string
+	Text   string
+}
+
 // Sent is the message a transport sends when the user submitted a line.
 type Sent struct{ Text string }
 
@@ -96,6 +104,12 @@ type Model struct {
 	// message. It is separate from windows because membership is not scrollback:
 	// it has no history, and a channel window shows exactly one of them.
 	nicks map[string][]Nick
+
+	// topics is the current topic per channel. Empty means either "no topic" or
+	// "not told yet"; the two are not distinguished because both render as an
+	// absent header, and inventing a third state would be a distinction with no
+	// visible difference.
+	topics map[string]string
 
 	input   []rune
 	scroll  int
@@ -171,6 +185,13 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+
+	case Topic:
+		if m.topics == nil {
+			m.topics = make(map[string]string, 4)
+		}
+		m.topics[msg.Window] = msg.Text
 		return m, nil
 
 	case Nicklist:
@@ -312,7 +333,10 @@ var (
 	// the terminal's own theme.
 	mentionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("222")).Bold(true)
 	// opStyle marks channel operators in the nick column, in the same palette.
-	opStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
+	opStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
+	// topicStyle is deliberately dimmer than a nickname: a topic is context, not
+	// conversation, and it is on screen constantly.
+	topicStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	borderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
 	nickStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
 	timeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
@@ -358,6 +382,14 @@ func (m Model) View() string {
 	b.WriteString(titleStyle.Render(m.active))
 	if m.scroll > 0 {
 		b.WriteString(systemStyle.Render(fmt.Sprintf(" (scroll %d)", m.scroll)))
+	}
+	// The topic sits on the title row, which is where every IRC client puts it and
+	// the only place it can be seen without stealing a line from the conversation.
+	if topic := m.topics[m.active]; topic != "" {
+		room := width - lipgloss.Width(b.String()) - 6
+		if room > 12 {
+			b.WriteString(topicStyle.Render("  " + truncateTo(topic, room)))
+		}
 	}
 	head := lipgloss.Width(b.String()) + lipgloss.Width(borderStyle.Render(" ╮"))
 	if pad := width - head; pad > 0 {
@@ -459,6 +491,18 @@ func nickColumn(nicks []Nick, width, n int) []string {
 		}
 	}
 	return out
+}
+
+// truncateTo shortens a string to fit a display width, adding an ellipsis. Width
+// and not length: a topic with a wide glyph must not overflow the border.
+func truncateTo(text string, width int) string {
+	if lipgloss.Width(text) <= width {
+		return text
+	}
+	if width <= 1 {
+		return ""
+	}
+	return lipgloss.NewStyle().MaxWidth(width-1).Render(text) + "…"
 }
 
 func styleLine(l Line, width int) string {
@@ -606,3 +650,7 @@ func (m Model) NickCounts() map[string]int {
 	}
 	return out
 }
+
+// Topic returns the current topic of a window, "" if it has none or we have not
+// been told.
+func (m Model) Topic(window string) string { return m.topics[window] }

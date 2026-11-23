@@ -44,7 +44,11 @@ type Transport struct {
 	// KICK/NICK keep it current after that. It lives in the transport because it is
 	// wire knowledge - the model does not know what a "353" is, and should not.
 	members map[string]map[string]string
-	active  string
+	// topics is the current topic per channel. It is state, not scrollback: a
+	// topic is replaced, not appended to, and the whole point of showing it is
+	// that it is the current answer to "what is this channel for".
+	topics map[string]string
+	active string
 
 	outq chan string
 	msgs chan tea.Msg
@@ -66,6 +70,7 @@ func Dial(addr string) (*Transport, error) {
 		windows: make(map[string]bool),
 		own:     make(map[string]bool),
 		members: make(map[string]map[string]string),
+		topics:  make(map[string]string),
 		active:  "status",
 		outq:    make(chan string, 64),
 		msgs:    make(chan tea.Msg, 256),
@@ -358,6 +363,30 @@ func (t *Transport) handle(raw []byte) {
 		}))
 		return
 
+	case "TOPIC":
+		// A topic change is state, so it updates the header; it is also news, so
+		// it goes in the window as a line. Both, because "the topic changed" is
+		// exactly the moment a user wants to know what it changed to.
+		fields := strings.SplitN(params, " ", 2)
+		if len(fields) >= 2 {
+			channel := fields[0]
+			topic := strings.TrimPrefix(fields[1], ":")
+			t.setTopic(channel, topic)
+			t.push(Incoming(Line{
+				Window: channel,
+				Nick:   from,
+				Text:   "set the topic: " + topic,
+				Kind:   LineSystem,
+			}))
+			return
+		}
+		t.push(Incoming(Line{
+			Window: "status",
+			Text:   strings.TrimSpace(from + " " + verb + " " + params),
+			Kind:   LineSystem,
+		}))
+		return
+
 	case "MODE":
 		// Membership changes are status events rather than conversation, unless
 		// they happen in a window the user is in — the model has no per-window
@@ -373,6 +402,24 @@ func (t *Transport) handle(raw []byte) {
 		// The bouncer normally answers its own PINGs, but a direct connection to
 		// an IRCd does not; answering here keeps both cases working.
 		t.Send("PONG " + params)
+		return
+	}
+
+	// 332 is the topic reply: "332 me #chan :the topic". 331 says there is none.
+	// Both belong in the channel's header, not its scrollback: a topic is current
+	// state that gets replaced, and leaving a copy in the conversation would show
+	// every old topic forever.
+	if verb == "332" {
+		fields := strings.SplitN(params, " ", 3)
+		if len(fields) >= 3 {
+			t.setTopic(fields[1], strings.TrimPrefix(fields[2], ":"))
+		}
+		return
+	}
+	if verb == "331" {
+		if fields := strings.Fields(params); len(fields) >= 2 {
+			t.setTopic(fields[1], "")
+		}
 		return
 	}
 
@@ -486,6 +533,16 @@ func rank(prefix string) int {
 		return 1
 	}
 	return 0
+}
+
+// setTopic records a channel's current topic and tells the UI. An empty topic is a
+// real state - "there is no topic" is different from "we have not been told" - so it
+// is recorded rather than deleted.
+func (t *Transport) setTopic(channel, topic string) {
+	t.mu.Lock()
+	t.topics[channel] = topic
+	t.mu.Unlock()
+	t.push(Topic{Window: channel, Text: topic})
 }
 
 // addMember records one nick in one channel.

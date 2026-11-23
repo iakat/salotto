@@ -649,3 +649,142 @@ func TestNickJSONFieldNames(t *testing.T) {
 		t.Fatalf("a plain Nick marshals to %s", got)
 	}
 }
+
+// TestTopicReplyBecomesState pins that a topic is state, not scrollback. A 332 in
+// the conversation would leave every old topic on screen forever, and the current
+// one would be indistinguishable from a description of the past.
+func TestTopicReplyBecomesState(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":irc.test 332 me #c :the current topic")
+
+	got := collectTopic(t, tr)
+	if got.Window != "#c" || got.Text != "the current topic" {
+		t.Fatalf("topic = %+v", got)
+	}
+}
+
+// TestNoTopicIsARealState pins that 331 is recorded rather than ignored. "This
+// channel has no topic" is an answer; treating it as silence means a channel whose
+// topic was just cleared keeps showing the old one.
+func TestNoTopicIsARealState(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":irc.test 331 me #c :No topic is set")
+
+	got := collectTopic(t, tr)
+	if got.Window != "#c" || got.Text != "" {
+		t.Fatalf("topic = %+v", got)
+	}
+}
+
+// TestTopicChangeUpdatesStateAndSaysSo pins both halves of a live topic change:
+// the header is replaced AND the window shows what happened. "The topic changed" is
+// precisely the moment a user wants to know what it changed to.
+func TestTopicChangeUpdatesStateAndSaysSo(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":alice!a@h TOPIC #c :a new topic")
+
+	// The state message and the line both arrive; order is not asserted because
+	// they are two independent messages about one event.
+	deadline := time.After(5 * time.Second)
+	var sawTopic, sawLine bool
+	for !sawTopic || !sawLine {
+		select {
+		case msg, ok := <-tr.Msgs():
+			if !ok {
+				t.Fatal("transport closed")
+			}
+			switch m := msg.(type) {
+			case Topic:
+				if m.Window == "#c" && m.Text == "a new topic" {
+					sawTopic = true
+				}
+			case Incoming:
+				if Line(m).Window == "#c" && strings.Contains(Line(m).Text, "a new topic") {
+					sawLine = true
+				}
+			}
+		case <-deadline:
+			t.Fatalf("sawTopic=%v sawLine=%v", sawTopic, sawLine)
+		}
+	}
+}
+
+// collectTopic reads until a Topic message arrives.
+func collectTopic(t *testing.T, tr *Transport) Topic {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg, ok := <-tr.Msgs():
+			if !ok {
+				t.Fatal("transport closed before a topic arrived")
+			}
+			if tp, ok := msg.(Topic); ok {
+				return tp
+			}
+		case <-deadline:
+			t.Fatal("no topic message arrived")
+		}
+	}
+}
+
+// TestTopicReachesTheFrame pins that the browser is told, and that it is a field
+// rather than a line: the client draws one topic, so a missing field means no
+// header at all.
+func TestTopicReachesTheFrame(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "hi"}))
+	p.Step(Topic{Window: "#c", Text: "welcome to the channel"})
+
+	srv := newWSServer(t, p)
+	_, f := wsDial(t, srv)
+	if f.Topic != "welcome to the channel" {
+		t.Fatalf("frame topic = %q", f.Topic)
+	}
+}
+
+// TestTopicSurvivesAWindowSwitch pins the header follows the window. A topic shown
+// for the wrong channel is worse than none: it is confidently wrong.
+func TestTopicSurvivesAWindowSwitch(t *testing.T) {
+	Configure()
+	p := NewProgram("#one", nil)
+	p.Step(Incoming(Line{Window: "#two", Nick: "a", Text: "hi"}))
+	p.Step(Topic{Window: "#one", Text: "topic one"})
+	p.Step(Topic{Window: "#two", Text: "topic two"})
+
+	srv := newWSServer(t, p)
+	c, f := wsDial(t, srv)
+	if f.Topic != "topic one" {
+		t.Fatalf("on #one the topic is %q", f.Topic)
+	}
+
+	if err := c.WriteJSON(Frame{Type: "select", Active: "#two"}); err != nil {
+		t.Fatal(err)
+	}
+	f = readState(t, c, 5*time.Second, func(f Frame) bool { return f.Active == "#two" })
+	if f.Topic != "topic two" {
+		t.Fatalf("on #two the topic is %q", f.Topic)
+	}
+}
