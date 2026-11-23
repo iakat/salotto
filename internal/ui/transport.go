@@ -35,7 +35,10 @@ type Transport struct {
 	// own convention and what the model's initial window is called.
 	mu      sync.Mutex
 	windows map[string]bool
-	active  string
+	// own is the set of nicks this connection holds. A bouncer can be holding
+	// more than one during a nick collision, so this is a set and not a string.
+	own    map[string]bool
+	active string
 
 	outq chan string
 	msgs chan tea.Msg
@@ -55,6 +58,7 @@ func Dial(addr string) (*Transport, error) {
 		conn:    conn,
 		br:      bufio.NewReaderSize(conn, 64*1024),
 		windows: make(map[string]bool),
+		own:     make(map[string]bool),
 		active:  "status",
 		outq:    make(chan string, 64),
 		msgs:    make(chan tea.Msg, 256),
@@ -240,7 +244,48 @@ func (t *Transport) handle(raw []byte) {
 		t.push(Incoming(Line{Window: window, Nick: from, Text: text, Kind: kind}))
 		return
 
-	case "JOIN", "PART", "QUIT", "NICK", "KICK", "MODE":
+	case "JOIN":
+		// Our own JOIN is what opens a window. Everything else about membership
+		// stays in status, because the model has no per-window membership table
+		// and inventing one to show "bob joined #x" in #x would be a second
+		// source of truth for who is where.
+		//
+		// The channel is the first parameter, minus a leading ":" when the server
+		// sends the extended-join form (":ournick JOIN #chan account :realname").
+		channel, _, _ := strings.Cut(strings.TrimPrefix(params, ":"), " ")
+		channel = strings.TrimSuffix(channel, ",")
+		if channel != "" && t.isSelf(from) {
+			t.note(channel)
+			t.push(Incoming(Line{
+				Window: channel,
+				Text:   "joined " + channel,
+				Kind:   LineSystem,
+			}))
+			return
+		}
+		t.push(Incoming(Line{
+			Window: "status",
+			Text:   strings.TrimSpace(from + " " + verb + " " + params),
+			Kind:   LineSystem,
+		}))
+		return
+
+	case "NICK":
+		// Our own nick change: the new nick is ours too, or every later line
+		// prefixed with it stops being recognised as self.
+		if t.isSelf(from) {
+			if fields := strings.Fields(strings.TrimPrefix(params, ":")); len(fields) > 0 {
+				t.noteSelf(fields[0])
+			}
+		}
+		t.push(Incoming(Line{
+			Window: "status",
+			Text:   strings.TrimSpace(from + " " + verb + " " + params),
+			Kind:   LineSystem,
+		}))
+		return
+
+	case "PART", "QUIT", "KICK", "MODE":
 		// Membership changes are status events rather than conversation, unless
 		// they happen in a window the user is in — the model has no per-window
 		// membership table, so status is the honest place.
@@ -256,6 +301,14 @@ func (t *Transport) handle(raw []byte) {
 		// an IRCd does not; answering here keeps both cases working.
 		t.Send("PONG " + params)
 		return
+	}
+
+	// 001 names the nick we are registered as; every later routing decision that
+	// asks "is this line about us" starts here.
+	if strings.HasPrefix(verb, "00") && len(verb) == 3 {
+		if fields := strings.Fields(params); len(fields) > 0 {
+			t.noteSelf(fields[0])
+		}
 	}
 
 	// Numerics and anything else are status. 001 also tells us our own nick,
@@ -283,6 +336,25 @@ func (t *Transport) windowFor(target, from string) string {
 	}
 	t.note(from)
 	return from
+}
+
+// isSelf reports whether a prefix nick is one of ours. A bouncer can hold more
+// than one nick at a time (nick plus altnick during a collision), so this is a set
+// and not a string compare; it is learned from 001 plus our own NICK changes.
+func (t *Transport) isSelf(nick string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.own[nick]
+}
+
+// noteSelf records a nick as ours.
+func (t *Transport) noteSelf(nick string) {
+	if nick == "" {
+		return
+	}
+	t.mu.Lock()
+	t.own[nick] = true
+	t.mu.Unlock()
 }
 
 func (t *Transport) note(window string) {

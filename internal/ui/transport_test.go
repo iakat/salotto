@@ -335,3 +335,59 @@ func TestQueuedMessagesAreDrainedAsTeaMsgs(t *testing.T) {
 		t.Fatalf("message is %T, want Incoming", msg)
 	}
 }
+
+// TestTransportOpensAWindowOnOurOwnJoin pins the routing rule that made the web
+// front end's /join look broken.
+//
+// A JOIN was always a status line. That is right for other people's joins, but
+// our OWN join is what creates the window: if it goes to status, the channel
+// exists in the bouncer and the UI never learns about it, so the sidebar stays at
+// one entry and a typed line has nowhere to go. The bouncer sends the JOIN only
+// after it accepted ours, so this line is the confirmation that the window is real.
+func TestTransportOpensAWindowOnOurOwnJoin(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	// 001 first: without knowing our own nick, no JOIN can be attributed to us.
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":me!m@h JOIN #fresh")
+	// And somebody else's join must still be status, not a window.
+	fb.inject(t, ":someone!s@h JOIN #someoneelse")
+
+	got := collectIncoming(t, tr, 3)
+	if got[0].Window != "status" {
+		t.Fatalf("001 routed to %q", got[0].Window)
+	}
+	if got[1].Window != "#fresh" {
+		t.Fatalf("our own JOIN routed to %q, want #fresh (the window never opens)", got[1].Window)
+	}
+	if got[2].Window != "status" {
+		t.Fatalf("another user's JOIN opened window %q", got[2].Window)
+	}
+}
+
+// TestTransportExtendedJoinOpensTheWindow is the same rule for the extended-join
+// form, which the IRCd sends when the client negotiated the capability:
+// ":me JOIN #chan account :realname". The channel is still the first parameter,
+// but it arrives with a leading colon and is followed by more fields, so a naive
+// split on the whole parameter string would name the window "#chan account".
+func TestTransportExtendedJoinOpensTheWindow(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":me!m@h JOIN :#ext account :Real Name")
+
+	got := collectIncoming(t, tr, 2)
+	if got[1].Window != "#ext" {
+		t.Fatalf("extended join routed to %q", got[1].Window)
+	}
+}
