@@ -5,7 +5,10 @@ package upstream
 // CTimer at 30 s (keepnick.cpp: Start(30000)); the interval is the same here so
 // the behaviour is recognisable, and it stops as soon as the nick is ours.
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // keepNickInterval is ZNC's CTimer interval in keepnick.cpp.
 const keepNickInterval = 30 * time.Second
@@ -42,4 +45,32 @@ func (c *Conn) keepNickLoop(stop <-chan struct{}) {
 			_ = c.Send([]byte("NICK " + want))
 		}
 	}
+}
+
+// NickCandidates is every nick this connection may be holding upstream: the one we
+// registered with, the one we asked for, and the alternate we fall back to on a 433.
+//
+// A single "current nick" is not enough to answer "is this line ours?" when the nick
+// can change under us. The deployed fixture has two bouncers sharing one IRCd, so
+// they trade the nick back and forth: salotto registers as "e2e", loses it on the
+// next reconnect, falls back to "e2e_", and a JOIN can arrive under either. ZNC does
+// not have this problem in the same way because it reads the nick from its own
+// IRCSock on every line.
+func (c *Conn) NickCandidates() []string {
+	out := make([]string, 0, 3)
+	add := func(n string) {
+		if n == "" {
+			return
+		}
+		for _, have := range out {
+			if strings.EqualFold(have, n) {
+				return
+			}
+		}
+		out = append(out, n)
+	}
+	add(c.CurrentNick())
+	add(c.cfg.Nick)
+	add(c.cfg.AltNick)
+	return out
 }

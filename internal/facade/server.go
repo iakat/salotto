@@ -152,6 +152,23 @@ func (n *nickCache) set(v string) {
 	n.mu.Unlock()
 }
 
+// OwnNicks is every nick the network may be holding upstream, current first. It is
+// what "is this line ours?" must consult: the live nick alone misses a line that
+// arrived while the nick was moving.
+func (s *Server) OwnNicks(network string) []string {
+	ne := s.network(network)
+	if ne == nil || ne.net == nil {
+		return nil
+	}
+	if src, ok := ne.net.(upstreamNickCandidates); ok {
+		return src.NickCandidates()
+	}
+	if n := ne.knownNick(); n != "" {
+		return []string{n}
+	}
+	return nil
+}
+
 // knownNick is the nick we hold upstream, as opposed to the nick the client chose:
 // a bouncer client routinely asks for a different one, and a client nick is not an
 // identity on the IRC side.

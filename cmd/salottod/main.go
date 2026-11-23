@@ -64,6 +64,10 @@ func (n *networkAdapter) Server() string { return n.conn.Server() }
 // upstream.Conn learned it; this is the wiring that makes it reachable.
 func (n *networkAdapter) Nick() string { return n.conn.CurrentNick() }
 
+// NickCandidates reports every nick this network may hold upstream, which is what
+// the facade needs to recognise our own lines. See upstream.Conn.NickCandidates.
+func (n *networkAdapter) NickCandidates() []string { return n.conn.NickCandidates() }
+
 func (n *networkAdapter) NickMask() string { return n.conn.NickMask() }
 
 func (n *networkAdapter) HasPassword() bool { return n.conn.HasPassword() }

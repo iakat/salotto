@@ -10,6 +10,15 @@ type upstreamNickSource interface {
 	Nick() string
 }
 
+// upstreamNickCandidates is the wider form: every nick the network may be holding
+// upstream right now. A single current nickname is not sufficient because the nick
+// can be taken from us between a rejoin and the JOIN that answers it — two bouncers
+// sharing one IRCd is enough for that — and the line then arrives under a nick we
+// used a moment ago.
+type upstreamNickCandidates interface {
+	NickCandidates() []string
+}
+
 func isNumericVerb(v []byte) bool {
 	if len(v) != 3 {
 		return false

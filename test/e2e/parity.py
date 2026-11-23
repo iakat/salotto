@@ -334,6 +334,26 @@ def case_connect_disconnect(b: Bouncer) -> dict:
     }
 
 
+def wait_connected(b: Bouncer, budget: float = 120.0) -> bool:
+    """Wait until the bouncer reports its upstream is connected.
+
+    Necessary before anything that depends on a line reaching the IRCd. A bouncer
+    accepts client lines while its upstream is down and simply drops them, and the
+    client cannot tell: its own line comes back from the replay buffer, so a naive
+    check (does a 366 for this channel appear?) matches history and proves nothing.
+    That is exactly how the chansaver control reported a join that never happened.
+    """
+    end = time.time() + budget
+    while time.time() < end:
+        lines = b.cmd("ListNetworks", seconds=2.0)
+        text = " ".join(lines)
+        # ZNC prints "Connected" in the Connected column; salotto prints "on irc".
+        if re.search(r"\bConnected\b", text) or re.search(r"\bon irc\b", text, re.I):
+            return True
+        time.sleep(3.0)
+    return False
+
+
 def join_and_confirm(b: Bouncer, channel: str, budget: float = 90.0) -> bool:
     """Join a channel and wait for RPL_ENDOFNAMES (366), retrying.
 
@@ -346,10 +366,20 @@ def join_and_confirm(b: Bouncer, channel: str, budget: float = 90.0) -> bool:
     366 is the honest proof the join landed, because the server answers it and the
     bouncer can only relay what it received. Returns whether it landed.
     """
+    # The upstream has to be up, or the join is dropped on the floor and the 366 we
+    # might see is replayed history rather than a fresh answer.
+    if not wait_connected(b):
+        return False
+    # Clear anything already buffered so a replayed 366 cannot be mistaken for the
+    # answer to this join.
+    b.drain(1.5)
     end = time.time() + budget
     while time.time() < end:
         b.send("JOIN " + channel)
         for line in b.drain(6.0):
+            # A replay line carries a batch tag; a live answer does not.
+            if "batch=" in line and "-replay" in line:
+                continue
             if " 366 " in line and channel.lower() in line.lower():
                 return True
     return False
@@ -370,11 +400,20 @@ def _reconnect_and_watch(b: Bouncer, needle: str, budget: float = 75.0) -> tuple
     seen: list[str] = []
     b.cmd("Disconnect", seconds=2.5)
     seen.extend(b.cmd("Connect", seconds=2.5))
+
+    def is_live_join(l: str) -> bool:
+        # A replayed line is tagged with its batch; replaying a past JOIN of this
+        # channel would otherwise look like a successful rejoin after a reconnect
+        # that never happened.
+        if "batch=" in l and "-replay" in l:
+            return False
+        return (" JOIN " in l) and (needle.lower() in l.lower())
+
     end = time.time() + budget
-    found = any((" JOIN " in l) and (needle.lower() in l.lower()) for l in seen)
+    found = any(is_live_join(l) for l in seen)
     while not found and time.time() < end:
         seen.extend(b.drain(0.5))
-        found = any((" JOIN " in l) and (needle.lower() in l.lower()) for l in seen)
+        found = any(is_live_join(l) for l in seen)
     return found, seen
 
 

@@ -145,9 +145,34 @@ func (c *channelSet) noteSelfJoinPart(line []byte, ownNick string) bool {
 	if ownNick == "" {
 		return false
 	}
+	return c.noteSelfJoinPartAny(line, []string{ownNick})
+}
+
+// noteSelfJoinPartAny is noteSelfJoinPart against every nick we may be holding.
+//
+// The single-nick form is wrong whenever the nick moves between the JOIN we send and
+// the JOIN the server echoes back: with two bouncers on one IRCd they trade the nick,
+// so the line can arrive as `:e2e` while we believe we are `e2e_`. The result was a
+// chansaver that recorded nothing and never re-joined anything, while each individual
+// piece looked correct.
+func (c *channelSet) noteSelfJoinPartAny(line []byte, ownNicks []string) bool {
+	if len(ownNicks) == 0 {
+		return false
+	}
 	_, rest := ircline.Tags(line)
 	prefix, rest := ircline.Prefix(rest)
-	if from := ircline.Nick(prefix); from == "" || !strings.EqualFold(from, ownNick) {
+	from := ircline.Nick(prefix)
+	if from == "" {
+		return false
+	}
+	mine := false
+	for _, n := range ownNicks {
+		if strings.EqualFold(from, n) {
+			mine = true
+			break
+		}
+	}
+	if !mine {
 		return false
 	}
 
