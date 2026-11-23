@@ -8,6 +8,10 @@ import (
 	"github.com/iakat/salotto/internal/ircline"
 )
 
+// defaultAwayReason is simple_away's SIMPLE_AWAY_DEFAULT_REASON
+// (simple_away.cpp:21).
+const defaultAwayReason = "Auto away at %awaytime%"
+
 // away is ZNC's simple_away module: when the last client detaches, wait a while
 // and then mark the user away on IRC; when a client attaches again, come back.
 //
@@ -95,7 +99,10 @@ func (a *away) clientDetached() {
 func (a *away) fire() {
 	a.mu.Lock()
 	a.timer = nil
-	reason := a.reason
+	// Expand at fire time, not at detach: %awaytime% means the moment you were
+	// actually marked away, which is also when the timer ran (simple_away.cpp:213
+	// expands inside SetAway).
+	reason := expandAwayTime(a.reason, time.Now())
 	a.weSet = true
 	// Counting starts now, not at detach: the count answers "what arrived while
 	// the server said I was gone", which is the only interval the module owns.
@@ -103,8 +110,10 @@ func (a *away) fire() {
 	a.mu.Unlock()
 
 	if reason == "" {
-		a.send("AWAY")
-		return
+		// ZNC never sends an empty reason: ExpandReason falls back to the default
+		// (simple_away.cpp:211). An unconfigured reason therefore still says
+		// "Auto away at <time>".
+		reason = expandAwayTime(defaultAwayReason, time.Now())
 	}
 	a.send("AWAY :" + reason)
 }
@@ -137,14 +146,22 @@ func (a *away) reasonText(now time.Time) string {
 	return expandAwayTime(r, now)
 }
 
-// expandAwayTime replaces ZNC's %awaytime% token with a timestamp. ZNC expands a
-// wider substitution language; the one token the default reason uses is the one
-// implemented, because a token nobody sends is a feature nobody has asked for.
+// expandAwayTime replaces ZNC's %awaytime% token with a timestamp.
+//
+// The format is not a choice: simple_away expands the token with
+// `CUtils::CTime(iTime, "Etc/UTC") + " UTC"` (simple_away.cpp:213-215), and
+// CUtils::CTime is `FormatTime(t, "%c", tz)` (Utils.cpp:510-512). In the C locale
+// that is "%a %b %e %H:%M:%S %Y", which is Go's "Mon Jan _2 15:04:05 2006" — note
+// the space-padded day, so a single-digit date is "Nov  3", not "Nov 03".
+//
+// ZNC also runs ExpandString over the result, which is a wider substitution
+// language. Only the one token the default reason uses is implemented: a token
+// nobody sends is a feature nobody has asked for.
 func expandAwayTime(reason string, now time.Time) string {
 	if !strings.Contains(reason, "%awaytime%") {
 		return reason
 	}
-	return strings.ReplaceAll(reason, "%awaytime%", now.Format("2006-01-02 15:04:05"))
+	return strings.ReplaceAll(reason, "%awaytime%", now.UTC().Format("Mon Jan _2 15:04:05 2006")+" UTC")
 }
 
 // handleAway intercepts a client's AWAY: it records whether the user set the

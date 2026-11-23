@@ -128,15 +128,42 @@ func TestAwayDisabledNeverFires(t *testing.T) {
 	}
 }
 
-// TestAwayReasonExpandsTime checks the %awaytime% substitution the default
-// reason uses (simple_away.cpp:13).
+// TestAwayReasonExpandsTime pins the %awaytime% substitution to ZNC's actual
+// format rather than a nicer-looking one. simple_away expands it with
+// CUtils::CTime(iTime, "Etc/UTC") + " UTC" (simple_away.cpp:213-215), and
+// CUtils::CTime is FormatTime(t, "%c", tz) (Utils.cpp:510-512), which in the C
+// locale is "%a %b %e %H:%M:%S %Y". The space-padded day matters: the 3rd of
+// November formats as "Nov  3", with two spaces.
 func TestAwayReasonExpandsTime(t *testing.T) {
 	now := time.Date(2026, 11, 23, 15, 4, 5, 0, time.UTC)
-	if got := expandAwayTime("Auto away at %awaytime%", now); got != "Auto away at 2026-11-23 15:04:05" {
-		t.Fatalf("expansion: %q", got)
+	if got, want := expandAwayTime("Auto away at %awaytime%", now), "Auto away at Mon Nov 23 15:04:05 2026 UTC"; got != want {
+		t.Fatalf("expansion: %q, want %q", got, want)
+	}
+	// A single-digit day keeps %e's leading space.
+	single := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
+	if got, want := expandAwayTime("%awaytime%", single), "Tue Nov  3 09:00:00 2026 UTC"; got != want {
+		t.Fatalf("single-digit day: %q, want %q", got, want)
 	}
 	if got := expandAwayTime("plain", now); got != "plain" {
 		t.Fatalf("a reason without the token was rewritten: %q", got)
+	}
+}
+
+// TestAwayEmptyReasonFallsBackToTheDefault: ZNC never sends an empty AWAY —
+// ExpandReason substitutes SIMPLE_AWAY_DEFAULT_REASON (simple_away.cpp:211), so an
+// operator who sets no reason still gets "Auto away at <time>".
+func TestAwayEmptyReasonFallsBackToTheDefault(t *testing.T) {
+	rec := &awayRecorder{}
+	a := newAway(true, "", 5*time.Millisecond, rec.send)
+	a.clientDetached()
+	time.Sleep(40 * time.Millisecond)
+
+	got := rec.got()
+	if len(got) != 1 {
+		t.Fatalf("sent %v, want one AWAY", got)
+	}
+	if !strings.HasPrefix(got[0], "AWAY :Auto away at ") || !strings.HasSuffix(got[0], " UTC") {
+		t.Fatalf("empty reason did not fall back to the default: %q", got[0])
 	}
 }
 

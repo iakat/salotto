@@ -318,6 +318,26 @@ def case_connect_disconnect(b: Bouncer) -> dict:
     }
 
 
+def case_chansaver(b: Bouncer, channel: str) -> dict:
+    """Part a channel, then force a reconnect: chansaver's job is that what the
+    saved list says is what comes back. Observable through Disconnect/Connect,
+    which exercises the same rejoin path on both sides without restarting either
+    bouncer.
+
+    The parity question is not "did it save the part" (ZNC's module flips a
+    per-channel InConfig flag on our own PART, chansaver.cpp:69-92) but "does a
+    PART inside a session survive a reconnect" — it must, and then the channel
+    must not come back.
+    """
+    b.send("PART " + channel)
+    b.drain(1.0)
+    b.cmd("Disconnect", seconds=1.5)
+    b.cmd("Connect", seconds=3.0)
+    lines = b.drain(6.0)
+    rejoin = any((" JOIN " in l) and (channel.lower() in l.lower()) for l in lines)
+    return {"rejoined_after_part": rejoin}
+
+
 def run(host: str, port: int, nick: str, dialect: str, password: str | None, channel: str) -> dict:
     b = Bouncer(host, port, nick, dialect, password)
     out: dict[str, dict] = {}
@@ -334,6 +354,7 @@ def run(host: str, port: int, nick: str, dialect: str, password: str | None, cha
         out["listservers"] = case_listservers(b)
         out["listclients"] = case_listclients(b)
         out["traffic"] = case_traffic(b)
+        out["chansaver"] = case_chansaver(b, channel)
     finally:
         b.close()
     return out
