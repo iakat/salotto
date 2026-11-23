@@ -281,11 +281,28 @@ func (t *Transport) handle(raw []byte) {
 		channel, _, _ := strings.Cut(strings.TrimPrefix(params, ":"), " ")
 		channel = strings.TrimSuffix(channel, ",")
 		if channel != "" && from != "" && !t.isSelf(from) {
-			// Somebody else joined a channel we know about: membership changed,
-			// so the nicklist has to follow or it lists people who left and misses
-			// people who arrived.
+			// Somebody else joined. The line goes in the channel only if WE are in
+			// it: a join is about that channel, and filing it in status leaves a
+			// status window full of other people's arrivals and a channel that never
+			// says who came. But a stranger joining a channel we are not in is not
+			// our conversation, and opening nothing for it is the right answer.
+			if !t.knowsChannel(channel) {
+				t.push(Incoming(Line{
+					Window: "status",
+					Text:   strings.TrimSpace(from + " " + verb + " " + params),
+					Kind:   LineSystem,
+				}))
+				return
+			}
 			t.addMember(channel, from)
 			t.publishMembers(channel)
+			t.push(Incoming(Line{
+				Window: channel,
+				Nick:   from,
+				Text:   "joined",
+				Kind:   LineJoin,
+			}))
+			return
 		}
 		if channel != "" && t.isSelf(from) {
 			t.note(channel)
@@ -339,6 +356,17 @@ func (t *Transport) handle(raw []byte) {
 			channel := strings.TrimSuffix(fields[0], ",")
 			t.removeMember(channel, fields[1])
 			t.publishMembers(channel)
+			reason := ""
+			if len(fields) >= 3 {
+				reason = " (" + strings.TrimPrefix(strings.Join(fields[2:], " "), ":") + ")"
+			}
+			t.push(Incoming(Line{
+				Window: channel,
+				Nick:   from,
+				Text:   "kicked " + fields[1] + reason,
+				Kind:   LineKick,
+			}))
+			return
 		}
 		t.push(Incoming(Line{
 			Window: "status",
@@ -351,10 +379,21 @@ func (t *Transport) handle(raw []byte) {
 		// A part removes the parting nick from the channel it names.
 		fields := strings.Fields(params)
 		if len(fields) >= 1 && from != "" {
+			reason := ""
+			if len(fields) >= 2 {
+				reason = " (" + strings.TrimPrefix(strings.Join(fields[1:], " "), ":") + ")"
+			}
 			for _, channel := range strings.Split(fields[0], ",") {
 				t.removeMember(channel, from)
 				t.publishMembers(channel)
+				t.push(Incoming(Line{
+					Window: channel,
+					Nick:   from,
+					Text:   "left" + reason,
+					Kind:   LinePart,
+				}))
 			}
+			return
 		}
 		t.push(Incoming(Line{
 			Window: "status",
@@ -365,7 +404,22 @@ func (t *Transport) handle(raw []byte) {
 
 	case "QUIT":
 		// A quit removes the nick from every channel: one departure, several
-		// lists.
+		// lists. It is also news in every channel the nick was in, because that is
+		// where the user noticed them - a quit filed only in status means a nick
+		// silently disappears from the nicklist with no explanation.
+		reason := strings.TrimPrefix(strings.TrimSpace(params), ":")
+		for _, channel := range t.channelsOf(from) {
+			text := "quit"
+			if reason != "" {
+				text = "quit (" + reason + ")"
+			}
+			t.push(Incoming(Line{
+				Window: channel,
+				Nick:   from,
+				Text:   text,
+				Kind:   LineQuit,
+			}))
+		}
 		t.removeEverywhere(from)
 		t.push(Incoming(Line{
 			Window: "status",
@@ -672,6 +726,30 @@ func (t *Transport) setTopic(channel, topic string) {
 	t.topics[channel] = topic
 	t.mu.Unlock()
 	t.push(Topic{Window: channel, Text: topic})
+}
+
+// knowsChannel reports whether we are in a channel, which decides whether somebody
+// else's arrival belongs in that window or in status.
+func (t *Transport) knowsChannel(channel string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.members[channel]
+	return ok
+}
+
+// channelsOf lists the channels a nick is a member of, so a quit can be reported
+// where the user saw the nick rather than only in status.
+func (t *Transport) channelsOf(nick string) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []string
+	for channel, set := range t.members {
+		if _, ok := set[nick]; ok {
+			out = append(out, channel)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // addMember records one nick in one channel.

@@ -1063,3 +1063,230 @@ func TestOwnJoinAsksForTheModes(t *testing.T) {
 		}
 	}
 }
+
+// TestFrameCarriesBodyNotJustRender pins the fix for the box inside a box. The page
+// already has a sidebar, a header, an input row and a footer; handing it the TUI's
+// framed View put a second frame around the conversation and a second input line
+// under it.
+func TestFrameCarriesBodyNotJustRender(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Resize(80, 24)
+	p.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "hello there"}))
+
+	srv := newWSServer(t, p)
+	_, f := wsDial(t, srv)
+
+	if len(f.Body) == 0 {
+		t.Fatal("no body lines: the browser would have to draw the TUI's frame")
+	}
+	if f.Cols == 0 || f.Rows == 0 {
+		t.Fatalf("frame reports %dx%d; the client cannot tell whether it needs a resize", f.Cols, f.Rows)
+	}
+	for _, line := range f.Body {
+		// The TUI's frame characters must not be in the body: their presence is
+		// exactly the box-in-a-box bug.
+		if strings.ContainsAny(line, "\u256d\u256e\u2570\u256f") {
+			t.Fatalf("body line carries the TUI border: %q", line)
+		}
+	}
+	joined := strings.Join(f.Body, "\n")
+	if !strings.Contains(joined, "hello there") {
+		t.Fatalf("body does not contain the message: %q", joined)
+	}
+}
+
+// TestResizeChangesWhatIsRendered pins that a resize actually reaches the model. A
+// phone and a desktop get different line counts, and a client that reports its size
+// and is ignored is worse than one that never reports it.
+func TestResizeChangesWhatIsRendered(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Resize(40, 12)
+	narrow := len(p.Model().Body(40, 12))
+
+	p.Resize(120, 40)
+	wide := len(p.Model().Body(120, 40))
+
+	if wide <= narrow {
+		t.Fatalf("a bigger viewport rendered %d lines, the smaller one %d", wide, narrow)
+	}
+	if p.Model().Width() != 120 || p.Model().Height() != 40 {
+		t.Fatalf("model size is %dx%d", p.Model().Width(), p.Model().Height())
+	}
+}
+
+// TestResizeHasAFloor pins that a hostile or silly size cannot make the render
+// impossible: a zero-width window would divide by zero somewhere, and a negative one
+// is a crash waiting for the first phone that reports it.
+func TestResizeHasAFloor(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Resize(1, 1)
+	if p.Model().Width() < 20 || p.Model().Height() < 6 {
+		t.Fatalf("size is %dx%d, want at least 20x6", p.Model().Width(), p.Model().Height())
+	}
+	p.Resize(-5, -5)
+	if p.Model().Width() < 20 || p.Model().Height() < 6 {
+		t.Fatalf("negative size produced %dx%d", p.Model().Width(), p.Model().Height())
+	}
+}
+
+// TestKeystrokesReachTheModelsBuffer pins that the browser types into the MODEL's
+// buffer, not into a parallel string. That is what gives it the same history,
+// completion and command handling as the TUI instead of a second implementation.
+func TestKeystrokesReachTheModelsBuffer(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+
+	p.Key("", "h")
+	p.Key("", "i")
+	if got := p.Model().Input(); got != "hi" {
+		t.Fatalf("buffer after two keystrokes = %q, want %q", got, "hi")
+	}
+
+	p.Key("backspace", "")
+	if got := p.Model().Input(); got != "h" {
+		t.Fatalf("buffer after backspace = %q, want %q", got, "h")
+	}
+
+	p.Key("esc", "")
+	if got := p.Model().Input(); got != "" {
+		t.Fatalf("buffer after escape = %q, want empty", got)
+	}
+}
+
+// TestEnterSubmitsThroughTheModel pins that Enter goes through updateKey like every
+// other keystroke. A client that sends its own text would bypass the command mapping
+// and the local echo, and the two front ends would drift.
+func TestEnterSubmitsThroughTheModel(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	p.Key("", "/join #x")
+	p.Key("enter", "")
+
+	if got := p.Model().Input(); got != "" {
+		t.Fatalf("the buffer was not cleared by Enter: %q", got)
+	}
+	// The line is echoed locally, which is how a test can see that Enter submitted
+	// rather than merely cleared.
+	body := strings.Join(p.Model().Body(80, 20), "\n")
+	if !strings.Contains(body, "/join #x") {
+		t.Fatalf("Enter did not submit the line; body is %q", body)
+	}
+}
+
+// TestKeyMessageOverTheSocket pins the wire path, not just the method: the browser
+// sends {"type":"key","runes":"x"} and the buffer must grow.
+func TestKeyMessageOverTheSocket(t *testing.T) {
+	Configure()
+	p := NewProgram("#c", nil)
+	srv := newWSServer(t, p)
+	c, _ := wsDial(t, srv)
+
+	if err := c.WriteJSON(Frame{Type: "key", Runes: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WriteJSON(Frame{Type: "key", Runes: "b"}); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.Model().Input() == "ab" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("buffer over the socket = %q, want %q", p.Model().Input(), "ab")
+}
+
+// TestClickOnTheNameSelectsTheWindow pins the sidebar bug in the client source. The
+// row is built from spans, so a handler reading e.target gets the <span> and finds no
+// data-window - only the empty space beside the text worked.
+func TestClickOnTheNameSelectsTheWindow(t *testing.T) {
+	js := clientJSSource(t)
+	if !strings.Contains(js, "closest(\"[data-window]\")") {
+		t.Fatal("the window click handler reads e.target directly; clicking the name would do nothing")
+	}
+	if strings.Contains(js, "t.getAttribute(\"data-window\")") {
+		t.Fatal("the window click handler still reads data-window off the target")
+	}
+}
+
+// TestMobileHasDrawersNotJustHiddenSidebars pins that a phone can still change
+// channel. Hiding the sidebars is the obvious mobile fix and it removes the one
+// control a chat client must always offer.
+func TestMobileHasDrawersNotJustHiddenSidebars(t *testing.T) {
+	html := pageHTML(t)
+	if !strings.Contains(html, `id="show-windows"`) {
+		t.Fatal("no control to open the window list on a small screen")
+	}
+	if !strings.Contains(html, `id="show-nicks"`) {
+		t.Fatal("no control to open the nick list on a small screen")
+	}
+	css := html
+	if !strings.Contains(css, "body.show-windows aside.windows") {
+		t.Fatal("the drawer class is not styled, so opening it would do nothing")
+	}
+	// An input under 16px makes iOS zoom on focus, which is what makes a web chat
+	// unusable on a phone.
+	if !strings.Contains(css, "font-size: 16px") {
+		t.Fatal("the mobile input is smaller than 16px, so iOS will zoom on focus")
+	}
+}
+
+// TestClientReportsItsViewport pins that the browser tells the server how big it is.
+// Without it every phone gets the daemon's default width and every line wraps.
+func TestClientReportsItsViewport(t *testing.T) {
+	js := clientJSSource(t)
+	if !strings.Contains(js, `type: "resize"`) {
+		t.Fatal("the client never reports its size")
+	}
+	if !strings.Contains(js, "ResizeObserver") {
+		t.Fatal("the client does not react to its viewport changing")
+	}
+}
+
+// TestTheBodyFillsTheViewport pins that the conversation is as big as the space it
+// was given. A fixed small block in a large window is what a renderer that was never
+// told the size looks like, and it is the bug this pins shut.
+func TestTheBodyFillsTheViewport(t *testing.T) {
+	Configure()
+	m := New("#c")
+	m, _ = m.Step(tea.WindowSizeMsg{Width: 140, Height: 40})
+	for i := 0; i < 50; i++ {
+		m, _ = m.Step(Incoming(Line{Window: "#c", Nick: "a", Text: "line"}))
+	}
+
+	body := m.Body(m.Width(), m.Height()-3)
+	if len(body) != m.Height()-3 {
+		t.Fatalf("body is %d lines for a %d-row viewport, want %d", len(body), m.Height(), m.Height()-3)
+	}
+	for i, line := range body {
+		if !strings.Contains(line, "line") {
+			continue
+		}
+		// A rendered line must fit the width it was asked for, not some default.
+		if w := len([]rune(stripANSI(line))); w > m.Width() {
+			t.Fatalf("line %d is %d columns for a %d-column viewport", i, w, m.Width())
+		}
+	}
+}
+
+// stripANSI removes SGR sequences so a width assertion counts visible characters.
+func stripANSI(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			for i += 2; i < len(s); i++ {
+				if s[i] >= '@' && s[i] <= '~' {
+					break
+				}
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}

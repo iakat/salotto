@@ -27,6 +27,22 @@ const previewsInFrame = 3
 type Frame struct {
 	Type string `json:"type"`
 
+	// Body is the conversation as lines, already ANSI, without a frame. The browser
+	// draws its own chrome, so it gets the lines and not the TUI's box around them -
+	// which the page used to wrap in a second box.
+	Body []string `json:"body,omitempty"`
+
+	// Cols and Rows are the size this frame was rendered at, so the client knows
+	// whether it needs to ask for a re-render when its viewport changes.
+	Cols int `json:"cols,omitempty"`
+	Rows int `json:"rows,omitempty"`
+
+	// Key is a keystroke's name ("enter", "up", "backspace", ...) and Runes the
+	// printable text of one. They travel instead of the whole buffer because the
+	// model owns the buffer: a client that sent text would be a second one.
+	Key   string `json:"key,omitempty"`
+	Runes string `json:"runes,omitempty"`
+
 	// Render is the terminal output, already ANSI, for the client to convert.
 	// Sending the model's own View() verbatim is what keeps one renderer.
 	Render string `json:"render,omitempty"`
@@ -128,8 +144,23 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 	state := func() (Frame, uint64) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
+		// The browser draws its own chrome, so it gets the conversation without the
+		// TUI's frame. Rendering View() into a page that has a sidebar, a header, an
+		// input form and a footer put a box inside a box and printed the input line
+		// twice.
+		cols, rows := p.model.Width(), p.model.Height()
+		if cols < 20 {
+			cols = 20
+		}
+		bodyRows := rows - 3 // the page's header and input, not the render's own
+		if bodyRows < 3 {
+			bodyRows = 3
+		}
 		return Frame{
 			Type:       "state",
+			Body:       p.model.Body(cols, bodyRows),
+			Cols:       cols,
+			Rows:       rows,
 			Render:     p.model.View(),
 			Windows:    p.model.Windows(),
 			Active:     p.model.Active(),
@@ -203,8 +234,22 @@ func (p *Program) ServeWS(w http.ResponseWriter, r *http.Request) {
 			if f.Active != "" {
 				p.SetActiveWindow(f.Active)
 			}
+		case "resize":
+			// The browser is the only thing that knows its viewport, and a render
+			// wider than the screen wraps. Asking on every change is cheap: the
+			// model only stores two ints.
+			if f.Cols > 0 && f.Rows > 0 {
+				p.Resize(f.Cols, f.Rows)
+			}
+		case "key":
+			// A keystroke, not text: the browser sends what was pressed and the model
+			// decides what it means. This is the same door the TUI uses, so the
+			// buffer, history, completion and /command handling cannot diverge
+			// between the two front ends.
+			p.Key(f.Key, f.Runes)
 		case "input":
-			// Typing is mirrored but not committed: replace the buffer.
+			// Kept for a client that sets the whole buffer at once. Typing goes
+			// through "key" now.
 			p.SetInput(f.Text)
 		case "search":
 			// Search is answered in a frame of its own rather than through the

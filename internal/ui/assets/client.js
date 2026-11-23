@@ -115,9 +115,18 @@
     // Remembered so the keybinds can cycle windows without parsing the DOM: the
     // frame already carries the list and which one is active.
     lastFrame = f;
-    if (typeof f.render === "string" && f.render !== lastRender) {
-      lastRender = f.render;
-      termEl.innerHTML = ansiToHTML(f.render);
+    // The model owns the buffer; this field only shows it. Setting .value on every
+    // frame would fight the caret, so it is set only when it actually differs.
+    if (inputEl && typeof f.input === "string" && inputEl.value !== f.input) {
+      inputEl.value = f.input;
+    }
+    // Body, not render: the server sends the conversation without the TUI's frame,
+    // because this page already has a sidebar, a header and an input row. Drawing
+    // the framed render here is what produced a box inside a box.
+    var bodyKey = Array.isArray(f.body) ? f.body.join("\n") : null;
+    if (bodyKey !== null && bodyKey !== lastRender) {
+      lastRender = bodyKey;
+      termEl.innerHTML = bodyKey.split("\n").map(ansiToHTML).join("\n");
       // Keep the newest line visible unless the user scrolled up to read.
       var nearBottom = termEl.scrollTop + termEl.clientHeight >= termEl.scrollHeight - 40;
       if (nearBottom) termEl.scrollTop = termEl.scrollHeight;
@@ -125,6 +134,8 @@
 
     if (Array.isArray(f.windows)) {
       active = f.active || active;
+      var mt = document.getElementById("mobile-title");
+      if (mt) mt.textContent = active;
       var unread = f.unread || {};
       var mentions = f.mentions || {};
       var html = "";
@@ -212,6 +223,11 @@
     ws = new WebSocket(proto + "//" + location.host + "/ws");
 
     ws.onopen = function () {
+      lastSize = "";
+      // First frame is already the right size: report before the server renders,
+      // not after, so the conversation does not appear as a small block and then
+      // jump to fill the page.
+      reportSize();
       retry = 0;
       bannerEl.hidden = true;
     };
@@ -328,6 +344,61 @@
     send({ type: "select", active: next });
   }
 
+
+  // ---- viewport reporting -------------------------------------------------
+  //
+  // The server renders a fixed width and a fixed number of lines, so it has to be
+  // told the size. Without this the page asks for the terminal driver's default and
+  // every phone gets a window that wraps.
+  var lastSize = "";
+
+  function reportSize() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Measure the terminal element, not the window: the sidebar and the input take
+    // space, and asking for the window width produces lines that wrap anyway.
+    var rect = termEl.getBoundingClientRect();
+    var charW = 8.4;   // ui-monospace at 14px; close enough, and measured below
+    var charH = 18.9;  // 14px * 1.35 line-height
+    var probe = document.createElement("span");
+    probe.textContent = "0000000000";
+    probe.style.font = getComputedStyle(termEl).font;
+    probe.style.position = "absolute";
+    probe.style.visibility = "hidden";
+    document.body.appendChild(probe);
+    var w = probe.getBoundingClientRect().width / 10;
+    document.body.removeChild(probe);
+    if (w > 0) charW = w;
+    var cols = Math.max(20, Math.floor((rect.width - 24) / charW));
+    var rows = Math.max(6, Math.floor((rect.height - 8) / charH));
+    var key = cols + "x" + rows;
+    if (key === lastSize) return;
+    lastSize = key;
+    ws.send(JSON.stringify({ type: "resize", cols: cols, rows: rows }));
+  }
+
+
+  // ---- mobile drawers -----------------------------------------------------
+  //
+  // On a phone the sidebars become drawers. They cannot simply be hidden: a phone
+  // with no window list cannot change channel, which is the one thing a chat client
+  // must always allow.
+  function bindDrawer(buttonId, bodyClass) {
+    var btn = document.getElementById(buttonId);
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+      var on = document.body.classList.toggle(bodyClass);
+      btn.classList.toggle("active", on);
+    });
+  }
+
+  function closeDrawers() {
+    document.body.classList.remove("show-windows", "show-nicks");
+    var a = document.getElementById("show-windows");
+    var b = document.getElementById("show-nicks");
+    if (a) a.classList.remove("active");
+    if (b) b.classList.remove("active");
+  }
+
   function renderPreviews(list) {
     if (!previewsEl) return;
     previewsEl.textContent = "";
@@ -373,18 +444,75 @@
     }
   }
 
+  // Every keystroke goes to the model. It is the same path a TUI keypress takes, so
+  // the buffer, history and completion cannot diverge between the two front ends.
+  //
+  // The caret is put back afterwards because the server re-renders the input line:
+  // a client that only appends its own text would be a second buffer.
+  if (inputEl) {
+    inputEl.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        send({ type: "key", key: "enter" });
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        send({ type: "key", key: "up" });
+        return;
+      }
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        send({ type: "key", key: "down" });
+        return;
+      }
+      if (e.key === "Backspace") {
+        e.preventDefault();
+        send({ type: "key", key: "backspace" });
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        send({ type: "key", key: "esc" });
+        return;
+      }
+      // Printable characters only: modifiers and control keys are the browser's.
+      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        send({ type: "key", runes: e.key });
+      }
+    });
+
+    // Paste arrives as one event, not a keystroke per character.
+    inputEl.addEventListener("paste", function (e) {
+      var text = (e.clipboardData || window.clipboardData).getData("text");
+      if (!text) return;
+      e.preventDefault();
+      send({ type: "key", runes: text });
+    });
+  }
+
   formEl.addEventListener("submit", function (e) {
     e.preventDefault();
-    var text = inputEl.value;
+    // The input field is a VIEW of the model's buffer, not the buffer itself. Send
+    // the Enter and let the model decide what the line means: that is what gives the
+    // browser the same command mapping, the same /commands and the same local echo
+    // as the TUI, instead of a second implementation that drifts.
+    send({ type: "key", key: "enter" });
     inputEl.value = "";
-    send(text);
   });
 
   listEl.addEventListener("click", function (e) {
-    var t = e.target;
-    if (!t || !t.getAttribute) return;
-    var name = t.getAttribute("data-window");
+    // closest(), not e.target: the row is built from spans, so clicking the window
+    // NAME lands on the inner <span> which has no data-window. Reading the target
+    // directly meant only the empty space beside the text worked, which is exactly
+    // as broken as it sounds and invisible to every test that dispatches the click
+    // on the row itself.
+    var row = e.target && e.target.closest ? e.target.closest("[data-window]") : null;
+    if (!row) return;
+    var name = row.getAttribute("data-window");
     if (!name) return;
+    closeDrawers();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "select", active: name }));
     } else {
@@ -478,8 +606,24 @@
   }
 
   connect();
+  bindDrawer("show-windows", "show-windows");
+  bindDrawer("show-nicks", "show-nicks");
+  // Tapping the conversation closes a drawer. Otherwise the only way out is the
+  // button that opened it, which is a trap on a small screen.
+  if (termEl) termEl.addEventListener("click", closeDrawers);
+
   var themeBtn = document.getElementById("theme");
   if (themeBtn) themeBtn.addEventListener("click", toggleTheme);
+
+  // A resize is not a keypress and not a click, so it needs its own listener. Both
+  // directions are covered: the window (a phone rotating) and the element (the
+  // sidebar collapsing at a breakpoint).
+  if (window.ResizeObserver && termEl) {
+    var ro = new ResizeObserver(function () { reportSize(); });
+    ro.observe(termEl);
+  }
+  window.addEventListener("resize", reportSize);
+  window.addEventListener("orientationchange", function () { setTimeout(reportSize, 250); });
 
   loadSettings();
 

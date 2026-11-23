@@ -29,6 +29,17 @@ func HTML(view string) string {
 	return terminal.Render([]byte(view))
 }
 
+// bodyHTML renders body lines as the HTML the web front end embeds. It converts each
+// line separately and joins with newlines: the converter is built for one terminal
+// screen, and handing it a slice keeps the escaping in the one place it already lives.
+func bodyHTML(lines []string) string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		out = append(out, terminal.Render([]byte(line)))
+	}
+	return strings.Join(out, "\n")
+}
+
 // Headless drives the model with no terminal at all: it applies messages in
 // order and returns the final View. Tests and bots use it, and it is the proof
 // that the model is a value and not a Program.

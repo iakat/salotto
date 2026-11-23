@@ -41,6 +41,17 @@ const (
 	LineNotice
 	LineSystem
 	LineGap
+	// The membership and channel events. Each is its own kind rather than one
+	// "system" bucket because every front end wants to draw them differently:
+	// a join and a quit are the same event with opposite meaning, and a client that
+	// renders them identically makes a busy channel unreadable.
+	LineJoin
+	LinePart
+	LineQuit
+	LineKick
+	LineNick
+	LineTopic
+	LineMode
 )
 
 // Incoming is the message a transport sends when a line arrives. It is a plain
@@ -359,14 +370,20 @@ var (
 	topicStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	borderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
 	nickStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
-	timeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	bodyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
-	actionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
-	noticeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
-	systemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	gapStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	inputStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
-	barStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
+	// eventStyle is the dimmest thing on screen on purpose: a join is not news, and
+	// a channel where every arrival is loud cannot be read. The arrows say what
+	// happened; the colour says it does not matter.
+	eventStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
+	topicEventStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("180"))
+	kickStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("174"))
+	timeStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	bodyStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
+	actionStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
+	noticeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
+	systemStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	gapStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	inputStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
+	barStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 )
 
 // View renders the whole screen: a titled box with the scrollback and an input
@@ -461,6 +478,24 @@ func (m Model) View() string {
 	return b.String()
 }
 
+// Body renders the conversation without a frame: no border, no input line, no status
+// bar. The browser draws its own chrome - sidebar, header, input form, footer - so
+// wrapping the full View() in those panels put a box inside a box and printed the
+// input line twice.
+//
+// It is still the same renderer: the lines come from bodyLines, styled by styleLine,
+// exactly as the TUI draws them. Only the frame around them is the caller's.
+func (m Model) Body(width, lines int) []string {
+	if width < 20 {
+		width = 20
+	}
+	return m.bodyLines(width, lines)
+}
+
+// ScrollbackLen is how many lines the active window holds, so a driver can ask for a
+// number of lines that actually fills its viewport.
+func (m Model) ScrollbackLen() int { return len(m.windows[m.active]) }
+
 // bodyLines renders exactly n lines of scrollback, styled, bottom-aligned: a
 // short window shows the newest lines, which is what a chat window means.
 func (m Model) bodyLines(width, n int) []string {
@@ -545,6 +580,23 @@ func styleLine(l Line, width int) string {
 		return noticeStyle.Render("<" + l.Nick + "> " + text)
 	case LineAction:
 		return actionStyle.Render("* " + l.Nick + " " + text)
+	case LineJoin:
+		// Joins and parts are the quietest things in a channel: dim, and marked with
+		// an arrow so a scan of the window can tell them from conversation without
+		// reading a word.
+		return eventStyle.Render("→ " + l.Nick + " " + text)
+	case LinePart:
+		return eventStyle.Render("← " + l.Nick + " " + text)
+	case LineQuit:
+		return eventStyle.Render("⇐ " + l.Nick + " " + text)
+	case LineKick:
+		return kickStyle.Render("✖ " + text)
+	case LineNick:
+		return eventStyle.Render("↔ " + text)
+	case LineTopic:
+		return topicEventStyle.Render("≡ " + l.Nick + " " + text)
+	case LineMode:
+		return eventStyle.Render("± " + text)
 	default:
 		// A mention is drawn differently in every front end. The model decides
 		// that it IS a mention; each renderer decides what that looks like, which
@@ -707,3 +759,11 @@ func (m Model) Links(window string, max int) []string {
 	}
 	return out
 }
+
+// Width and Height report the size the model was last told. A driver needs them to
+// ask for a render that fits, and there is no other way to know: the model holds the
+// size precisely because the driver told it.
+func (m Model) Width() int { return m.width }
+
+// Height is the model's last known height.
+func (m Model) Height() int { return m.height }

@@ -39,6 +39,49 @@ type Program struct {
 	rev uint64
 }
 
+// Key applies one keystroke, named the way a terminal names it. The web client sends
+// these instead of text so both front ends go through updateKey: the buffer, the
+// history and the command mapping live in one place.
+func (p *Program) Key(name, runes string) {
+	var msg tea.KeyMsg
+	switch name {
+	case "enter":
+		msg = tea.KeyMsg{Type: tea.KeyEnter}
+	case "backspace":
+		msg = tea.KeyMsg{Type: tea.KeyBackspace}
+	case "esc":
+		msg = tea.KeyMsg{Type: tea.KeyEsc}
+	case "up":
+		msg = tea.KeyMsg{Type: tea.KeyUp}
+	case "down":
+		msg = tea.KeyMsg{Type: tea.KeyDown}
+	case "tab":
+		msg = tea.KeyMsg{Type: tea.KeyTab}
+	default:
+		if runes == "" {
+			return
+		}
+		msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(runes)}
+	}
+	p.Step(msg)
+}
+
+// Resize tells the model how big the client is. A driver calls it whenever the
+// viewport changes; the model needs it because it renders a fixed number of lines and
+// a width, and guessing either produces a window that either wraps or is short.
+func (p *Program) Resize(width, height int) {
+	if width < 20 {
+		width = 20
+	}
+	if height < 6 {
+		height = 6
+	}
+	p.mu.Lock()
+	p.model, _ = p.model.Step(tea.WindowSizeMsg{Width: width, Height: height})
+	p.rev++
+	p.mu.Unlock()
+}
+
 // previewCache returns the preview cache, creating it on first use. Lazy because a
 // TUI session that never opens a browser must not pay for a fetcher it cannot use.
 func (p *Program) previewCache() *PreviewCache {

@@ -355,7 +355,9 @@ func TestTransportOpensAWindowOnOurOwnJoin(t *testing.T) {
 	// 001 first: without knowing our own nick, no JOIN can be attributed to us.
 	fb.inject(t, ":irc.test 001 me :welcome")
 	fb.inject(t, ":me!m@h JOIN #fresh")
-	// And somebody else's join must still be status, not a window.
+	// Somebody joining a channel we are NOT in must stay status: it is not our
+	// conversation, and opening a window for every channel a stranger joins would
+	// fill the sidebar with other people's business.
 	fb.inject(t, ":someone!s@h JOIN #someoneelse")
 
 	got := collectIncoming(t, tr, 3)
@@ -366,7 +368,7 @@ func TestTransportOpensAWindowOnOurOwnJoin(t *testing.T) {
 		t.Fatalf("our own JOIN routed to %q, want #fresh (the window never opens)", got[1].Window)
 	}
 	if got[2].Window != "status" {
-		t.Fatalf("another user's JOIN opened window %q", got[2].Window)
+		t.Fatalf("another user's JOIN to a channel we are not in opened window %q", got[2].Window)
 	}
 }
 

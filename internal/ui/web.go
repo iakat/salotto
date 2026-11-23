@@ -130,7 +130,8 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   div.results .hit:hover { background: var(--bg-hover); }
   div.results .hl { color: var(--mention); font-weight: 600; }
   div.results .hn { color: var(--nick); }
-  div.wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  div.wrap { flex: 1; display: flex; flex-direction: column; min-height: 0;
+    min-width: 0; overflow: hidden; }
   div.topic { padding: 4px 12px; background: var(--window-bg); color: var(--fg-dim);
     border-bottom: 1px solid var(--border);
     font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -157,8 +158,12 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   body.compact div.topic, body.compact div.previews { padding: 2px 10px; }
   div.banner { padding: 6px 12px; background: var(--alert-bg); color: var(--alert-fg);
     font: 13px ui-monospace, monospace; }
+  /* The conversation fills its container. A fixed-size block in the middle of a
+     large window is what a renderer that was never told the size looks like. */
   pre.term-container { flex: 1; margin: 0; padding: 12px; overflow: auto;
-    font: 14px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    min-height: 0; width: 100%; box-sizing: border-box;
+    font: 14px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre; tab-size: 4; }
   form.input { display: flex; gap: 8px; padding: 8px 12px;
     border-top: 1px solid var(--border); background: var(--bg-panel); }
   form.input input { flex: 1; background: var(--bg-inset); color: var(--fg);
@@ -179,10 +184,54 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
     color: var(--result-fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   aside.nicks .nick.op { color: var(--op); font-weight: 600; }
   aside.windows .count-nicks { color: var(--fg-muted); font-size: 11px; }
-  @media (max-width: 640px) { aside.windows, aside.nicks { display: none; } }
+  /* Mobile: the sidebars cannot both be shown, but they also cannot simply vanish -
+     a phone with no window list cannot change channel. They become toggleable
+     drawers, and the bar that opens them is the only new chrome. */
+  div.mobilebar { display: none; }
+  @media (max-width: 760px) {
+    body { flex-direction: column; }
+    div.mobilebar { display: flex; gap: 6px; padding: 6px 8px;
+      background: var(--bg-panel); border-bottom: 1px solid var(--border); }
+    div.mobilebar button { flex: 1; background: var(--bg-raised); color: var(--fg);
+      border: 0; border-radius: 4px; padding: 8px 6px;
+      font: 13px ui-monospace, monospace; cursor: pointer; }
+    div.mobilebar button.active { background: var(--accent); color: var(--bg); }
+    aside.windows, aside.nicks {
+      position: fixed; top: 0; bottom: 0; z-index: 30; width: 78vw; max-width: 320px;
+      display: none; box-shadow: 0 0 0 100vmax rgba(0,0,0,.45); }
+    aside.windows { left: 0; border-right: 1px solid var(--border); }
+    aside.nicks { right: 0; border-left: 1px solid var(--border); }
+    body.show-windows aside.windows { display: block; }
+    body.show-nicks aside.nicks { display: block; }
+    /* The input must not be under the keyboard: 16px is the smallest size iOS will
+       not zoom on, and zooming is what makes a chat client unusable on a phone. */
+    form.input { padding: 6px 8px; gap: 6px; }
+    form.input input { font-size: 16px; padding: 8px; }
+    form.input button { font-size: 16px; padding: 8px 12px; }
+    pre.term-container { padding: 8px; font-size: 13px; line-height: 1.3; }
+    div.searchbar { padding: 4px 8px; }
+    div.searchbar input { font-size: 16px; }
+    div.topic, div.previews { padding: 4px 8px; }
+    footer.status { font-size: 11px; padding: 3px 8px; }
+    /* The terminal scrolls its own way on touch: momentum, and no rubber-banding of
+       the page behind it, which otherwise makes the whole page bounce when you try
+       to read. */
+    pre.term-container { -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+    body { overscroll-behavior: none; }
+  }
+  /* On a phone held sideways there is room for the conversation and the nick list,
+     but not the window list too. */
+  @media (max-width: 760px) and (orientation: landscape) {
+    aside.windows { width: 50vw; }
+  }
 </style>
 </head>
 <body>
+<div class="mobilebar">
+  <button type="button" id="show-windows"># windows</button>
+  <span id="mobile-title" style="flex:2;text-align:center;font:13px ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>
+  <button type="button" id="show-nicks">nicks</button>
+</div>
 <aside class="windows" id="windows"><h2>windows
   <button class="theme" id="theme" type="button" title="toggle theme (Alt-T)">◐</button></h2></aside>
 <div class="wrap">
@@ -268,8 +317,22 @@ func Handler(p *Program) http.Handler {
 		// cannot open a socket still shows the window list and the connection
 		// status; the socket only adds updates to what is already correct.
 		m := p.Model()
+		// Body, not View: this page already has a sidebar, a header, an input row and
+		// a footer. Rendering the TUI's framed View here drew a box around the
+		// conversation and a second input line under it.
+		cols, rows := m.Width(), m.Height()
+		if cols < 20 {
+			cols = 20
+		}
+		if rows < 6 {
+			rows = 6
+		}
+		// The client's reported size is the model's size, so a reload after the
+		// browser has told us its viewport renders at that size immediately. The
+		// first-ever load has no size yet, hence the floor.
+		lines := m.Body(cols, rows-3)
 		if err := pageTemplate.Execute(w, map[string]interface{}{
-			"Terminal": template.HTML(HTML(p.View())),
+			"Terminal": template.HTML(bodyHTML(lines)),
 			"Status":   m.Status(),
 		}); err != nil {
 			return

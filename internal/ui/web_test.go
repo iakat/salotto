@@ -68,13 +68,17 @@ func TestWebRendersTheTerminalView(t *testing.T) {
 	}
 }
 
-// TestWebMatchesHeadlessView: the page body must be the conversion of the very
-// string the headless driver produced. If a second renderer ever appears, this
-// is what fails.
+// TestWebMatchesHeadlessView: the page's conversation must be the conversion of the
+// very lines the headless driver produced. If a second renderer ever appears, this is
+// what fails.
+//
+// Body and not View, because the page draws its own chrome: the claim being protected
+// is "one renderer for the lines", not "the browser gets the TUI's frame".
 func TestWebMatchesHeadlessView(t *testing.T) {
 	m := seeded()
 	_, view := Headless(m)
-	want := HTML(view)
+	_ = view // the TUI's own render, asserted separately below
+	want := bodyHTML(m.Body(m.Width(), m.Height()-3))
 
 	srv := httptest.NewServer(Handler(progFor(m)))
 	defer srv.Close()
@@ -91,13 +95,17 @@ func TestWebMatchesHeadlessView(t *testing.T) {
 }
 
 // TestWebResizeIsTheSameWindowSizeMsg: the preview's query parameters must go
-// through the same message the terminal driver sends, not a parallel path. The
-// page for ?width=60&height=14 must be byte-identical to the conversion of a
-// model that received that WindowSizeMsg itself.
+// through the same message the terminal driver sends, not a parallel path. The page
+// for ?width=60&height=14 must render the body of a model that received that
+// WindowSizeMsg itself.
+//
+// Body and not View: the page draws its own chrome, so it gets the conversation
+// without the TUI's frame. Asserting on the framed render is what let a box inside a
+// box ship, and this test asserted it happily.
 func TestWebResizeIsTheSameWindowSizeMsg(t *testing.T) {
 	want := New("status")
 	want, _ = want.Step(tea.WindowSizeMsg{Width: 60, Height: 14})
-	wantHTML := HTML(want.View())
+	wantHTML := bodyHTML(want.Body(60, 14-3))
 
 	srv := httptest.NewServer(Handler(NewProgram("status", nil)))
 	defer srv.Close()
@@ -108,7 +116,11 @@ func TestWebResizeIsTheSameWindowSizeMsg(t *testing.T) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), wantHTML) {
-		t.Fatalf("the resized page is not the converted WindowSizeMsg rendering\nwant: %q", wantHTML)
+		t.Fatalf("the resized page is not the body rendering at that size\nwant: %q", wantHTML)
+	}
+	// And the frame must NOT be there: its border characters are the box-in-a-box.
+	if strings.Contains(string(body), "╭─") {
+		t.Fatal("the page still contains the TUI's own frame")
 	}
 }
 
