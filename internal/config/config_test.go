@@ -35,6 +35,7 @@ server_name = "salotto"
 stats_listen = "127.0.0.1:6668"
 ring_segments = 8
 ring_segment_size = 262144
+max_windows = 64
 max_clients = 32
 
 [[network]]
@@ -64,6 +65,9 @@ channels = []
 				}
 				if cfg.ServerName != "salotto" || cfg.RingSegments != 8 || cfg.RingSegmentSize != 262144 || cfg.MaxClients != 32 {
 					t.Fatalf("global defaults = %+v", cfg)
+				}
+				if cfg.MaxWindows != 64 {
+					t.Fatalf("max_windows = %d, want 64", cfg.MaxWindows)
 				}
 				if len(cfg.Networks) != 2 {
 					t.Fatalf("networks = %d, want 2", len(cfg.Networks))
