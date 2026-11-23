@@ -26,7 +26,16 @@ type Config struct {
 	Pass               string
 	SASLUser           string
 	SASLPass           string
-	Channels           []string
+	// Channels is the static channel list used when JoinChannels is nil. It is
+	// kept for tests and for callers that have no runtime state to consult.
+	Channels []string
+	// JoinChannels, when non-nil, is called at every (re)connect instead of
+	// reading Channels: it returns the channels to join right now. The daemon
+	// supplies it so DisableChan can suppress the rejoin of a disabled channel,
+	// which is the one thing ZNC's disabled flag actually does
+	// (IRCNetwork.cpp:998 checks IsDisabled before JoinChan; CClient::AddBuffer
+	// never does, so a disabled channel keeps buffering and replaying).
+	JoinChannels func() []string
 	// Windows owns one replay ring per window for this network. The connection
 	// routes every line to the windows the logger gives it and appends the line
 	// to each of those rings.

@@ -272,10 +272,15 @@ func TestDisableChanCommand(t *testing.T) {
 		t.Fatalf("disabled window did not deliver live line: %v", got)
 	}
 
-	got = notices(runWindowCmd(t, s, sub, "PLAYBUFFER #c"))
-	want = []string{"The buffer for channel #c is empty"}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("PlayBuffer while disabled = %q, want %q", got, want)
+	// ZNC's disabled flag does not stop buffering or replay: CClient::AddBuffer
+	// never checks IsDisabled, only the rejoin does (IRCNetwork.cpp:998). So a
+	// disabled channel must still deliver what it buffered.
+	got = runWindowCmd(t, s, sub, "PLAYBUFFER #c")
+	if n := notices(got); len(n) != 0 {
+		t.Fatalf("PlayBuffer while disabled produced notices %q, want the replayed lines", n)
+	}
+	if replay := bodies(got); strings.Join(replay, ",") != "old,while-disabled" {
+		t.Fatalf("disabled PlayBuffer = %v, want old,while-disabled", replay)
 	}
 
 	list := notices(runWindowCmd(t, s, sub, "LISTCHANS"))
@@ -299,10 +304,11 @@ func TestDisableChanCommand(t *testing.T) {
 	fx.addLive(s, fn, "after-enable")
 	fx.addLive(s, fn, "later")
 	notices(runWindowCmd(t, s, sub, "ATTACH #c"))
-	// Re-enabling starts buffering again; it does not drop the lines buffered
-	// before the disable, so the replay is the whole window.
-	if got := bodies(runWindowCmd(t, s, sub, "PLAYBUFFER #c")); strings.Join(got, ",") != "old,while-disabled,after-enable,later" {
-		t.Fatalf("replay after enable = %v, want the whole buffered window", got)
+	// Re-enabling does not drop what was buffered, but the PlayBuffer above was
+	// a deliberate catch-up and advanced this client's cursor past the first two
+	// lines, so what is left to replay is only what arrived while detached.
+	if got := bodies(runWindowCmd(t, s, sub, "PLAYBUFFER #c")); strings.Join(got, ",") != "after-enable,later" {
+		t.Fatalf("replay after enable = %v, want after-enable,later", got)
 	}
 }
 

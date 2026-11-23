@@ -292,6 +292,17 @@ func (s *Server) network(name string) *networkEntry {
 // Attached returns the number of clients currently attached to the hub.
 func (s *Server) Attached() int { return s.hub.Len() }
 
+// KnownNick returns the upstream nick the facade has learned for a network, or
+// "". Callers outside the client path use it to answer "is this line about us"
+// without keeping a second nickname cache.
+func (s *Server) KnownNick(network string) string {
+	ne := s.network(network)
+	if ne == nil {
+		return ""
+	}
+	return ne.knownNick()
+}
+
 type client struct {
 	srv *Server
 	sub *Subscriber

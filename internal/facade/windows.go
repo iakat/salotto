@@ -322,12 +322,12 @@ func (s *Server) DetachWindow(sub *Subscriber, network, window string) bool {
 	return s.windows.detach(sub, windowKey(network, window))
 }
 
-// SetDisabled sets the not-buffered flag for a window. ZNC's flag also stops
-// the channel being re-joined after a reconnect; we do not manage joins at
-// runtime, so the observable effect here is "not buffered". Disabling only
-// suppresses replay, it does not stop buffering; re-enabling starts replaying
-// the window's own ring again, so nothing is silently rewound. It reports
-// whether the flag changed.
+// SetDisabled sets the not-buffered flag for a window. Matching ZNC's
+// CChan::Disable, the flag only suppresses the *rejoin* after a reconnect
+// (IRCNetwork.cpp:998); it does not stop buffering nor replay, and it does not
+// part a channel we are already joined to. The daemon reads the flag when it
+// dials (upstream.Config.JoinChannels), which is where the rejoin is decided.
+// It reports whether the flag changed.
 func (s *Server) SetDisabled(network, window string, disabled bool) bool {
 	return s.windows.setDisabled(windowKey(network, window), disabled)
 }
@@ -363,12 +363,11 @@ func (s *Server) Known(network, window string) bool {
 	return known
 }
 
-// BufferEmpty reports whether a window has nothing to replay: it is disabled or
-// its own ring has no lines.
+// BufferEmpty reports whether a window has nothing to replay: its own ring has
+// no lines. A disabled window is *not* empty: ZNC's DisableChan only suppresses
+// the rejoin after a reconnect (CChan::Disable, IRCNetwork.cpp:998), it does not
+// stop buffering or replay, so neither do we.
 func (s *Server) BufferEmpty(network, window string) bool {
-	if s.Disabled(network, window) {
-		return true
-	}
 	ne := s.network(network)
 	if ne == nil {
 		return true
@@ -558,9 +557,6 @@ func (s *Server) PlayBuffer(sub *Subscriber, network string, windows ...string) 
 
 	for _, window := range windows {
 		key := windowKey(network, window)
-		if s.windows.isDisabled(key) {
-			continue
-		}
 
 		r, ok := ne.net.Window(window)
 		if !ok {

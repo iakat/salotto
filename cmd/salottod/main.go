@@ -23,6 +23,7 @@ import (
 	"github.com/iakat/salotto/internal/config"
 	"github.com/iakat/salotto/internal/facade"
 	"github.com/iakat/salotto/internal/ident"
+	"github.com/iakat/salotto/internal/ircline"
 	"github.com/iakat/salotto/internal/logfile"
 	"github.com/iakat/salotto/internal/upstream"
 	"github.com/iakat/salotto/internal/winring"
@@ -174,9 +175,16 @@ func run() int {
 			Windows:            set,
 			Route:              w.Route,
 			Log:                logger.With("network", netName),
+			// Read at every (re)connect: a channel the operator disabled must
+			// not be re-joined, which is the only effect ZNC's disabled flag
+			// has. Buffering and replay are unaffected.
+			JoinChannels: func() []string {
+				return joinableChannels(nc.Channels, srv, netName)
+			},
 			OnLine: func(windows []string, seqs []uint64, entries []logfile.Entry, line []byte) {
 				dispatchRouted(srv, netName, windows, line)
 				w.OnRouted(entries, line, false)
+				noteSelfKick(srv, netName, line)
 			},
 			OnSend: func(line []byte) {
 				entries := w.Route(line, true)
@@ -464,6 +472,54 @@ func dispatchEntries(srv *facade.Server, netName string, entries []logfile.Entry
 		windows[i] = e.Window
 	}
 	dispatchRouted(srv, netName, windows, line)
+}
+
+// joinableChannels returns the channels a network should join on the next
+// connect: the configured list minus the windows the operator disabled. ZNC
+// suppresses the rejoin of a disabled channel and nothing else
+// (IRCNetwork.cpp:998), so this is the whole of the flag's effect on dialling.
+func joinableChannels(configured []string, srv *facade.Server, network string) []string {
+	if srv == nil {
+		return append([]string(nil), configured...)
+	}
+	out := make([]string, 0, len(configured))
+	for _, ch := range configured {
+		if srv.Disabled(network, ch) {
+			continue
+		}
+		out = append(out, ch)
+	}
+	return out
+}
+
+// noteSelfKick mirrors ZNC's IRCSock.cpp:734: being kicked from a channel
+// disables that channel, so the bouncer does not immediately re-join a channel
+// the operator was removed from on purpose. The kick itself is still routed and
+// buffered; only the rejoin is suppressed.
+func noteSelfKick(srv *facade.Server, network string, line []byte) {
+	if srv == nil {
+		return
+	}
+	own := srv.KnownNick(network)
+	if own == "" {
+		return
+	}
+	_, rest := ircline.Tags(line)
+	prefix, rest := ircline.Prefix(rest)
+	if !ircline.IsVerb(rest, "KICK") {
+		return
+	}
+	params := ircline.Params(rest)
+	fields := strings.Fields(string(params))
+	if len(fields) < 2 {
+		return
+	}
+	channel, target := fields[0], fields[1]
+	if !strings.EqualFold(target, own) {
+		return
+	}
+	_ = prefix
+	srv.SetDisabled(network, channel, true)
 }
 
 func parseLogLevel(value string) (slog.Level, error) {

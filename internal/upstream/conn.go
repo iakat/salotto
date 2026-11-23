@@ -147,7 +147,11 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 		c.cfg.OnConnect()
 	}
 
-	for _, ch := range c.cfg.Channels {
+	join := c.cfg.Channels
+	if c.cfg.JoinChannels != nil {
+		join = c.cfg.JoinChannels()
+	}
+	for _, ch := range join {
 		if err := c.enqueue([]byte("JOIN " + ch)); err != nil {
 			close(stop)
 			conn.Close()
