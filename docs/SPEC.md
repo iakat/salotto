@@ -237,14 +237,24 @@ into the outbound ring — still no allocation, the outbound ring is the arena).
 
 ### 6.2.1 Windows and per-client cursors (B2, current implementation)
 
-The bouncer tracks cursors per client **per window**, where a window is the same
-key the log uses: network + window name (`status` for the server window). Only
-the last acknowledged `seq` per client/window is kept, in memory; nothing is
-persisted. A client that is not attached has no cursor and starts at
-`oldest_seq`. `PlayBuffer` is window-scoped: for each requested window it
-replays from `max(oldest_seq, cursor+1)`. If the client's cursor has already
-been dropped by the ring, a `GAP` marker is written first, then the surviving
-lines. The marker is one plain IRC line so the POC's text client can render it:
+Each network keeps **one ring per window** (`internal/winring`). A window is the
+same key the log uses: network + window name (`status` for the server window).
+Every buffered line is routed by `logfile.Route` to the windows its log files
+belong to and appended to **each** of those rings, so a line shared by two
+windows (a `QUIT` fanned out to every shared channel) exists in both rings with
+independent sequences. At most `max_windows` rings exist per network
+(`max_windows`, default 64); the least recently used window is evicted when the
+cap is exceeded. Each ring uses `ring_segments` × `ring_segment_size`, so those
+settings apply **per window**.
+
+The bouncer tracks cursors per client **per window**. Only the last
+acknowledged `seq` per client/window is kept, in memory; nothing is persisted.
+A client that is not attached has no cursor and starts at `oldest_seq`.
+`PlayBuffer` is window-scoped: for each requested window it replays from
+`max(oldest_seq, cursor+1)` of that window's ring. If the client's cursor has
+already been dropped by the window's ring, a `GAP` marker is written first, then
+the surviving lines. The marker is one plain IRC line so the POC's text client
+can render it:
 
 ```
 :<server> GAP <network> <window> <lost_from> <lost_to>
@@ -252,21 +262,21 @@ lines. The marker is one plain IRC line so the POC's text client can render it:
 
 `lost_from` is the first sequence after the client's cursor and `lost_to` is the
 last sequence the ring dropped (`oldest_seq-1`), i.e. the exact range the client
-will never see.
+will never see. Because the ring is per window, a `GAP` now means **this window
+really overflowed**: a busy window can no longer evict a quiet window's lines,
+and the quiet window's client sees no `GAP` at all. Each window's sequences are
+independent; two windows holding the same line number it differently.
 
 `Attach`/`Detach` state lives next to the cursors: a window can be detached
 (delivery stops, the cursor freezes) or muted (delivery stops, replay still
 possible). Detaching and re-attaching replays exactly what arrived while away.
-`ClearBuffer <window>` hides that window's already-broadcast lines and advances
-every client's cursor past them, so cleared lines are never replayed; it is a
-no-op with a message for an unknown window.
-
-**Honest limitation.** The rings are still one per network, not one per window.
-Per-window cursors index that shared ring, which approximates a per-window split
-without fragmenting it. A very busy window can therefore push a quiet window's
-lines out of the shared ring even though the quiet window's client was caught
-up; that client sees a `GAP` where true per-window rings would have retained the
-lines. One ring per window is a separate, larger change.
+`ClearBuffer <window>` physically drops that window's already-broadcast lines
+and advances every client's cursor past them, so cleared lines are never
+replayed. Clearing is deliberate, not loss: without the cursor advance a client
+would see a `GAP` for lines the operator chose to drop. The window's sequence
+counter stays monotonic across a clear, so a stale cursor from a client that
+never saw the commit is a well-formed `GAP`, not a silent rewind. `ClearBuffer`
+is a no-op with a message for an unknown window.
 
 ### 6.3 Checkpoint (the trick that keeps the bouncer dumb)
 

@@ -17,8 +17,15 @@ log_listen = ""                  # empty disables search; loopback only without 
 log_token = ""
 ident_listen = ""                # RFC 1413 listener, e.g. ":113"; empty disables ident
 ident = ""                       # ident string; empty uses the network's nick
+# Replay rings are per window, not per network. The two ring settings below
+# therefore apply to EACH window, and max_windows bounds how many windows a
+# network keeps (the least recently used is evicted when it is exceeded).
+# Arithmetic at the defaults: 8 * 262144 = 2 MiB per window, times 64 windows
+# = 128 MiB per network. Multiply by the number of [[network]] sections to size
+# the whole process; lower max_windows or ring_segment_size to shrink it.
 ring_segments = 8
 ring_segment_size = 262144
+max_windows = 64
 max_clients = 32
 
 [user]

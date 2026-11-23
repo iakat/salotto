@@ -51,8 +51,9 @@ These are the things that were exercised while building this POC:
   joined the configured channel. `/stats` showed `state=registered`,
   `attempts=1`, and live `lines_in`/`lines_out`/ring counters.
 - A plain TCP client sent `CAP LS 302`, `CAP END`, `NICK` and `USER`, received
-  the 001/002/003/004/005 registration numerics, and then received the whole
-  ring as a `BATCH +replay ...`/`BATCH -replay ...` replay with `time=` tags.
+  the 001/002/003/004/005 registration numerics, and then received each
+  buffered window as its own `BATCH +replay <network>-<window>-replay` /
+  `BATCH -replay ...` replay with `time=` tags.
 - The replay and the live stream are rewritten per attached client. Numerics
   are addressed to that client's own nick, a line from the upstream identity
   carries the client's nick in its prefix, the `353` names list contains the
@@ -72,9 +73,9 @@ These are the things that were exercised while building this POC:
   are joined again.
 - The facade has no authentication at all. Bind it to loopback or put it
   behind an SSH tunnel. Anyone who can reach the port gets the whole session.
-- The ring is lossy: it has a fixed size and overwrites the oldest records. A
-  client that attaches after a gap cannot be told exactly what it missed,
-  except by the jump in the replayed `time=` stamps.
+- Each window's ring is lossy: it has a fixed size and overwrites the oldest
+  records of that window only. A client that falls behind one window gets an
+  explicit `GAP` for it; a busy window never evicts another window's lines.
 - A slow client is dropped rather than buffered indefinitely.
 - There is one upstream connection per network, shared by all attached
   clients. Every attached client shares that same upstream identity, so two
@@ -119,9 +120,9 @@ net.libera.state=registered
 net.libera.attempts=1
 net.libera.lines_in=70
 net.libera.lines_out=6
-net.libera.ring_oldest=1
-net.libera.ring_newest=70
 net.libera.ring_bytes=21331
+net.libera.windows_known=2
+net.libera.windows_disabled=0
 clients_attached=0
 clients_dropped_slow=0
 goroutines=9

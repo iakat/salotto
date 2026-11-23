@@ -43,7 +43,7 @@ written here. Nothing gets to be quietly missing.
 | # | capability | ZNC evidence | our state |
 |---|---|---|---|
 | B1 | Persistent upstream socket per network, survives client detach | `CIRCSock`, `CIRCNetwork` | **have** (upstream goroutines) |
-| B2 | Replay buffer per window with per-client pointer | `CBuffer`, `CChan`, `CQuery` | **partial**: one ring per network, no per-window split, no per-client cursor in the POC |
+| B2 | Replay buffer per window with per-client pointer | `CBuffer`, `CChan`, `CQuery` | **have** (one ring per window, per-client cursors, `GAP` on cursor loss) |
 | B3 | Attach/detach without a visible disconnect to the network | `CClient`, `CUser::AddClient` | **have** |
 | B4 | Multiple concurrent clients on one session | `ListClients` | **have** (hub, `clients_attached`) |
 | B5 | Multi-network per user with independent state | `AddNetwork`/`DelNetwork`/`ListNetworks` | **partial**: config-file networks only, no runtime add/remove |
@@ -299,16 +299,15 @@ recording because they are not obvious from a feature list:
   scrollback. ZNC handles them by fanning `QUIT` to every shared channel, which
   we now do. A *condensed* rendering is a client concern and must not truncate
   history to be pretty.
-- **Q4. Every routed line is parsed twice** (measured, not suspected). Routing
-  (`dispatchLine` → `logfile.WindowFor`) calls `Format` to decide the window, and
-  the writer's drain calls `Format` again to build the log entry. Ad-hoc
-  measurement on `PRIVMSG #c`: `Format` once = 250.4 ns/op, 112 B/op, 9 allocs;
-  twice = 595.9 ns/op, 240 B/op, 19 allocs. So ≈ +345 ns, +128 B, +10 allocs per
-  logged line. The existing `BenchmarkOnLine` (21.37 ns/op, 0 allocs) cannot see
-  it because it measures the enqueue path only and the format happens on the
-  drain goroutine. Fix: return the parsed `[]Entry` from routing and hand it to
-  the writer instead of re-parsing. Not urgent, but it is pure waste on the hot
-  path.
+- **Q4. Every routed line was parsed twice — done.** Routing
+  (`dispatchLine` → `logfile.WindowFor`) used to call `Format` to decide the
+  window, and the writer's drain called `Format` again to build the log entry.
+  Ad-hoc measurement on `PRIVMSG #c`: `Format` once = 250.4 ns/op, 112 B/op,
+  9 allocs; twice = 595.9 ns/op, 240 B/op, 19 allocs, i.e. ≈ +345 ns, +128 B,
+  +10 allocs per logged line. Fixed in the B2 change: routing now calls
+  `logfile.Route` once and hands the `[]Entry` to the writer (`Writer.OnRouted`),
+  so the drain never re-parses. The old measurement is kept as history; no new
+  benchmark was added.
 
 ---
 
