@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -66,6 +67,12 @@ func (p *Program) Key(name, runes string) {
 	p.Step(msg)
 }
 
+// Mouse applies a click at a character cell. The model decides what is there: it drew
+// the screen, so it is the only thing that knows where the window list is.
+func (p *Program) Mouse(x, y int) {
+	p.Step(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: x, Y: y})
+}
+
 // Resize tells the model how big the client is. A driver calls it whenever the
 // viewport changes; the model needs it because it renders a fixed number of lines and
 // a width, and guessing either produces a window that either wraps or is short.
@@ -82,11 +89,20 @@ func (p *Program) Resize(width, height int) {
 	p.mu.Unlock()
 }
 
+// previewsPerWindow bounds how many cards one window is worth fetching for: a message
+// with a dozen links does not need a dozen requests to strangers.
+const previewsPerWindow = 3
+
 // previewCache returns the preview cache, creating it on first use. Lazy because a
 // TUI session that never opens a browser must not pay for a fetcher it cannot use.
 func (p *Program) previewCache() *PreviewCache {
 	p.previewsOnce.Do(func() {
-		p.previews = NewPreviewCache(NewFetcher())
+		// Only if nothing was handed in: a caller that supplied a cache (a test with a
+		// fake fetcher, or a future one shared between sessions) must not have it replaced
+		// by a live one the first time a preview is primed.
+		if p.previews == nil {
+			p.previews = NewPreviewCache(NewFetcher())
+		}
 	})
 	return p.previews
 }
@@ -102,6 +118,11 @@ func NewProgram(window string, tr *Transport) *Program {
 }
 
 // Model returns the current model, for a driver that needs to inspect it.
+//
+// The returned value shares its maps with the live model, so it is a snapshot only while
+// the lock is held: callers must not keep it and read it later, which is what a race
+// detector will happily point out. It exists for tests and for drivers that render
+// immediately; the front ends render through View().
 func (p *Program) Model() Model {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -223,16 +244,45 @@ func (p *Program) SetInput(text string) {
 	p.mu.Unlock()
 }
 
-// Search runs a scrollback search and converts the hits to wire form.
-func (p *Program) Search(query string) []SearchHit {
+// Search runs a scrollback search. The results are the model's own type: there is no
+// wire form any more, because there is no JSON frame that has to describe them.
+func (p *Program) Search(query string) []SearchResult {
 	p.mu.Lock()
-	results := p.model.Search(query)
+	defer p.mu.Unlock()
+	return p.model.Search(query)
+}
+
+// primePreviews fetches a card for each link in the window the user is looking at, in
+// the background, and delivers it to the model as a message.
+//
+// Server-side and once per link, for the reason in preview.go: fetching in the browser
+// tells every link's author who read the channel and from which address. It is fired
+// from Step so the model never waits on a stranger's web server, and the card arrives as
+// PreviewReady so it lands in the same scrollback as the message that carried the link -
+// which is what makes it show up in the SSH and terminal front ends too.
+func (p *Program) primePreviews() {
+	cache := p.previewCache()
+	p.mu.Lock()
+	window := p.model.Active()
+	links := p.model.Links(window, previewsPerWindow)
 	p.mu.Unlock()
-	hits := make([]SearchHit, 0, len(results))
-	for _, r := range results {
-		hits = append(hits, SearchHit{Window: r.Window, Nick: r.Line.Nick, Text: r.Line.Text})
+	for _, u := range links {
+		if _, ok := cache.Cached(u); ok {
+			continue
+		}
+		go func(link string) {
+			ctx, cancel := context.WithTimeout(context.Background(), previewTimeout)
+			defer cancel()
+			// Get is silent on failure: a dead link returns a Preview with no title.
+			pv := cache.Get(ctx, link)
+			if pv.Title == "" && pv.Site == "" {
+				return
+			}
+			// Through Step, so the card is applied by the model under the same lock as
+			// everything else: appending from this goroutine would be a second writer.
+			p.Step(PreviewReady{Window: window, URL: link, Title: pv.Title, Site: pv.Site})
+		}(u)
 	}
-	return hits
 }
 
 // Next waits for the next message from the transport, blocking. A driver runs it

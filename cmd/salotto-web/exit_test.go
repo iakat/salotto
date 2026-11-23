@@ -5,27 +5,28 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// TestWebExitsWhenTheBouncerGoesAway pins the choice that a lost bouncer makes
-// the process exit rather than keep serving.
+// TestALostBouncerKillsTheSessionNotTheFrontEnd pins the boundary the PTY bridge moved.
 //
-// There is no in-process reconnect, so a front end whose connection died is
-// wrong in the worst way: the page still renders, the input box still accepts
-// text, POST still answers 303, and none of it reaches anything. A UI that lies
-// quietly is worse than one that is visibly down, so the process exits and the
-// supervisor brings back a fresh dial with a replayed buffer. That is only true
-// if the exit actually happens, which is what this test runs the built binary to
-// check rather than asserting the intent in a comment.
-func TestWebExitsWhenTheBouncerGoesAway(t *testing.T) {
+// The old front end held one bouncer connection for the process, so losing it meant the
+// whole web server was lying and had to exit. Now each session owns its own child, and
+// the connection that dies belongs to the session: the browser's terminal shows the
+// child exiting, and the front end keeps serving so the next tab gets a fresh dial. That
+// is a different contract and the test has to say so, because "the process exits" is the
+// kind of assertion that is either true for a reason or quietly wrong for a month.
+func TestALostBouncerKillsTheSessionNotTheFrontEnd(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go binary not available to build the front end")
 	}
 
-	// A listener that accepts and then hangs up: the transport dials, then reads
-	// EOF. No bouncer is needed to prove the front end notices.
+	// A listener that accepts and then hangs up: the child dials, reads EOF, and exits.
+	// No bouncer is needed to prove the session notices.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -41,40 +42,58 @@ func TestWebExitsWhenTheBouncerGoesAway(t *testing.T) {
 		}
 	}()
 
-	bin := t.TempDir() + "/salotto-web"
-	build := exec.Command("go", "build", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
-
+	bin := buildFrontEnd(t)
 	addr := freeAddr(t)
 	cmd := exec.Command(bin, "-addr", addr, "-bouncer", ln.Addr().String(), "-nick", "e2e-ui")
 	cmd.Stdout, cmd.Stderr = nil, nil
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
 
-	// The process must go away on its own, and must do it promptly: a front end
-	// that notices a dead bouncer ten minutes later is still lying for ten
-	// minutes.
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		var exitErr *exec.ExitError
-		if err == nil {
-			t.Fatal("the front end stayed up with a dead bouncer")
-		}
-		if !errors.As(err, &exitErr) {
-			t.Fatalf("unexpected exit: %v", err)
-		}
-		if code := exitErr.ExitCode(); code != 1 {
-			t.Fatalf("exit code = %d, want 1 (the bouncer connection is gone)", code)
-		}
-	case <-time.After(20 * time.Second):
-		_ = cmd.Process.Kill()
-		t.Fatal("the front end kept serving with a dead bouncer")
+	// The front end must stay up: it is a bridge, and a bridge with one broken session is
+	// still a bridge.
+	waitListening(t, "http://"+addr+"/")
+
+	// And the session must end, visibly. Opening the socket starts a child; the child
+	// finds the bouncer gone and exits, which closes the socket. A socket that stays open
+	// with a dead child behind it is a terminal that accepts typing and delivers nothing.
+	u := "ws://" + addr + "/ws?cols=80&rows=24"
+	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
 	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+	for {
+		var m struct {
+			Type string `json:"type"`
+		}
+		if err := conn.ReadJSON(&m); err != nil {
+			// Closed, which is the correct ending: the child is gone.
+			return
+		}
+		if m.Type == "exit" || m.Type == "error" {
+			return
+		}
+	}
+}
+
+// waitListening polls until the URL answers 200.
+func waitListening(t *testing.T, url string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("%s never answered", url)
 }
 
 // freeAddr returns a port that was free a moment ago, for the child to bind.
@@ -104,11 +123,7 @@ func TestWebExitsWhenTheBouncerCannotBeDialled(t *testing.T) {
 	// refused, which is the case that used to fall through to a local-only UI.
 	dead := freeAddr(t)
 
-	bin := t.TempDir() + "/salotto-web"
-	build := exec.Command("go", "build", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	bin := buildFrontEnd(t)
 
 	cmd := exec.Command(bin, "-addr", freeAddr(t), "-bouncer", dead, "-nick", "e2e-ui")
 	done := make(chan error, 1)
@@ -138,11 +153,7 @@ func TestWebServesLocalOnlyWithoutABouncer(t *testing.T) {
 		t.Skip("go binary not available to build the front end")
 	}
 
-	bin := t.TempDir() + "/salotto-web"
-	build := exec.Command("go", "build", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	bin := buildFrontEnd(t)
 
 	addr := freeAddr(t)
 	cmd := exec.Command(bin, "-addr", addr)
@@ -164,4 +175,23 @@ func TestWebServesLocalOnlyWithoutABouncer(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatal("a local-only UI without -bouncer never answered")
+}
+
+// buildFrontEnd builds the web front end AND the terminal client it spawns, into one
+// directory, because that is how the image ships them: resolveTUI looks beside itself
+// first, and a web binary alone in an empty directory has no sibling to find.
+func buildFrontEnd(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, c := range []struct{ pkg, name string }{
+		{".", "salotto-web"},
+		{"../salotto-tui", "salotto-tui"},
+	} {
+		out := filepath.Join(dir, c.name)
+		build := exec.Command("go", "build", "-o", out, c.pkg)
+		if b, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v\n%s", c.name, err, b)
+		}
+	}
+	return filepath.Join(dir, "salotto-web")
 }

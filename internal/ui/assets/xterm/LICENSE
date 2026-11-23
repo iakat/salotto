@@ -1,0 +1,8 @@
+xterm.js — MIT, https://github.com/xtermjs/xterm.js
+
+Vendored rather than loaded from a CDN: the page must work with no network access, and a
+chat client whose terminal comes from a third party is a chat client that stops working
+when that third party does. The browser half of this front end is a terminal emulator,
+and this is the one every project uses.
+
+Files: xterm.js (5.5.0), xterm.css. Unmodified.

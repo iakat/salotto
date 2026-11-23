@@ -1,10 +1,24 @@
-// Command salotto-web serves the salotto UI as HTML.
+// Command salotto-web serves the salotto TUI to a browser.
 //
-// This is the second front end in QUEUE.md §2.0, and it is deliberately thin:
-// it converts a ui.Program's View() to HTML with buildkite's terminal-to-html, so
-// the browser sees the terminal rendering instead of a second UI. The WebSocket
-// transport (W1) will replace the request-per-page part; the rendering half is
-// this file and does not change.
+// It is a PTY bridge, the way ttyd and GoTTY are: every websocket gets its own
+// salotto-tui process on its own pseudo-terminal, and the browser runs a terminal
+// emulator against it. The alternative - serialising the model's screen into JSON and
+// rebuilding a UI from those fields in JavaScript - is a second renderer, and this
+// front end has already paid for that twice: a nicklist drawn both by the model and by
+// a sidebar, an input line printed in two places, and a framed render wrapped in an
+// HTML frame.
+//
+// A PTY also settles, for free, the things that were hand-made before and each had its
+// own bug:
+//
+//	window size   TIOCSWINSZ -> bubbletea's WindowSizeMsg. No resize protocol.
+//	mouse         xterm emits the SGR mouse sequences; bubbletea decodes them.
+//	keys          xterm emits what a terminal emits, for every key and modifier.
+//	paste         bracketed paste, handled by bubbletea.
+//	colour        256-colour SGR from lipgloss, rendered by the emulator.
+//
+// And because each session is its own process with its own bouncer client, two
+// browsers are two clients of the same user rather than two views of one shared cursor.
 package main
 
 import (
@@ -16,7 +30,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -31,9 +47,10 @@ func main() {
 
 func run() int {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
-	window := flag.String("window", "status", "initial window")
 	bouncer := flag.String("bouncer", "", "bouncer address to attach to (host:port); empty serves a local-only UI")
 	nick := flag.String("nick", "salotto", "nick to register with the bouncer")
+	window := flag.String("window", "", "initial window (default: the nick's own window)")
+	tuiPath := flag.String("tui", "", "path to the salotto-tui binary (default: beside this binary)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -42,39 +59,59 @@ func run() int {
 		return 0
 	}
 
-	// Same reason as salotto-ssh: no TTY means no colour unless the profile is
-	// pinned, and the HTML converter only understands 8-bit SGR.
-	ui.Configure()
+	bin, err := resolveTUI(*tuiPath)
+	if err != nil {
+		slog.Error("cannot find the terminal client", "err", err, "hint", "pass -tui")
+		return 1
+	}
+
+	// A configured bouncer that cannot be reached is a front end that would accept a
+	// websocket, start a child, and have that child die before drawing anything: the
+	// browser shows an empty page and nobody learns why. Refusing to start hands it to
+	// the supervisor instead, which is where a retry belongs. An empty -bouncer stays a
+	// deliberate local-only UI.
+	if *bouncer != "" {
+		probe, err := net.DialTimeout("tcp", *bouncer, 5*time.Second)
+		if err != nil {
+			slog.Error("bouncer unreachable; exiting so the front end is retried",
+				"bouncer", *bouncer, "err", err)
+			return 1
+		}
+		_ = probe.Close()
+	}
+
+	// Each session builds its own child. The child owns the bouncer connection, so it
+	// dies with the session and a closed tab closes its client - which is what any IRC
+	// client does, and what a shared in-process Program could not do.
+	cmdFor := func(cols, rows int) *exec.Cmd {
+		args := []string{"-cols", fmt.Sprint(cols), "-rows", fmt.Sprint(rows)}
+		if *bouncer != "" {
+			args = append(args, "-bouncer", *bouncer, "-nick", *nick)
+		}
+		if *window != "" {
+			args = append(args, "-window", *window)
+		}
+		cmd := exec.Command(bin, args...)
+		cmd.Env = ui.SessionEnv()
+		// The child's stderr goes to the pod log: when a session dies there is nothing
+		// in the browser to explain why, and a silent 1006 close is not a diagnosis.
+		cmd.Stderr = os.Stderr
+		return cmd
+	}
+
+	srv := &http.Server{
+		Handler:           ui.TermHandler(ui.NewTermServer(cmdFor)),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "salotto-web: %v\n", err)
 		return 1
 	}
-	// One transport for the process, not one per request: the browser polls, and
-	// a bouncer connection per page load would open and close a client on every
-	// refresh, which the bouncer sees as a flapping user. It is attached to the
-	// shared Program the handler serves.
-	tr, err := dialBouncer(*bouncer, *nick)
-	if err != nil {
-		// An empty -bouncer is a deliberate local-only UI and stays one. A dial
-		// that failed is not the same thing: the front end was asked to attach
-		// and could not, and serving a page that accepts input and delivers
-		// nothing is the lie this file exists to avoid. Exit, so the supervisor
-		// retries the dial against a bouncer that is probably still starting.
-		slog.Error("bouncer dial failed; exiting so the front end is retried", "err", err)
-		return 1
-	}
-	if tr != nil {
-		defer tr.Close()
-	}
-	prog := ui.NewProgram(*window, tr)
 
-	srv := &http.Server{
-		Handler:           ui.Handler(prog),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	slog.Info("web listening", "addr", ln.Addr().String(), "window", *window)
+	slog.Info("web listening", "addr", ln.Addr().String(), "tui", bin,
+		"bouncer", *bouncer, "nick", *nick)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -85,29 +122,6 @@ func run() int {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	// A transport that dies leaves the page rendering a stale model and every
-	// POST going nowhere, which looks like a working UI until someone reads a
-	// line and sees nothing happened. There is no reconnect here on purpose: the
-	// model is a view of a bouncer that keeps the history, so coming back is a
-	// fresh dial that replays it. Exiting hands that to the supervisor instead of
-	// pretending to be alive.
-	transportDone := make(chan struct{})
-	if tr != nil {
-		go func() {
-			pump(prog, tr)
-			close(transportDone)
-		}()
-	}
-
-	if tr != nil {
-		go func() {
-			<-transportDone
-			slog.Error("bouncer connection lost; exiting so the front end is restarted",
-				"err", tr.Err())
-			os.Exit(1)
-		}()
-	}
-
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 		slog.Error("web serve failed", "err", err)
 		return 1
@@ -115,31 +129,24 @@ func run() int {
 	return 0
 }
 
-// pump feeds transport messages into the Program. The web handler renders on
-// demand, so the pump exists to keep the model current between requests: without
-// it the page would show whatever arrived before the first render and never
-// change.
-func pump(prog *ui.Program, tr *ui.Transport) {
-	for {
-		msg, ok := prog.Next()
-		if !ok {
-			return
+// resolveTUI finds the terminal client. Shipping both binaries beside each other is the
+// deployment's job; looking beside ourselves first means the web front end does not need
+// to be told where its sibling is.
+func resolveTUI(explicit string) (string, error) {
+	if explicit != "" {
+		if _, err := os.Stat(explicit); err != nil {
+			return "", err
 		}
-		prog.Step(msg)
+		return explicit, nil
 	}
-}
-
-// dialBouncer connects to the bouncer if one was configured. An empty address is
-// not an error: the UI works without a bouncer, which is what a quick look at the
-// renderer wants.
-func dialBouncer(addr, nick string) (*ui.Transport, error) {
-	if addr == "" {
-		return nil, nil
+	if self, err := os.Executable(); err == nil {
+		cand := filepath.Join(filepath.Dir(self), "salotto-tui")
+		if _, err := os.Stat(cand); err == nil {
+			return cand, nil
+		}
 	}
-	tr, err := ui.Dial(addr)
-	if err != nil {
-		return nil, err
+	if p, err := exec.LookPath("salotto-tui"); err == nil {
+		return p, nil
 	}
-	tr.Register(nick, "")
-	return tr, nil
+	return "", errors.New("salotto-tui not found beside the web binary or in PATH")
 }

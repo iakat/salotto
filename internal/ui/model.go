@@ -52,12 +52,28 @@ const (
 	LineNick
 	LineTopic
 	LineMode
+	// LinePreview is a link card. It is a line and not a panel because a terminal
+	// has no panels: the one thing a terminal can show beside a message is another
+	// line, and putting it there means the SSH and PTY front ends get previews for
+	// free instead of the browser getting them alone.
+	LinePreview
 )
 
 // Incoming is the message a transport sends when a line arrives. It is a plain
 // value so the web bridge can build one from a wire frame and a test can build
 // one from a literal.
 type Incoming Line
+
+// PreviewReady is the message that a link's card has been fetched. It is a message and
+// not a field on a frame because a card is a line: the model appends it, and every front
+// end shows it because every front end renders the model. The URL is what identifies it
+// - a fetch can finish after its window is gone.
+type PreviewReady struct {
+	Window string
+	URL    string
+	Title  string
+	Site   string
+}
 
 // Nicklist is the message a transport sends when the membership of a window
 // changes. Nicks are sorted and carry their prefix modes ("@", "+", "") so the
@@ -211,6 +227,27 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 
+	case tea.MouseMsg:
+		// A click in the window list selects that window. The model drew the list, so
+		// the model is what knows where it is; a click handler in the page would be a
+		// second copy of the layout, and the two would disagree the first time a
+		// breakpoint moved.
+		if win := m.WindowAt(msg.X, msg.Y); win != "" {
+			return m.SetActive(win), nil
+		}
+		return m, nil
+
+	case PreviewReady:
+		// A card is decoration appended under the line that carried the link. It never
+		// counts as unread and it never becomes active: nobody wants a channel to light
+		// up because a stranger's title tag loaded slowly.
+		m.append(Line{
+			Window: msg.Window,
+			Kind:   LinePreview,
+			Text:   previewText(msg.Title, msg.Site, msg.URL),
+		})
+		return m, nil
+
 	case ChannelModes:
 		if m.modes == nil {
 			m.modes = make(map[string]string, 4)
@@ -342,7 +379,11 @@ func (m *Model) append(l Line) {
 	// Unread is a count of things you did not see arrive. A line in the window you
 	// are looking at was seen, so it does not count; that is what makes the number
 	// meaningful rather than a total.
-	if l.Window != m.active && l.Kind != LineGap {
+	//
+	// A preview never counts. It is decoration attached to a message that already
+	// counted, and a channel lighting up because a stranger's title tag loaded slowly
+	// is the cheapest way to make the number untrustworthy.
+	if l.Window != m.active && l.Kind != LineGap && l.Kind != LinePreview {
 		if m.unread == nil {
 			m.unread = make(map[string]int)
 		}
@@ -376,19 +417,33 @@ var (
 	eventStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
 	topicEventStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("180"))
 	kickStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("174"))
-	timeStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	bodyStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
-	actionStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
-	noticeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
-	systemStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	gapStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	inputStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
-	barStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
+	// A preview is decoration, so it is dimmer than a message and cannot be mistaken
+	// for something a person said.
+	previewStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
+	timeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	bodyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
+	actionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
+	noticeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
+	systemStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	gapStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	inputStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
+	barStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 )
 
 // View renders the whole screen: a titled box with the scrollback and an input
 // line, then a status bar. It is the only rendering code in the program.
-func (m Model) View() string {
+// layout is the geometry of one full-screen render. It exists as a value because
+// the mouse handler has to agree with the renderer about where the window list is:
+// computing the columns twice is how a click selects the wrong channel, and it is the
+// kind of bug that only shows up on a screen size nobody tested.
+type layout struct {
+	width, height       int
+	winWidth, nickWidth int
+	inner               int
+	contentRows         int
+}
+
+func (m Model) layout() layout {
 	width := m.width
 	if width < 20 {
 		width = 20
@@ -397,137 +452,232 @@ func (m Model) View() string {
 	if height < 6 {
 		height = 6
 	}
+	l := layout{width: width, height: height}
 
-	// The nicklist takes a column on the right when the window has members. It is
-	// drawn inside the same border as the conversation, so the TUI shows what the
-	// browser shows in its sidebar rather than something a little different: one
-	// model, three renderers, and this is the third one agreeing.
-	nickWidth := 0
-	nicks := m.nicks[m.active]
-	if len(nicks) > 0 && width >= 60 {
-		nickWidth = 18
-		if width < 90 {
-			nickWidth = 14
+	// The window list needs room to be readable. Under 72 columns it is dropped
+	// rather than squeezed: a sidebar of four characters is a column of dots, and the
+	// keyboard still switches windows.
+	if len(m.order) > 0 && width >= 72 {
+		l.winWidth = 20
+		if width < 100 {
+			l.winWidth = 16
 		}
 	}
-	inner := width - 4 - nickWidth // border, padding, and the nick column
-	body := m.bodyLines(inner, height-6)
-	nickCol := nickColumn(nicks, nickWidth, height-6)
+	if len(m.nicks[m.active]) > 0 && width >= 72 {
+		l.nickWidth = 18
+		if width < 100 {
+			l.nickWidth = 14
+		}
+	}
+	l.inner = width - 2
+	if l.winWidth > 0 {
+		l.inner -= l.winWidth + 1
+	}
+	if l.nickWidth > 0 {
+		l.inner -= l.nickWidth + 1
+	}
+	if l.inner < 8 {
+		l.inner = 8
+	}
+	// Rows: top border, content, separator, input, bottom border, status.
+	l.contentRows = height - 5
+	if l.contentRows < 1 {
+		l.contentRows = 1
+	}
+	return l
+}
+
+// View draws the whole screen: window list, conversation, member list, input line and
+// status bar.
+//
+// The model draws all of it, and the web page is a thin shell around this string. That
+// is the rule the three front ends live by: there is exactly one place that knows what
+// a window list looks like, and it is here. A browser sidebar built in HTML was a
+// second one, and it drifted immediately - the nicks were drawn twice, once by the
+// renderer and once by the page.
+func (m Model) View() string {
+	l := m.layout()
+	nicks := m.nicks[m.active]
+	body := m.bodyLines(l.inner, l.contentRows)
+	winCol := m.windowColumn(l.winWidth, l.contentRows)
+	nickCol := nickColumn(nicks, l.nickWidth, l.contentRows)
 
 	var b strings.Builder
+
+	// Top border, with the active window as the title and the topic and modes after
+	// it. Modes first: they are short and survive truncation where a long topic does
+	// not.
 	b.WriteString(borderStyle.Render("╭─ "))
 	b.WriteString(titleStyle.Render(m.active))
 	if m.scroll > 0 {
 		b.WriteString(systemStyle.Render(fmt.Sprintf(" (scroll %d)", m.scroll)))
 	}
-	// The topic sits on the title row, which is where every IRC client puts it and
-	// the only place it can be seen without stealing a line from the conversation.
-	// Modes first: they are short and fixed-width-ish, so they survive truncation
-	// where a long topic would not.
 	if modes := m.modes[m.active]; modes != "" && modes != "+" {
 		b.WriteString(topicStyle.Render("  " + modes))
 	}
 	if topic := m.topics[m.active]; topic != "" {
-		room := width - lipgloss.Width(b.String()) - 6
+		room := l.width - lipgloss.Width(b.String()) - 6
 		if room > 12 {
 			b.WriteString(topicStyle.Render("  " + truncateTo(topic, room)))
 		}
 	}
-	head := lipgloss.Width(b.String()) + lipgloss.Width(borderStyle.Render(" ╮"))
-	if pad := width - head; pad > 0 {
-		b.WriteString(borderStyle.Render(strings.Repeat("─", pad) + "╮"))
-	}
+	m.closeTop(&b, l.width, "╮")
 	b.WriteString("\n")
 
-	for i, line := range body {
-		b.WriteString(borderStyle.Render("│ "))
-		b.WriteString(line)
-		if pad := inner - lipgloss.Width(line); pad > 0 {
-			b.WriteString(strings.Repeat(" ", pad))
-		}
-		if nickWidth > 0 {
+	for i := 0; i < l.contentRows; i++ {
+		b.WriteString(borderStyle.Render("│"))
+		if l.winWidth > 0 {
+			b.WriteString(cell(winCol, i, l.winWidth))
 			b.WriteString(borderStyle.Render("│"))
-			cell := ""
-			if i < len(nickCol) {
-				cell = nickCol[i]
-			}
-			b.WriteString(" ")
-			b.WriteString(cell)
-			// Pad on display width, not byte length: a nick with a wide glyph must
-			// not push the border out.
-			if pad := nickWidth - 2 - lipgloss.Width(cell); pad > 0 {
-				b.WriteString(strings.Repeat(" ", pad))
-			}
 		}
-		b.WriteString(borderStyle.Render(" │"))
+		b.WriteString(cell(body, i, l.inner))
+		if l.nickWidth > 0 {
+			b.WriteString(borderStyle.Render("│"))
+			b.WriteString(cell(nickCol, i, l.nickWidth))
+		}
+		b.WriteString(borderStyle.Render("│"))
 		b.WriteString("\n")
 	}
 
-	b.WriteString(borderStyle.Render("├" + strings.Repeat("─", width-2) + "┤"))
+	// The separator knows which columns exist, so the frame is one box and not three
+	// boxes stacked.
+	b.WriteString(borderStyle.Render("├"))
+	if l.winWidth > 0 {
+		b.WriteString(borderStyle.Render(strings.Repeat("─", l.winWidth) + "┼"))
+	}
+	b.WriteString(borderStyle.Render(strings.Repeat("─", l.inner)))
+	if l.nickWidth > 0 {
+		b.WriteString(borderStyle.Render("┼" + strings.Repeat("─", l.nickWidth)))
+	}
+	b.WriteString(borderStyle.Render("┤"))
 	b.WriteString("\n")
-	b.WriteString(borderStyle.Render("│ "))
-	b.WriteString(inputStyle.Render("> " + string(m.input)))
-	if pad := width - 4 - lipgloss.Width(string(m.input)) - 2; pad > 0 {
+
+	// Input row, spanning the conversation column: typing has nothing to do with the
+	// member list.
+	b.WriteString(borderStyle.Render("│"))
+	if l.winWidth > 0 {
+		b.WriteString(strings.Repeat(" ", l.winWidth))
+		b.WriteString(borderStyle.Render("│"))
+	}
+	input := "> " + string(m.input)
+	b.WriteString(inputStyle.Render(truncateTo(input, l.inner-1)))
+	if pad := l.inner - 1 - lipgloss.Width(inputStyle.Render(input)); pad > 0 {
 		b.WriteString(strings.Repeat(" ", pad))
 	}
-	b.WriteString(borderStyle.Render(" │"))
+	if pad := l.inner - 1 - lipgloss.Width(input); pad < 0 {
+		_ = pad
+	}
+	if l.nickWidth > 0 {
+		b.WriteString(borderStyle.Render("│" + strings.Repeat(" ", l.nickWidth)))
+	}
+	b.WriteString(borderStyle.Render("│"))
 	b.WriteString("\n")
-	b.WriteString(borderStyle.Render("╰" + strings.Repeat("─", width-2) + "╯"))
+
+	b.WriteString(borderStyle.Render("╰" + strings.Repeat("─", l.width-2) + "╯"))
 	b.WriteString("\n")
 	b.WriteString(m.statusBar())
 	return b.String()
 }
 
-// Body renders the conversation without a frame: no border, no input line, no status
-// bar. The browser draws its own chrome - sidebar, header, input form, footer - so
-// wrapping the full View() in those panels put a box inside a box and printed the
-// input line twice.
-//
-// It is still the same renderer: the lines come from bodyLines, styled by styleLine,
-// exactly as the TUI draws them. Only the frame around them is the caller's.
-func (m Model) Body(width, lines int) []string {
-	if width < 20 {
-		width = 20
+// closeTop fills the rest of the top border and closes it.
+func (m Model) closeTop(b *strings.Builder, width int, corner string) {
+	head := lipgloss.Width(b.String()) + lipgloss.Width(borderStyle.Render(" "+corner))
+	if pad := width - head; pad > 0 {
+		b.WriteString(borderStyle.Render(strings.Repeat("─", pad) + corner))
+	} else {
+		b.WriteString(borderStyle.Render(corner))
 	}
-	return m.bodyLines(width, lines)
 }
 
-// ScrollbackLen is how many lines the active window holds, so a driver can ask for a
-// number of lines that actually fills its viewport.
-func (m Model) ScrollbackLen() int { return len(m.windows[m.active]) }
-
-// bodyLines renders exactly n lines of scrollback, styled, bottom-aligned: a
-// short window shows the newest lines, which is what a chat window means.
-func (m Model) bodyLines(width, n int) []string {
-	if n < 1 {
-		n = 1
+// cell returns row i of a column, padded to width on display width. Display width and
+// not byte length: a nick or a topic with a wide glyph must not push the border out.
+func cell(col []string, i, width int) string {
+	s := ""
+	if i < len(col) {
+		s = col[i]
 	}
-	lines := m.windows[m.active]
-	end := len(lines) - m.scroll
-	if end > len(lines) {
-		end = len(lines)
-	}
-	if end < 0 {
-		end = 0
-	}
-	start := end - n
-	if start < 0 {
-		start = 0
-	}
-	out := make([]string, 0, n)
-	for _, l := range lines[start:end] {
-		out = append(out, styleLine(l, width))
-	}
-	for len(out) < n {
-		out = append(out, "")
+	out := s
+	if pad := width - lipgloss.Width(s); pad > 0 {
+		out += strings.Repeat(" ", pad)
 	}
 	return out
 }
 
+// windowColumn renders the window list: the active one marked, and a mention or an
+// unread count where there is one. It is inside the frame because the whole screen
+// belongs to the model - a window list drawn by the page was the second renderer that
+// drifted.
+func (m Model) windowColumn(width, n int) []string {
+	if width <= 2 || n <= 0 {
+		return nil
+	}
+	out := make([]string, 0, n)
+	for _, name := range m.order {
+		if len(out) >= n {
+			break
+		}
+		marker := "  "
+		if name == m.active {
+			marker = "▸ "
+		}
+		badge := ""
+		switch {
+		case m.mention[name]:
+			badge = "@"
+		case m.unread[name] > 0:
+			badge = fmt.Sprintf("%d", m.unread[name])
+		}
+		room := width - 2
+		if badge != "" {
+			room -= 2
+		}
+		label := truncateTo(name, room)
+		line := marker + label
+		if badge != "" {
+			pad := width - lipgloss.Width(line) - lipgloss.Width(badge)
+			if pad > 0 {
+				line += strings.Repeat(" ", pad)
+			}
+			line += badge
+		}
+		switch {
+		case name == m.active:
+			out = append(out, titleStyle.Render(line))
+		case m.mention[name]:
+			out = append(out, mentionStyle.Render(line))
+		default:
+			out = append(out, bodyStyle.Render(line))
+		}
+	}
+	return out
+}
+
+// WindowAt reports which window a click at character cell (x, y) landed on, "" if the
+// click was not in the window list. It uses the same layout the renderer used, so the
+// two cannot disagree.
+func (m Model) WindowAt(x, y int) string {
+	l := m.layout()
+	if l.winWidth == 0 {
+		return ""
+	}
+	// Column 0 is the left border, the list starts at 1 and is winWidth wide.
+	if x < 1 || x > l.winWidth {
+		return ""
+	}
+	row := y - 1 // row 0 is the top border
+	if row < 0 || row >= l.contentRows {
+		return ""
+	}
+	if row < len(m.order) {
+		return m.order[row]
+	}
+	return ""
+}
+
 // nickColumn renders the member list as n rows of at most width-2 columns. Ops keep
-// their prefix; ordinary members are plain. It is truncated rather than wrapped:
-// a nicklist that runs off the bottom of the screen would push the conversation out
-// of view, which is the wrong trade for a list you can scroll by asking NAMES again.
+// their prefix; ordinary members are plain. It is truncated rather than wrapped: a
+// nicklist that runs off the bottom pushes the conversation out of view, which is the
+// wrong trade for a list you can refresh by asking NAMES again.
 func nickColumn(nicks []Nick, width, n int) []string {
 	if width <= 2 || n <= 0 {
 		return nil
@@ -541,9 +691,7 @@ func nickColumn(nicks []Nick, width, n int) []string {
 		if nick.Prefix != "" {
 			label = nick.Prefix + nick.Name
 		}
-		if lipgloss.Width(label) > width-2 {
-			label = lipgloss.NewStyle().MaxWidth(width - 2).Render(label)
-		}
+		label = truncateTo(label, width-2)
 		if nick.Prefix != "" {
 			out = append(out, opStyle.Render(label))
 		} else {
@@ -553,9 +701,12 @@ func nickColumn(nicks []Nick, width, n int) []string {
 	return out
 }
 
-// truncateTo shortens a string to fit a display width, adding an ellipsis. Width
-// and not length: a topic with a wide glyph must not overflow the border.
+// truncateTo shortens a string to fit a display width, adding an ellipsis. Width and
+// not length: a topic with a wide glyph must not overflow the border.
 func truncateTo(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
 	if lipgloss.Width(text) <= width {
 		return text
 	}
@@ -565,47 +716,154 @@ func truncateTo(text string, width int) string {
 	return lipgloss.NewStyle().MaxWidth(width-1).Render(text) + "…"
 }
 
-func styleLine(l Line, width int) string {
-	text := l.Text
-	if lipgloss.Width(text) > width-2 {
-		// Truncate on width, not bytes: a wide glyph must not eat the border.
-		text = lipgloss.NewStyle().MaxWidth(width - 2).Render(text)
+// Body is gone: the model draws the whole screen, and the browser is a thin shell
+// around it. Keeping a body-only renderer was what let the page grow a second window
+// list and a second nicklist beside this one.
+
+// bodyLines renders the scrollback: wrapped to width, bottom-aligned, exactly n lines.
+// A chat window means the newest lines, and a long line means a second line and not an
+// ellipsis - truncating is what made the browser cut sentences off at the right edge.
+func (m Model) bodyLines(width, n int) []string {
+	if n < 1 {
+		n = 1
 	}
+	if width < 1 {
+		width = 1
+	}
+	lines := m.windows[m.active]
+	end := len(lines) - m.scroll
+	if end > len(lines) {
+		end = len(lines)
+	}
+	if end < 0 {
+		end = 0
+	}
+	// A lookback bound, not the whole buffer: wrapping expands lines, and rendering a
+	// thousand of them to show twenty is work with no visible result.
+	start := end - 200
+	if start < 0 {
+		start = 0
+	}
+	out := make([]string, 0, n)
+	for _, l := range lines[start:end] {
+		out = append(out, lineLines(l, width)...)
+	}
+	if len(out) > n {
+		out = out[len(out)-n:]
+	}
+	for len(out) < n {
+		out = append(out, "")
+	}
+	return out
+}
+
+// lineLines renders one line, wrapped to width. Each kind decides its own prefix and
+// style; continuation lines are indented under the text so a wrapped message still
+// reads as one message.
+func lineLines(l Line, width int) []string {
 	switch l.Kind {
 	case LineGap:
-		return gapStyle.Render(text)
+		return wrapStyled(gapStyle, l.Text, width, "")
 	case LineSystem:
-		return systemStyle.Render(text)
+		return wrapStyled(systemStyle, l.Text, width, "")
 	case LineNotice:
-		return noticeStyle.Render("<" + l.Nick + "> " + text)
+		return wrapStyled(noticeStyle, "<"+l.Nick+"> "+l.Text, width, "")
 	case LineAction:
-		return actionStyle.Render("* " + l.Nick + " " + text)
+		return wrapStyled(actionStyle, "* "+l.Nick+" "+l.Text, width, "")
 	case LineJoin:
-		// Joins and parts are the quietest things in a channel: dim, and marked with
-		// an arrow so a scan of the window can tell them from conversation without
-		// reading a word.
-		return eventStyle.Render("→ " + l.Nick + " " + text)
+		return wrapStyled(eventStyle, "→ "+l.Nick+" "+l.Text, width, "")
 	case LinePart:
-		return eventStyle.Render("← " + l.Nick + " " + text)
+		return wrapStyled(eventStyle, "← "+l.Nick+" "+l.Text, width, "")
 	case LineQuit:
-		return eventStyle.Render("⇐ " + l.Nick + " " + text)
+		return wrapStyled(eventStyle, "⇐ "+l.Nick+" "+l.Text, width, "")
 	case LineKick:
-		return kickStyle.Render("✖ " + text)
+		return wrapStyled(kickStyle, "✖ "+l.Text, width, "")
 	case LineNick:
-		return eventStyle.Render("↔ " + text)
+		return wrapStyled(eventStyle, "↔ "+l.Text, width, "")
 	case LineTopic:
-		return topicEventStyle.Render("≡ " + l.Nick + " " + text)
+		return wrapStyled(topicEventStyle, "≡ "+l.Nick+" "+l.Text, width, "")
 	case LineMode:
-		return eventStyle.Render("± " + text)
+		return wrapStyled(eventStyle, "± "+l.Text, width, "")
+	case LinePreview:
+		return wrapStyled(previewStyle, "┄ "+l.Text, width, "")
 	default:
-		// A mention is drawn differently in every front end. The model decides
-		// that it IS a mention; each renderer decides what that looks like, which
-		// is why this is a style here and a CSS class in the browser.
+		prefix := "<" + l.Nick + "> "
+		style := bodyStyle
 		if l.Mention {
-			return nickStyle.Render("<"+l.Nick+">") + " " + mentionStyle.Render(text)
+			style = mentionStyle
 		}
-		return nickStyle.Render("<"+l.Nick+">") + " " + bodyStyle.Render(text)
+		return wrapStyled(style, prefix+l.Text, width, strings.Repeat(" ", lipgloss.Width(prefix)))
 	}
+}
+
+// wrapStyled wraps text to width and styles each resulting line. The indent is applied
+// to continuation lines so a wrapped message lines up under its own text rather than
+// under the nickname.
+func wrapStyled(style lipgloss.Style, text string, width int, indent string) []string {
+	if width < 4 {
+		return []string{style.Render(text)}
+	}
+	chunks := wrapText(text, width)
+	if indent != "" {
+		for i := 1; i < len(chunks); i++ {
+			chunks[i] = indent + chunks[i]
+		}
+	}
+	out := make([]string, 0, len(chunks))
+	for _, c := range chunks {
+		out = append(out, style.Render(c))
+	}
+	return out
+}
+
+// wrapText breaks text into lines of at most width display cells, preferring spaces.
+// A word longer than the line is split: refusing to split it would push the border out
+// on exactly the input that is easiest to produce (a pasted URL).
+func wrapText(text string, width int) []string {
+	if width < 2 {
+		return []string{text}
+	}
+	if lipgloss.Width(text) <= width {
+		return []string{text}
+	}
+	var out []string
+	cur := ""
+	curW := 0
+	flush := func() {
+		if cur != "" {
+			out = append(out, cur)
+			cur, curW = "", 0
+		}
+	}
+	for _, word := range strings.Split(text, " ") {
+		w := lipgloss.Width(word)
+		sep := 0
+		if curW > 0 {
+			sep = 1
+		}
+		if curW+sep+w <= width {
+			if sep == 1 {
+				cur += " "
+				curW++
+			}
+			cur += word
+			curW += w
+			continue
+		}
+		flush()
+		// The word alone does not fit: hard-split it.
+		for lipgloss.Width(word) > width {
+			head := lipgloss.NewStyle().MaxWidth(width).Render(word)
+			out = append(out, head)
+			word = strings.TrimPrefix(word, head)
+		}
+		cur, curW = word, lipgloss.Width(word)
+	}
+	flush()
+	if len(out) == 0 {
+		out = append(out, "")
+	}
+	return out
 }
 
 func (m Model) statusBar() string {
@@ -735,6 +993,24 @@ func (m Model) Topic(window string) string { return m.topics[window] }
 // Modes returns a window's channel mode string ("+nt"), "" if not a channel or not
 // known.
 func (m Model) Modes(window string) string { return m.modes[window] }
+
+// previewText renders a card as one line: the site, the title, and the URL only when
+// the title does not already name it. One line because a terminal's unit of display is a
+// line, and three lines of card for one link is most of a phone screen.
+func previewText(title, site, rawURL string) string {
+	title = strings.TrimSpace(title)
+	site = strings.TrimSpace(site)
+	switch {
+	case title != "" && site != "":
+		return title + " — " + site
+	case title != "":
+		return title
+	case site != "":
+		return site
+	default:
+		return rawURL
+	}
+}
 
 // Links returns the distinct links in a window's recent lines, most recent first.
 //

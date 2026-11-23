@@ -8,11 +8,13 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/salottod ./cmd/salottod \
  && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/salotto-web ./cmd/salotto-web \
+ && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/salotto-tui ./cmd/salotto-tui \
  && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/salotto-ssh ./cmd/salotto-ssh
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/salottod /usr/local/bin/salottod
 COPY --from=build /out/salotto-web /usr/local/bin/salotto-web
+COPY --from=build /out/salotto-tui /usr/local/bin/salotto-tui
 COPY --from=build /out/salotto-ssh /usr/local/bin/salotto-ssh
 # 6667 the client listener, 6668 stats, 113 ident, 8080 web, 2222 ssh.
 EXPOSE 6667 6668 113 8080 2222

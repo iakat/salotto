@@ -57,6 +57,20 @@ func SSHProgram(in io.Reader, out io.Writer, m Model) *tea.Program {
 	return tea.NewProgram(m, tea.WithInput(in), tea.WithOutput(out))
 }
 
+// TUIProgram builds the program a terminal session runs: stdin and stdout, mouse
+// reporting, and the alt screen. Mouse reporting is what makes the window list
+// clickable in a real terminal AND in the browser, because the browser is running this
+// same program on a PTY.
+func TUIProgram(p *Program, in io.Reader, out io.Writer) *tea.Program {
+	return tea.NewProgram(
+		p,
+		tea.WithInput(in),
+		tea.WithOutput(out),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+	)
+}
+
 // Table is a small helper the settings screens share, so the boxed look is
 // defined once. It returns plain text plus ANSI, like every other view.
 func Table(headers []string, rows [][]string) string {
