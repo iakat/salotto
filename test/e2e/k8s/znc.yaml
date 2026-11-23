@@ -68,7 +68,9 @@ data:
             LoadModule = keepnick
             LoadModule = buffextras
             IRCConnectEnabled = true
-            Server = salotto-e2e-ergo:6667
+            # CServer::Parse (src/Server.cpp): "host port", and a "+" prefix on
+            # the port means SSL. "+6667" is therefore TLS, not a port number.
+            Server = salotto-e2e-ergo 6667
             Encoding = ^UTF-8
             <Chan #e2e>
             </Chan>

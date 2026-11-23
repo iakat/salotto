@@ -333,6 +333,14 @@ func run() int {
 // channel or query window goes through BroadcastWindows. The caller owns
 // windows and must not keep using it after the call.
 func dispatchRouted(srv *facade.Server, netName string, windows []string, line []byte) {
+	dispatchRoutedFrom(srv, netName, windows, line, nil)
+}
+
+// dispatchRoutedFrom is dispatchRouted for a line a client sent. source is that
+// client, and it decides who gets the echo: ZNC sends the author's own line back
+// only when the author negotiated echo-message (Client.cpp:1138), so a client
+// that draws its own messages locally is not shown them twice.
+func dispatchRoutedFrom(srv *facade.Server, netName string, windows []string, line []byte, source *facade.Subscriber) {
 	if srv == nil {
 		return
 	}
@@ -347,18 +355,24 @@ func dispatchRouted(srv *facade.Server, netName string, windows []string, line [
 		srv.Broadcast(netName, 0, line, time.Now().UnixNano())
 		return
 	}
-	srv.BroadcastWindows(netName, windows, 0, line, time.Now().UnixNano())
+	srv.BroadcastWindowsFrom(netName, windows, 0, line, time.Now().UnixNano(), source)
 }
 
 // dispatchEntries is dispatchRouted for a caller that has the parsed entries
 // but not the window list. It runs on the outbound path, where the allocation
 // does not matter.
 func dispatchEntries(srv *facade.Server, netName string, entries []logfile.Entry, line []byte) {
+	dispatchEntriesFrom(srv, netName, entries, line, nil)
+}
+
+// dispatchEntriesFrom is dispatchEntries for a line a client sent: source is
+// that client, and only it is subject to the echo-message gate.
+func dispatchEntriesFrom(srv *facade.Server, netName string, entries []logfile.Entry, line []byte, source *facade.Subscriber) {
 	windows := make([]string, len(entries))
 	for i, e := range entries {
 		windows[i] = e.Window
 	}
-	dispatchRouted(srv, netName, windows, line)
+	dispatchRoutedFrom(srv, netName, windows, line, source)
 }
 
 // joinableChannels returns the channels a network should join on the next

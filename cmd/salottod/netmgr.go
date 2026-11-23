@@ -163,7 +163,7 @@ func (m *netmgr) Start(nc config.Network) error {
 		},
 		OnSend: func(line []byte) {
 			entries := w.Route(line, true)
-			dispatchEntries(m.srv, netName, entries, line)
+			dispatchEntriesFrom(m.srv, netName, entries, line, m.srv.OutboundSource())
 			w.OnRouted(entries, line, true)
 		},
 		OnConnect: func() {

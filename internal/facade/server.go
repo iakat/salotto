@@ -148,7 +148,12 @@ type Server struct {
 	windows      *windowState
 	fingerprints *Fingerprints
 	created      string
-	active       atomic.Int64
+
+	// outSource is the client whose line is being sent right now, read by the
+	// daemon's OnSend hook. outMu makes the attribution exact; see forward.
+	outMu     sync.Mutex
+	outSource atomic.Pointer[Subscriber]
+	active    atomic.Int64
 
 	linePool sync.Pool
 }
@@ -382,6 +387,13 @@ func (s *Server) networkName() string {
 
 // Attached returns the number of clients currently attached to the hub.
 func (s *Server) Attached() int { return s.hub.Len() }
+
+// OutboundSource returns the client whose line is being sent right now, or nil
+// when the line did not come from a client. The daemon reads it inside OnSend so
+// the echo-message gate can tell the author from everyone else.
+func (s *Server) OutboundSource() *Subscriber {
+	return s.outSource.Load()
+}
 
 // KnownNick returns the upstream nick the facade has learned for a network, or
 // "". Callers outside the client path use it to answer "is this line about us"
@@ -692,6 +704,12 @@ func (c *client) handleCapReq(args []byte) bool {
 		return c.send(":", c.srv.cfg.ServerName, " CAP * NAK :", string(req))
 	}
 	c.caps = mask
+	// echo-message decides whether this client gets its own lines back, which is
+	// ZNC's HasEchoMessage gate (Client.cpp:1138). Keep the subscriber in step,
+	// including for a CAP REQ that arrives after registration.
+	if idx := capIndex([]byte("echo-message")); idx >= 0 {
+		c.sub.SetEchoMessage(c.caps&(1<<uint(idx)) != 0)
+	}
 	if c.registered {
 		c.sub.SetIdentity(c.nick, c.extendedJoin())
 	}
@@ -898,6 +916,19 @@ func (c *client) replayNetwork(ne *networkEntry) bool {
 // protocol to choose a network. No 402 is emitted because the choice is never
 // ambiguous.
 func (c *client) forward(line []byte) bool {
+	// The daemon fans outbound lines out from its OnSend hook, which runs
+	// synchronously inside Network.Send, and it must know which client is the
+	// author so that client's own line is only echoed back when it asked for
+	// echo-message (ZNC does the same, Client.cpp:1138). outMu serialises the
+	// attribution: Send is enqueue-only and does not block, so holding it across
+	// the call costs nothing while making the attribution exact.
+	c.srv.outMu.Lock()
+	c.srv.outSource.Store(c.sub)
+	defer func() {
+		c.srv.outSource.Store(nil)
+		c.srv.outMu.Unlock()
+	}()
+
 	nets := c.srv.netSnapshot()
 	if len(nets) == 0 {
 		return c.notConnected()

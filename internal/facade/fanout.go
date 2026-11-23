@@ -20,7 +20,12 @@ type Subscriber struct {
 	outN     int
 	nick     string
 	extended bool
-	closed   bool
+	// echo is set when the client negotiated echo-message. ZNC echoes a user's
+	// own line back to that user only in this case (Client.cpp:1138,
+	// EchoMessage: HasEchoMessage() || (pClient != this && ...)), so a client
+	// that renders its own messages locally does not get duplicates.
+	echo   bool
+	closed bool
 
 	wake    chan struct{}
 	done    chan struct{}
@@ -54,6 +59,21 @@ func (s *Subscriber) SetIdentity(nick string, extendedJoin bool) {
 	s.nick = nick
 	s.extended = extendedJoin
 	s.mu.Unlock()
+}
+
+// SetEchoMessage records whether the client negotiated echo-message. It is the
+// only reason a client may receive the line it just sent.
+func (s *Subscriber) SetEchoMessage(echo bool) {
+	s.mu.Lock()
+	s.echo = echo
+	s.mu.Unlock()
+}
+
+// HasEchoMessage reports whether the client negotiated echo-message.
+func (s *Subscriber) HasEchoMessage() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.echo
 }
 
 // Write copies one framed IRC line (already CRLF-terminated by the caller) into

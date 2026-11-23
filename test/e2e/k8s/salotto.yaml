@@ -13,7 +13,7 @@ data:
   salotto.toml: |
     listen = "0.0.0.0:6667"
     server_name = "salotto"
-    stats_listen = "0.0.0.0:6668"
+    stats_listen = "127.0.0.1:6668"
     log_dir = "/data/logs"
     ring_segments = 16
     ring_segment_size = 8192
@@ -66,7 +66,6 @@ spec:
           args: ["-config", "/etc/salotto/salotto.toml", "-log-level", "info"]
           ports:
             - {name: irc, containerPort: 6667}
-            - {name: stats, containerPort: 6668}
           resources:
             limits: {memory: 256Mi, cpu: 300m}
             requests: {memory: 32Mi, cpu: 20m}
@@ -92,4 +91,4 @@ spec:
   selector: {app: salotto-e2e}
   ports:
     - {name: irc, port: 6667, targetPort: 6667}
-    - {name: stats, port: 6668, targetPort: 6668}
+

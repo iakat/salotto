@@ -538,6 +538,15 @@ func (s *Server) BroadcastWindow(netName, window string, seq uint64, line []byte
 // it is buffered and PLAYBUFFER is how that client catches up. No client
 // receives it twice. It is the routing entry point for a non-status line.
 func (s *Server) BroadcastWindows(netName string, windows []string, seq uint64, line []byte, ts int64) {
+	s.BroadcastWindowsFrom(netName, windows, seq, line, ts, nil)
+}
+
+// BroadcastWindowsFrom is BroadcastWindows for a line a *client* sent. ZNC's
+// CClient::EchoMessage sends the echo back to the author only when that client
+// negotiated echo-message, while every other client gets a channel line
+// unconditionally (Client.cpp:1138). source is that author; nil means the line
+// came from the network, where nobody is the author and everyone sees it.
+func (s *Server) BroadcastWindowsFrom(netName string, windows []string, seq uint64, line []byte, ts int64, source *Subscriber) {
 	if len(windows) == 0 {
 		return
 	}
@@ -565,9 +574,15 @@ func (s *Server) BroadcastWindows(netName string, windows []string, seq uint64, 
 	p := s.linePool.Get().(*[]byte)
 	b := appendLiveLine((*p)[:0], line, ts)
 	for _, sub := range attached {
+		if sub == source && !sub.HasEchoMessage() {
+			continue
+		}
 		sub.WriteFrom(b, un)
 	}
 	s.hub.BroadcastFromSkip(b, un, func(sub *Subscriber) bool {
+		if sub == source && !sub.HasEchoMessage() {
+			return true
+		}
 		return s.windows.skipCatchAll(sub, keys, attachedSet[sub])
 	})
 	*p = b
