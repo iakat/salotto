@@ -92,3 +92,17 @@ sed 's/name: salotto-e2e-image-build/name: salotto-e2e-image-build-N/' \
 $K apply -f /tmp/b.yaml
 $K delete pod -l app=salotto-ui --wait=false   # :e2e is a stable tag + Always pull
 ```
+- **A front end must notice its bouncer dying.** The web driver holds one
+  transport for the process, so when the bouncer was redeployed underneath it the
+  page kept rendering, the input box kept accepting text and POST kept answering
+  303, while every line went nowhere: healthy-looking and completely dead. There
+  is no in-process reconnect, deliberately — the model is a view of a bouncer that
+  keeps the history, so coming back is a fresh dial that replays the buffer — so
+  the driver exits non-zero and lets the supervisor make that dial.
+  `TestWebExitsWhenTheBouncerGoesAway` builds the real binary, points it at a
+  listener that accepts and hangs up, and requires a non-zero exit within twenty
+  seconds. The SSH front end never had this bug because it dials per session.
+- **A password must be offered, not merely accepted.** `probe_ssh.py` reported
+  "No authentication methods available" against a working server: the handler
+  accepts any password when none is configured, but a client that offers none has
+  no method in common and is refused before the handler runs.
