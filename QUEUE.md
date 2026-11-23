@@ -38,6 +38,30 @@ ZNC ships 59 modules (`ls modules/*.cpp | wc -l` → 59) and 32 bouncer commands
 *every* one of those either exists, or is deliberately dropped with a reason
 written here. Nothing gets to be quietly missing.
 
+**Audit, last run against the ZNC clone in `cache/scratch/znc-src`:** every one of
+the 59 module names and all 32 command names appears in this file, each with a
+status. Recheck with:
+
+```sh
+# every module name must appear somewhere in this file (must print nothing)
+comm -23 <(ls modules/*.cpp | sed 's|.*/||; s/.cpp//' | sort) \
+         <(grep -o '[a-z_0-9]\+' QUEUE.md | sort -u)
+
+# 32 bouncer commands, counted the only way that gives 32: a bare
+# `grep -c AddCommandHelp` returns 61 because the file also contains a lambda
+# named AddCommandHelp and 27 plain calls, so count distinct help entries.
+grep -o 'AddCommandHelp("[A-Za-z]*"' src/ClientCommand.cpp \
+  | sed 's/AddCommandHelp("//; s/"//' | sort -u | wc -l        # 32
+```
+
+The bouncer side (Part 1) is closed: 59/59 modules settled, 32/32 commands
+settled, and 15 differential parity cases run through a deployed ZNC 1.10.2
+(`test/e2e/parity.py`, 14 identical + 1 declared deviation). What is still open
+in this file is the **client** side (Part 2: W1 WebSocket, the PWA shell, search
+UI, uploads, admin panel) and the one module row blocked behind it
+(`adminlog`, which needs an admin surface to log). Those are not parity gaps —
+they are the next milestone, and §2.0 now says which half of it is real.
+
 ### 1.1 Core bouncer capabilities (must have — these are what a bouncer *is*)
 
 | # | capability | ZNC evidence | our state |
@@ -220,6 +244,7 @@ Grouped, because 59 rows is a wall, and the grouping *is* the decision.
 | `buffextras` | put joins/parts/modes into the replay buffer | **done** by B2's routing split; `TestBuffExtrasReachesTheReplayRing` |
 | `savebuff` | persist the buffer across restarts | **refuse, matching ZNC.** It is not built in upstream either: it is a loadable module that serialises each window's buffer to disk on shutdown (`savebuff.cpp:199-217`) and replays it on boot (`:99-138`). salotto's rings are in memory by design and its history is the log files, which are already on disk and already searchable — a third copy would be a cache pretending to be history. |
 | `clearbufferonmsg` | clear buffer when you speak | **done** (`clearbufferonmsg.cpp`) |
+| `adminlog` | log admin actions to a file or syslog | **open — blocked on the admin surface, not on this row.** ZNC writes user/network add/remove/edit events to `GetSavePath()+"/znc.log"` or syslog (`adminlog.cpp:99-115`). Part 2 §8 requires the same audit trail from us ("every admin action appends a line with actor, action, target, result, timestamp"), and it should be built in rather than a module you can unload. But there is no admin surface yet to log: `grep -r 'admin' internal/ cmd/` finds nothing, because the single-tenant OIDC admin panel is §2.0.2/§2.3 and not started. Writing an audit log for actions that do not exist would be a log of nothing. |
 | `stripcontrols` | strip control codes before logging | **done**, opt-in. `internal/logfile/stripcontrols.go` reproduces `CString::StripControls_n` (`ZNCString.cpp:1452-1498`) including the two cases a regex gets wrong (a comma not followed by digits is text; a trailing code can still emit a comma). Applied to log bodies only when `strip_controls = true`, because in ZNC the module is opt-in and `log` writes what was said — `sanitizeBody` separately and always removes CR/LF/C0 for log integrity, which is a different job. Tests: `TestStripControlsMatchesZNC`, `TestStripControlsModuleIsOptIn`, `TestStripControlsKeepsTheReplayRingIntact`. |
 | `sasl` | SASL PLAIN | **have** |
 | `cert` / `certauth` | SASL EXTERNAL via client cert | **done** as B6: `sasl_external` + `cert_file`/`key_file`, EXTERNAL response is ZNC's single `"+"` (`sasl.cpp:198-213`), no PLAIN fallback when the certificate is missing |
