@@ -371,6 +371,14 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case tea.KeyRunes:
 		m.input = append(m.input, msg.Runes...)
 		return m, nil
+
+	case tea.KeySpace:
+		// bubbletea reports a space as KeySpace, not as a KeyRunes event carrying " ".
+		// Accepting only KeyRunes drops every space, so typing "hello there" produced
+		// "hellothere" and "/join #chan" produced "/join#chan" - and the message went out
+		// mangled rather than failing, which is the worst way for an input bug to behave.
+		m.input = append(m.input, ' ')
+		return m, nil
 	}
 	return m, nil
 }

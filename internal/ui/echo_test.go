@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/creack/pty"
 )
 
@@ -225,6 +226,73 @@ func TestTheChildRegistersWithTheBouncer(t *testing.T) {
 			}
 		case <-deadline:
 			t.Fatalf("the client never registered (NICK=%v USER=%v): a bouncer holds a user only once it gets them, and until then there is no window list and no nick list", seenNick, seenUser)
+		}
+	}
+}
+
+// TestSpacesSurviveTyping is the bug that made every command arrive mangled.
+//
+// bubbletea reports a space as tea.KeySpace, a key type of its own, and not as a KeyRunes
+// event carrying " ". A handler that only accepts KeyRunes silently drops every space:
+// "/join #chan" becomes "/join#chan", "hello there" becomes "hellothere", and nothing
+// errors - the wrong text just goes out. That is the worst shape an input bug can take.
+func TestSpacesSurviveTyping(t *testing.T) {
+	Configure()
+	for _, c := range []struct {
+		keys []tea.KeyMsg
+		want string
+	}{
+		{[]tea.KeyMsg{{Type: tea.KeyRunes, Runes: []rune("join")}, {Type: tea.KeySpace}, {Type: tea.KeyRunes, Runes: []rune("#chan")}}, "join #chan"},
+		{[]tea.KeyMsg{{Type: tea.KeyRunes, Runes: []rune("hello")}, {Type: tea.KeySpace}, {Type: tea.KeyRunes, Runes: []rune("there")}}, "hello there"},
+		// Two spaces in a row, because a run of them is where a partial fix (only the
+		// first space) shows up.
+		{[]tea.KeyMsg{{Type: tea.KeyRunes, Runes: []rune("a")}, {Type: tea.KeySpace}, {Type: tea.KeySpace}, {Type: tea.KeyRunes, Runes: []rune("b")}}, "a  b"},
+	} {
+		m := New("#test")
+		for _, k := range c.keys {
+			m, _ = m.Step(k)
+		}
+		if got := string(m.input); got != c.want {
+			t.Errorf("typed %q, want %q", got, c.want)
+		}
+	}
+}
+
+// TestASpaceReachesTheWire is the same bug at the other end: the input buffer being right
+// is not the same as the line going out right.
+func TestASpaceReachesTheWire(t *testing.T) {
+	Configure()
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	tr.Register("alice", "")
+	p := NewProgram("#test", tr)
+	p.Step(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	for _, ru := range "hello there" {
+		if ru == ' ' {
+			p.Step(tea.KeyMsg{Type: tea.KeySpace})
+		} else {
+			p.Step(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ru}})
+		}
+	}
+	p.Step(tea.KeyMsg{Type: tea.KeyEnter})
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line := <-fb.sent:
+			if strings.Contains(line, "PRIVMSG") {
+				if !strings.Contains(line, "hello there") {
+					t.Fatalf("the line went out mangled: %q", line)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("nothing was sent")
 		}
 	}
 }

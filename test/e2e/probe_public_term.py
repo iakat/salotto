@@ -24,6 +24,34 @@ import time
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[()][A-Z0-9]")
 
 
+def type_line(ws, text):
+    """Type a line a key at a time, spaces included, then Enter.
+
+    A space is its own key on a terminal. Sending the whole line as one input event works
+    for plain characters and silently loses every space, which is how "/join #chan" became
+    "/join#chan" with no error anywhere.
+    """
+    for ch in text:
+        ws.send(json.dumps({"type": "input", "data": base64.b64encode(ch.encode()).decode()}))
+    ws.send(json.dumps({"type": "input", "data": base64.b64encode(b"\r").decode()}))
+
+
+def screen(chunks):
+    """The newest complete screen: the last full draw, escape codes removed.
+
+    A terminal stream is a sequence of redraws, not lines appended to a file. Accumulating
+    every byte from every redraw makes each message appear once per repaint, which reads
+    as "messages are duplicated" when the terminal is fine. Taking the last draw and
+    stripping the sequences gives what a person sees.
+    """
+    text = b"".join(chunks)
+    # Each full render starts by moving the cursor home.
+    parts = text.split(b"\x1b[H")
+    last = parts[-1] if parts else text
+    out = ANSI.sub(b"", last).decode("utf-8", "replace")
+    return out.replace("\r\n", "\n")
+
+
 def visible(line):
     """A line as a terminal would draw it: escape sequences are not characters.
 
@@ -129,6 +157,35 @@ class WS:
                     break
         return got
 
+    def read(self, deadline):
+        """Collect output until the deadline, as a list of chunks in arrival order.
+
+        Chunks rather than one blob, because screen() needs to find the last full draw and
+        a blob has already lost where the draws began. Terminal output is a stream of
+        repaints; concatenating them makes each message appear once per repaint.
+        """
+        chunks = []
+        # A short socket timeout so an idle gap does not end the read: the terminal goes
+        # quiet between repaints, and stopping at the first quiet moment returns an empty
+        # screen that looks like a broken renderer.
+        self.sock.settimeout(1.0)
+        while time.time() < deadline:
+            try:
+                payload = self.recv()
+            except socket.timeout:
+                continue
+            except RuntimeError:
+                break
+            if not payload:
+                continue
+            try:
+                msg = json.loads(payload)
+            except ValueError:
+                continue
+            if msg.get("type") == "output" and msg.get("data"):
+                chunks.append(base64.b64decode(msg["data"]))
+        return chunks
+
     def close(self):
         try:
             self.sock.close()
@@ -199,6 +256,35 @@ def main():
             fails.append(nick)
         else:
             print(f"  ok   resize reached the model ({width} chars in the top border)")
+
+        # 5. A real conversation: join a channel and say something.
+        #
+        # This is what a person does first, and it is where both reported bugs lived: an
+        # unregistered client showed no windows at all, and a registered one drew every
+        # message twice. Assert on the SCREEN, not on accumulated output.
+        chan = "#salotto-probe"
+        type_line(ws, "/join " + chan)
+        joined = ws.read(time.time() + 15)
+        scr = screen(joined)
+        if chan not in scr:
+            print(f"  FAIL {chan} never appeared in the window list")
+            fails.append(nick)
+        else:
+            print("  ok   join opened a window")
+
+        body = f"probe {nick} message"
+        type_line(ws, body)
+        said = ws.read(time.time() + 15)
+        scr = screen(said)
+        n = scr.count(body)
+        if n == 0:
+            print("  FAIL our own message never appeared")
+            fails.append(nick)
+        elif n > 1:
+            print(f"  FAIL our own message is on screen {n} times: it is echoed locally and by the bouncer")
+            fails.append(nick)
+        else:
+            print("  ok   our own message appears exactly once")
 
         ws.close()
 
