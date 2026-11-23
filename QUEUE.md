@@ -264,10 +264,26 @@ SaveConfig SetBindHost SetBuffer Traffic UnloadMod`
 
 Mapping:
 
-- **Already meaningful for us**: `Attach`, `Detach`, `Connect`, `Disconnect`,
-  `ListNetworks`, `ListServers`, `ListChans`, `ListClients`, `SetBuffer`,
-  `Traffic`, `ClearAllBuffers`, `ClearAllChannelBuffers`, `DisableChan`,
-  `EnableChan`, `AddServer`, `DelServer`, `MoveChan`, `MoveNetwork`.
+- **Implemented**: `Attach`, `Detach`, `Connect`, `Disconnect`, `ListNetworks`,
+  `ListServers`, `ListChans`, `ListClients`, `SetBuffer`, `Traffic`,
+  `ClearAllBuffers`, `ClearAllChannelBuffers`, `ClearAllQueryBuffers`,
+  `ClearBuffer`, `PlayBuffer`, `DisableChan`, `EnableChan`, and the B14/B15
+  command set. The list commands answer with ZNC's `CTable` grid
+  (`internal/facade/table.go`) and the exact sentences from
+  `ClientCommand.cpp`; `Connect`/`Disconnect` drive a real
+  `m_bIRCConnectEnabled` gate in `upstream.Conn`, and `SetBuffer` resizes the
+  window's ring (`winring.Set.Resize`) rather than only answering. All eleven
+  cases are settled differentially against a deployed ZNC 1.10.2
+  (`test/e2e/parity.py`, `docs/E2E.md`).
+- **Still to do**: `AddServer`, `DelServer`, `MoveChan`, `MoveNetwork` — these
+  mutate a persisted server/channel list, and there is no server list: one
+  address per network comes from the config, so the honest implementation
+  arrives with the admin surface (§2.0.2) that writes config.
+- **Correction**: an earlier revision of this table called the above
+  "already meaningful for us". Grepping the tree showed `LISTNETWORKS`,
+  `LISTSERVERS`, `LISTCLIENTS`, `TRAFFIC`, `CONNECT`, `DISCONNECT` and
+  `SETBUFFER` did not exist at all. The row was wrong in the optimistic
+  direction; that is worse than wrong, because it stops anyone looking.
 - **Must have, and not negotiable** (katia): `SetBindHost`, `ClearBindHost`,
   `SetUserBindHost`, `ClearUserBindHost`, `ShowBindHost` — plus FREEBIND support.
   These are the outbound *source address* controls, not listener config; the
@@ -280,7 +296,8 @@ Mapping:
   `Broadcast`, `ListMods`, `ListUsers` (cross-user; no multi-tenant admin over
   IRC — admin lives in the Web UI, per Part 0.3).
 
-So: ~22 commands to implement, 1 dropped by design (`AddPort`), 6 refused.
+So: 22 commands implemented and verified, 4 waiting on the admin surface, 1
+dropped by design (`AddPort`), 6 refused.
 
 ### 1.4 Bouncer gaps the `log` work exposed
 
