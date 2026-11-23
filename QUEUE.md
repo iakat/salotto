@@ -533,14 +533,14 @@ message.
 
 | # | item | notes |
 |---|---|---|
-| W1 | **Transport adapter**: same frames over a binary WebSocket (`Sec-WebSocket-Protocol: salotto.v1`) | already designed in `docs/SPEC.md` §13; the whole client is transport-agnostic by construction |
+| W1 | **Transport adapter**: same frames over a binary WebSocket (`Sec-WebSocket-Protocol: salotto.v1`) | **done** — `internal/ui/ws.go`, JSON frames (`state`/`results`). The server still renders with the same `View()` as the TUI and SSH sessions; the socket adds structure, not a second renderer. Verified through the live edge Gateway by `test/e2e/probe_public_ws.py` (alice sends, bob's separate bouncer must see it). Two bugs it exposed, both fixed: a client that joined was never attached to the channel it created, and our own JOIN routed to `status` so the window never opened. |
 | W2 | **Client state engine**: channels, nicklists, topics, modes, unread, scrollback — built from checkpoint + replay | this is the TUI's core, reused; the UI is a view over it, not a second implementation |
 | W3 | **Channel + query rendering**, message types for join/part/quit/nick/kick/topic/mode/ctcp/away/invite/error/whois | The Lounge has 20 message-type renderers; that is the honest count of shapes to draw, and each is small |
-| W4 | **Search**: cross-channel, with jump-to-context | The Lounge's search is single-channel and cannot jump to context (#3 in Part 3). Ours is server-side over the log index (`/v1/log/search`, done) *plus* in-client buffer search. Two different questions, two different mechanisms. |
+| W4 | **Search**: cross-channel, with jump-to-context | **in-client half done**: `Model.Search` crosses every window and each hit carries its window, which the browser uses to jump. Linear scan on purpose — in-memory scrollback is bounded by the window caps, so an index has nothing to buy and can disagree with the lines it indexes. The server half (`/v1/log/search`) exists for "find this from last month". Verified live by `probe_public_features.py`. |
 | W5 | **Link previews, done safely** | see 2.2 — this is where The Lounge is most wrong |
 | W6 | **File uploads** | a separate concern with its own storage, quota and content-type policy; not an IRC feature |
 | W7 | **Push notifications** via Web Push | optional, off by default; requires HTTPS + VAPID keys |
-| W8 | **Typing indicators, mentions, mute, highlight rules** | IRCv3 `typing`, client-side mentions |
+| W8 | **Typing indicators, mentions, mute, highlight rules** | **mentions done**: word-boundary match on our own nicks, in the transport because it is the only place that knows them. Unread and mention are separate signals (a mention wins in the sidebar; a count would compete with it for the same glance). Verified live. Typing/mute/highlight rules open. |
 | W9 | **Themes, keybinds, per-window settings** | pure client, no daemon change |
 | W10 | **Admin panel** (see 2.3) | our own, inside the Web UI, not a `webadmin` clone |
 
