@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 // TestOnOpenClosedOnTLSFailure proves the ident hook sees the TCP connection
@@ -34,7 +34,8 @@ func TestOnOpenClosedOnTLSFailure(t *testing.T) {
 		Addr:       ln.Addr().String(),
 		TLS:        true,
 		Nick:       "nick",
-		Ring:       ring.New(2, 512),
+		Windows:    winring.New(8, 2, 512),
+		Route:      routeStatus,
 		BackoffMin: time.Millisecond,
 		OnOpen: func(conn net.Conn) func() {
 			opened.Add(1)

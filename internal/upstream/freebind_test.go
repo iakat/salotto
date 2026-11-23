@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 // freebindAddr is in TEST-NET-1 (RFC 5737) and is not configured on any
@@ -109,7 +109,8 @@ func TestFreebindDialerControl(t *testing.T) {
 		Name:       "test",
 		Addr:       addr,
 		Nick:       "nick",
-		Ring:       ring.New(2, 512),
+		Windows:    winring.New(8, 2, 512),
+		Route:      routeStatus,
 		BindHost:   net.IP(freebindAddr[:]).String(),
 		BackoffMin: time.Millisecond,
 	})
@@ -165,10 +166,11 @@ func TestDialerWithoutFreebindFailsAtBind(t *testing.T) {
 // stores the value and Connect reads it).
 func TestSetBindHostRepointsNextDial(t *testing.T) {
 	c, err := New(Config{
-		Name: "test",
-		Addr: "127.0.0.1:1",
-		Nick: "nick",
-		Ring: ring.New(2, 512),
+		Name:    "test",
+		Addr:    "127.0.0.1:1",
+		Nick:    "nick",
+		Windows: winring.New(8, 2, 512),
+		Route:   routeStatus,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

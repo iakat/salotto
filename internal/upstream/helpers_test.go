@@ -8,7 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/logfile"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 func listen(t *testing.T) net.Listener {
@@ -88,7 +89,17 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string)
 	t.Fatalf("timed out after %s waiting for %s", timeout, what)
 }
 
-func ringLines(r *ring.Ring) []string {
+// routeStatus buffers every line in the "status" window. The upstream tests
+// only care that a line was stored, not which windows the logger would pick.
+func routeStatus([]byte, bool) []logfile.Entry {
+	return []logfile.Entry{{Window: "status"}}
+}
+
+func windowLines(s *winring.Set, window string) []string {
+	r, ok := s.Ring(window)
+	if !ok {
+		return nil
+	}
 	var out []string
 	r.Replay(r.Oldest(), func(seq uint64, line []byte) bool {
 		out = append(out, string(line))
@@ -97,8 +108,8 @@ func ringLines(r *ring.Ring) []string {
 	return out
 }
 
-func ringContains(r *ring.Ring, substr string) bool {
-	for _, line := range ringLines(r) {
+func windowContains(s *winring.Set, window, substr string) bool {
+	for _, line := range windowLines(s, window) {
 		if strings.Contains(line, substr) {
 			return true
 		}

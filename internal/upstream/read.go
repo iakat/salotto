@@ -3,7 +3,6 @@ package upstream
 import (
 	"bufio"
 	"io"
-	"time"
 
 	"github.com/iakat/salotto/internal/ircline"
 )
@@ -34,11 +33,8 @@ func (c *Conn) readLoop(br *bufio.Reader, scratch []byte) error {
 			continue
 		}
 
-		seq := c.cfg.Ring.AppendStamp(line, time.Now().UnixNano())
 		c.linesIn.Add(1)
-		if c.cfg.OnLine != nil {
-			c.cfg.OnLine(seq, line)
-		}
+		c.store(line, false)
 	}
 }
 

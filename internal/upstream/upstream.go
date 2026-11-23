@@ -10,7 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/logfile"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 // Config describes one upstream network.
@@ -26,11 +27,20 @@ type Config struct {
 	SASLUser           string
 	SASLPass           string
 	Channels           []string
-	Ring               *ring.Ring
-	// OnLine is called for every line stored in the ring. The line slice is
-	// only valid for the duration of the call: it aliases an internal read
-	// buffer, so copy it if it is retained.
-	OnLine func(seq uint64, line []byte)
+	// Windows owns one replay ring per window for this network. The connection
+	// routes every line to the windows the logger gives it and appends the line
+	// to each of those rings.
+	Windows *winring.Set
+	// Route parses line once and returns the log entries it belongs to, in the
+	// routing order the logger uses; outbound tells it how the line arrived. It
+	// must not retain line. An empty result means the line is not buffered (a
+	// CAP reply or a suppressed echo).
+	Route func(line []byte, outbound bool) []logfile.Entry
+	// OnLine is called once per buffered line with the window list, the
+	// per-window sequence each append returned, and the entries routing already
+	// parsed. The line slice is only valid for the duration of the call: it
+	// aliases an internal read buffer, so copy it if it is retained.
+	OnLine func(windows []string, seqs []uint64, entries []logfile.Entry, line []byte)
 	// OnSend is called for every line sent to the network via Send.
 	OnSend func(line []byte)
 	// OnConnect is called after successful registration.
@@ -50,6 +60,38 @@ type Config struct {
 	BindHost   string
 	BackoffMin time.Duration
 	BackoffMax time.Duration
+}
+
+// store routes line to its replay windows and appends it to each window's ring.
+// One line shared by several windows is stored in each ring, with independent
+// per-window sequences. It reports whether the line was buffered.
+func (c *Conn) store(line []byte, outbound bool) bool {
+	if c.cfg.Windows == nil || c.cfg.Route == nil {
+		return false
+	}
+	entries := c.cfg.Route(line, outbound)
+	if len(entries) == 0 {
+		return false
+	}
+	ts := time.Now().UnixNano()
+	if cap(c.windows) < len(entries) {
+		c.windows = make([]string, len(entries))
+		c.seqs = make([]uint64, len(entries))
+	}
+	windows := c.windows[:len(entries)]
+	seqs := c.seqs[:len(entries)]
+	for i, e := range entries {
+		window := e.Window
+		if window == "" {
+			window = "status"
+		}
+		windows[i] = window
+		seqs[i] = c.cfg.Windows.Append(window, line, ts)
+	}
+	if c.cfg.OnLine != nil {
+		c.cfg.OnLine(windows, seqs, entries, line)
+	}
+	return true
 }
 
 // State is the current connection state.
@@ -106,6 +148,11 @@ type Conn struct {
 
 	freeSlabs  chan *slab
 	writeSlabs chan *slab
+
+	// windows and seqs are reused by store. Routing and appendSynthetic both
+	// run on the connection's own goroutine, so no lock is needed.
+	windows []string
+	seqs    []uint64
 }
 
 // New validates cfg and returns a connection that has not dialed yet.
@@ -125,8 +172,8 @@ func New(cfg Config) (*Conn, error) {
 	if cfg.BindHost != "" && net.ParseIP(cfg.BindHost) == nil {
 		return nil, errors.New("upstream: invalid BindHost: not an IP address")
 	}
-	if cfg.Ring == nil {
-		return nil, errors.New("upstream: Ring is required")
+	if cfg.Windows == nil {
+		return nil, errors.New("upstream: Windows is required")
 	}
 	if cfg.User == "" {
 		cfg.User = cfg.Nick

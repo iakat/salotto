@@ -176,10 +176,7 @@ func (c *Conn) appendSynthetic(attempt uint64) {
 		"NOTICE * :*** salotto reconnecting to %s (attempt %d)",
 		c.cfg.Name, attempt,
 	))
-	seq := c.cfg.Ring.AppendStamp(line, time.Now().UnixNano())
-	if c.cfg.OnLine != nil {
-		c.cfg.OnLine(seq, line)
-	}
+	c.store(line, false)
 }
 
 func (c *Conn) answerPing(conn net.Conn, rest []byte) error {

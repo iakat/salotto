@@ -7,14 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/logfile"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 func TestRegistration(t *testing.T) {
 	ln := listen(t)
 	defer ln.Close()
 
-	r := ring.New(4, 4096)
+	w := winring.New(8, 4, 4096)
 	cfg := Config{
 		Name:       "test",
 		Addr:       ln.Addr().String(),
@@ -22,7 +23,8 @@ func TestRegistration(t *testing.T) {
 		User:       "user",
 		RealName:   "Real Name",
 		Channels:   []string{"#chan"},
-		Ring:       r,
+		Windows:    w,
+		Route:      routeStatus,
 		BackoffMin: 10 * time.Millisecond,
 	}
 	c, err := New(cfg)
@@ -49,12 +51,13 @@ func TestPing(t *testing.T) {
 	ln := listen(t)
 	defer ln.Close()
 
-	r := ring.New(4, 4096)
+	w := winring.New(8, 4, 4096)
 	cfg := Config{
 		Name:       "test",
 		Addr:       ln.Addr().String(),
 		Nick:       "nick",
-		Ring:       r,
+		Windows:    w,
+		Route:      routeStatus,
 		BackoffMin: 10 * time.Millisecond,
 	}
 	c, err := New(cfg)
@@ -80,10 +83,10 @@ func TestPing(t *testing.T) {
 	if c.LinesIn() != 0 {
 		t.Fatalf("LinesIn = %d, want 0 (PING must not be stored)", c.LinesIn())
 	}
-	if r.Newest() != 0 {
-		t.Fatalf("ring newest = %d, want 0; lines: %v", r.Newest(), ringLines(r))
+	if got := windowLines(w, "status"); len(got) != 0 {
+		t.Fatalf("stored %d lines, want 0: %v", len(got), got)
 	}
-	for _, line := range ringLines(r) {
+	for _, line := range windowLines(w, "status") {
 		if strings.Contains(line, "PING") {
 			t.Fatalf("ring contains PING: %q", line)
 		}
@@ -94,16 +97,17 @@ func TestLineStorage(t *testing.T) {
 	ln := listen(t)
 	defer ln.Close()
 
-	r := ring.New(8, 4096)
+	w := winring.New(8, 8, 4096)
 	stored := make(chan uint64, 8)
 	cfg := Config{
 		Name:       "test",
 		Addr:       ln.Addr().String(),
 		Nick:       "nick",
-		Ring:       r,
+		Windows:    w,
+		Route:      routeStatus,
 		BackoffMin: 10 * time.Millisecond,
-		OnLine: func(seq uint64, line []byte) {
-			stored <- seq
+		OnLine: func(windows []string, seqs []uint64, entries []logfile.Entry, line []byte) {
+			stored <- seqs[0]
 		},
 	}
 	c, err := New(cfg)
@@ -135,10 +139,14 @@ func TestLineStorage(t *testing.T) {
 		}
 	}
 
+	r, ok := w.Ring("status")
+	if !ok {
+		t.Fatal("status window missing")
+	}
 	if r.Newest() != uint64(len(msgs)) {
 		t.Fatalf("ring newest = %d, want %d", r.Newest(), len(msgs))
 	}
-	got := ringLines(r)
+	got := windowLines(w, "status")
 	if len(got) != len(msgs) {
 		t.Fatalf("replayed %d lines, want %d", len(got), len(msgs))
 	}

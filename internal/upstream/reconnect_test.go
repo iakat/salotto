@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 // TestReconnect closes the server side of a registered connection and asserts
@@ -16,12 +16,13 @@ func TestReconnect(t *testing.T) {
 	ln := listen(t)
 	defer ln.Close()
 
-	r := ring.New(8, 4096)
+	w := winring.New(8, 8, 4096)
 	cfg := Config{
 		Name:       "test",
 		Addr:       ln.Addr().String(),
 		Nick:       "nick",
-		Ring:       r,
+		Windows:    w,
+		Route:      routeStatus,
 		BackoffMin: 10 * time.Millisecond,
 		BackoffMax: 20 * time.Millisecond,
 	}
@@ -48,7 +49,7 @@ func TestReconnect(t *testing.T) {
 	// The notice is appended at the start of the new connection, so it is in
 	// the ring by the time the second dial is accepted.
 	waitFor(t, 3*time.Second, func() bool {
-		return ringContains(r, "reconnecting")
+		return windowContains(w, "status", "reconnecting")
 	}, "reconnecting notice in the ring")
 
 	if got := c.Attempts(); got < 2 {

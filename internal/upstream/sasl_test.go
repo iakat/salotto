@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 // TestSASLPlain asserts the client does SASL PLAIN with the user as both
@@ -23,7 +23,8 @@ func TestSASLPlain(t *testing.T) {
 		Nick:       "nick",
 		SASLUser:   "user",
 		SASLPass:   "pass",
-		Ring:       ring.New(4, 4096),
+		Windows:    winring.New(8, 4, 4096),
+		Route:      routeStatus,
 		BackoffMin: 10 * time.Millisecond,
 	})
 	if err != nil {
@@ -80,7 +81,8 @@ func TestSASLNotRequestedWithoutCredentials(t *testing.T) {
 		Name:       "test",
 		Addr:       ln.Addr().String(),
 		Nick:       "nick",
-		Ring:       ring.New(4, 4096),
+		Windows:    winring.New(8, 4, 4096),
+		Route:      routeStatus,
 		BackoffMin: 10 * time.Millisecond,
 	})
 	if err != nil {

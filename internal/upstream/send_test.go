@@ -7,17 +7,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 // TestSendBeforeRun asserts Send refuses while the connection has never
 // registered.
 func TestSendBeforeRun(t *testing.T) {
 	c, err := New(Config{
-		Name: "test",
-		Addr: "127.0.0.1:1",
-		Nick: "nick",
-		Ring: ring.New(4, 4096),
+		Name:    "test",
+		Addr:    "127.0.0.1:1",
+		Nick:    "nick",
+		Windows: winring.New(8, 4, 4096),
+		Route:   routeStatus,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -38,7 +39,8 @@ func TestSendWhileBackoff(t *testing.T) {
 		Name:       "test",
 		Addr:       ln.Addr().String(),
 		Nick:       "nick",
-		Ring:       ring.New(4, 4096),
+		Windows:    winring.New(8, 4, 4096),
+		Route:      routeStatus,
 		BackoffMin: 50 * time.Millisecond,
 		BackoffMax: 50 * time.Millisecond,
 	})
