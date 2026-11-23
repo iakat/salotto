@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"net"
+	"net/http"
 	"os/exec"
 	"testing"
 	"time"
@@ -85,4 +86,82 @@ func freeAddr(t *testing.T) string {
 	}
 	defer ln.Close()
 	return ln.Addr().String()
+}
+
+// TestWebExitsWhenTheBouncerCannotBeDialled covers the other half: a configured
+// bouncer that refuses the connection at startup.
+//
+// The old behaviour was to log a warning and serve a local-only UI, which is the
+// same lie in a different place - the page accepts lines and delivers nothing. An
+// empty -bouncer still means a deliberate local-only UI; a dial that failed means
+// the front end could not attach and should be retried.
+func TestWebExitsWhenTheBouncerCannotBeDialled(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go binary not available to build the front end")
+	}
+
+	// A port with nothing listening: take one and close it again. The dial is
+	// refused, which is the case that used to fall through to a local-only UI.
+	dead := freeAddr(t)
+
+	bin := t.TempDir() + "/salotto-web"
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(bin, "-addr", freeAddr(t), "-bouncer", dead, "-nick", "e2e-ui")
+	done := make(chan error, 1)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		var exitErr *exec.ExitError
+		if err == nil {
+			t.Fatal("the front end served a local-only UI for a bouncer it could not dial")
+		}
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			t.Fatalf("want exit code 1, got %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("the front end hung dialling a dead bouncer")
+	}
+}
+
+// TestWebServesLocalOnlyWithoutABouncer keeps the deliberate case deliberate: an
+// empty address is a renderer preview and must not exit.
+func TestWebServesLocalOnlyWithoutABouncer(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go binary not available to build the front end")
+	}
+
+	bin := t.TempDir() + "/salotto-web"
+	build := exec.Command("go", "build", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+
+	addr := freeAddr(t)
+	cmd := exec.Command(bin, "-addr", addr)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+
+	// It must be answering, not exiting: poll the page until it responds.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get("http://" + addr + "/")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("a local-only UI without -bouncer never answered")
 }

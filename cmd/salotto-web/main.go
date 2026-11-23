@@ -57,7 +57,13 @@ func run() int {
 	// shared Program the handler serves.
 	tr, err := dialBouncer(*bouncer, *nick)
 	if err != nil {
-		slog.Warn("bouncer dial failed; serving a local-only UI", "err", err)
+		// An empty -bouncer is a deliberate local-only UI and stays one. A dial
+		// that failed is not the same thing: the front end was asked to attach
+		// and could not, and serving a page that accepts input and delivers
+		// nothing is the lie this file exists to avoid. Exit, so the supervisor
+		// retries the dial against a bouncer that is probably still starting.
+		slog.Error("bouncer dial failed; exiting so the front end is retried", "err", err)
+		return 1
 	}
 	if tr != nil {
 		defer tr.Close()
