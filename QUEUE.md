@@ -214,9 +214,9 @@ Grouped, because 59 rows is a wall, and the grouping *is* the decision.
 | `perform` | send commands on connect | **done**, before joins (`perform.cpp` `OnIRCConnected`) |
 | `keepnick` | retry the nick you want | **done**, 30 s loop (`keepnick.cpp Start(30000)`) |
 | `stickychan` | keep channels joined | subsumed by chansaver + rejoin |
-| `awaynick` | change nick when away | needs an away concept (B18) |
-| `awaystore` | store and replay away messages | pairs with B18 |
-| `simple_away` | auto-away on detach | pairs with B18 |
+| `simple_away` | auto-away on detach | **done** — `internal/facade/away.go`: away after `away_wait` with no client attached, back on attach, never fighting a user-set away (`simple_away.cpp` `m_bClientSetAway`/`m_bWeSetAway`) |
+| `awaynick` | change nick when away | **open** — the away concept (B18) now exists, so this is a nick change on the same transition |
+| `awaystore` | store and replay away messages | **open** — needs the away-notify capability we already negotiate upstream |
 | `buffextras` | put joins/parts/modes into the replay buffer | **done** by B2's routing split; `TestBuffExtrasReachesTheReplayRing` |
 | `savebuff` | persist the buffer across restarts | the "M5 mmapped rings" item, in effect |
 | `clearbufferonmsg` | clear buffer when you speak | **done** (`clearbufferonmsg.cpp`) |

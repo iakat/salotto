@@ -132,6 +132,7 @@ func run() int {
 		maxClients = 64
 	}
 	hub := facade.NewHub(maxClients)
+	awayEnabled, awayReason, awayWaitSeconds := cfg.AwayEnabled()
 	srv, err := facade.New(facade.Config{
 		ServerName:  cfg.ServerName,
 		Hub:         hub,
@@ -144,6 +145,12 @@ func run() int {
 		// because the daemon is single-user. Any network asking for it turns it
 		// on.
 		ClearBuffersOnMsg: cfg.ClearBufferOnMsg(),
+		// simple_away is also a per-network module; the away state is the
+		// user's, so any network asking for it turns it on for the daemon.
+		AwayEnabled:    awayEnabled,
+		AwayReason:     awayReason,
+		AwayWait:       time.Duration(awayWaitSeconds) * time.Second,
+		MaxBufferLines: cfg.MaxBufferLines,
 	})
 	if err != nil {
 		logger.Error("facade config invalid", "err", err)

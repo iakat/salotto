@@ -43,6 +43,14 @@ type Config struct {
 	// speaks, which is ZNC's clearbufferonmsg module. The module's default rule
 	// set is every message type except QUIT, so a QUIT does not clear.
 	ClearBuffersOnMsg bool
+	// AwayEnabled turns on ZNC's simple_away behaviour: mark the user away on
+	// IRC after AwayWait with no client attached, and come back on attach.
+	AwayEnabled bool
+	// AwayReason is the away message; %awaytime% expands to when it was set.
+	AwayReason string
+	// AwayWait is how long to wait after the last client detaches before
+	// setting away. Zero disables the automatic part, as ZNC's SetTimer 0 does.
+	AwayWait time.Duration
 	// MaxBufferLines is the largest buffer SETBUFFER will accept, which is
 	// ZNC's GetMaxBufferSize. Zero means the default.
 	MaxBufferLines int
@@ -178,6 +186,9 @@ type Server struct {
 	outSource atomic.Pointer[Subscriber]
 	active    atomic.Int64
 
+	// away is ZNC's simple_away: away on detach, back on attach.
+	away *away
+
 	linePool sync.Pool
 }
 
@@ -222,6 +233,12 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxBufferLines <= 0 {
 		cfg.MaxBufferLines = 10000
 	}
+	if cfg.AwayReason == "" {
+		cfg.AwayReason = "Auto away at %awaytime%"
+	}
+	if cfg.AwayWait <= 0 && cfg.AwayEnabled {
+		cfg.AwayWait = 60 * time.Second
+	}
 
 	s := &Server{
 		cfg:          cfg,
@@ -230,6 +247,10 @@ func New(cfg Config) (*Server, error) {
 		fingerprints: NewFingerprints(),
 		created:      time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 MST"),
 	}
+	// One away policy for the process: every network is the same user, so an
+	// AWAY fans out over all of them exactly as simple_away's PutIRC does per
+	// network (the module is loaded per network but the state is the user's).
+	s.away = newAway(cfg.AwayEnabled, cfg.AwayReason, cfg.AwayWait, s.broadcastAway)
 
 	names := make([]string, 0, len(cfg.Networks))
 	for name, net := range cfg.Networks {
@@ -436,6 +457,14 @@ func (s *Server) Traffic() (in, out uint64) {
 	return in, out
 }
 
+// broadcastAway sends one AWAY line to every network. The reason is already
+// expanded, so the line goes on the wire unchanged.
+func (s *Server) broadcastAway(line string) {
+	for _, ne := range s.netSnapshot() {
+		_ = ne.net.Send([]byte(line))
+	}
+}
+
 // OutboundSource returns the client whose line is being sent right now, or nil
 // when the line did not come from a client. The daemon reads it inside OnSend so
 // the echo-message gate can tell the author from everyone else.
@@ -496,6 +525,11 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.hub.Remove(sub)
 		s.windows.forget(sub)
 		sub.Close()
+		// simple_away's OnClientDisconnect: go away only when the *last*
+		// client left, which is why the hub count decides.
+		if s.hub.Len() == 0 {
+			s.away.clientDetached()
+		}
 	}()
 
 	c.readLoop()
@@ -587,6 +621,8 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleListClients()
 	case ircline.IsVerb(rest, "TRAFFIC"):
 		return c.handleTraffic()
+	case ircline.IsVerb(rest, "AWAY"):
+		return c.handleAway(rest)
 	case ircline.IsVerb(rest, "CONNECT"):
 		return c.handleConnect()
 	case ircline.IsVerb(rest, "DISCONNECT"):
@@ -854,6 +890,8 @@ func (c *client) maybeRegister() bool {
 	if !c.srv.hub.Add(c.sub) {
 		return c.send("ERROR :too many clients")
 	}
+	// simple_away's OnClientLogin: a client is here, come back.
+	c.srv.away.clientAttached()
 	return true
 }
 

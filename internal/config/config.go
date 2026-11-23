@@ -47,7 +47,14 @@ type Network struct {
 	Perform []string
 	// ClearBufferOnMsg clears every channel and query buffer as soon as the user
 	// speaks (ZNC's clearbufferonmsg).
-	ClearBufferOnMsg   bool
+	ClearBufferOnMsg bool
+	// Away enables ZNC's simple_away: away on detach, back on attach.
+	Away bool
+	// AwayReason is the message set; %awaytime% expands to when it was set.
+	AwayReason string
+	// AwayWait is how long to wait after the last client detaches. Zero keeps
+	// simple_away's 60 s default.
+	AwayWait           int
 	Channels           []string
 	BindHost           string
 	InsecureSkipVerify bool
@@ -78,6 +85,8 @@ type Config struct {
 	MOTDMissing bool
 	User        User
 	Networks    []Network
+	// MaxBufferLines caps SETBUFFER, ZNC's GetMaxBufferSize.
+	MaxBufferLines int
 }
 
 // Default returns the built-in configuration. Networks are intentionally empty:
@@ -369,6 +378,14 @@ func (c *Config) parseNetworkKey(n *Network, key, value string) error {
 		n.Perform, err = parseStringList(value)
 	case "clearbufferonmsg":
 		n.ClearBufferOnMsg, err = parseBool(value)
+	case "max_buffer_lines":
+		c.MaxBufferLines, err = parseInt(value)
+	case "away":
+		n.Away, err = parseBool(value)
+	case "away_reason":
+		n.AwayReason, err = parseString(value)
+	case "away_wait":
+		n.AwayWait, err = parseInt(value)
 	case "sasl_external":
 		n.SASLExternal, err = parseBool(value)
 	case "cert_file":
@@ -522,6 +539,32 @@ func parseInt(value string) (int, error) {
 		return 0, fmt.Errorf("expected an integer, got %q", strings.TrimSpace(value))
 	}
 	return v, nil
+}
+
+// AwayEnabled reports whether any network asked for simple_away, and returns the
+// reason and wait to use. The facade is process-wide and single-user, so the
+// first non-empty settings win: a per-network away reason would be an odd thing
+// to have, since the away state is the *user's*, not the network's.
+func (c *Config) AwayEnabled() (enabled bool, reason string, waitSeconds int) {
+	for i := range c.Networks {
+		n := &c.Networks[i]
+		if !n.Away {
+			continue
+		}
+		if !enabled {
+			enabled = true
+			reason = n.AwayReason
+			waitSeconds = n.AwayWait
+			continue
+		}
+		if reason == "" {
+			reason = n.AwayReason
+		}
+		if waitSeconds == 0 {
+			waitSeconds = n.AwayWait
+		}
+	}
+	return enabled, reason, waitSeconds
 }
 
 // ClearBufferOnMsg reports whether any network asked for ZNC's
