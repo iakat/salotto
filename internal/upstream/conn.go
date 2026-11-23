@@ -93,6 +93,9 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 	var closeOnce sync.Once
 	defer func() { closeOnce.Do(onClose) }()
 
+	c.setLive(raw)
+	defer c.setLive(nil)
+
 	conn := raw
 	if c.cfg.TLS {
 		host, _, _ := net.SplitHostPort(c.cfg.Addr)
@@ -261,6 +264,22 @@ func (c *Conn) answerPing(conn net.Conn, rest []byte) error {
 
 func jitter(d time.Duration) time.Duration {
 	return time.Duration(float64(d) * (0.8 + 0.4*rand.Float64()))
+}
+
+// sleepBackoff waits out the backoff but returns early when the run loop is
+// poked: a CONNECT while we are backing off must dial at once, not up to a
+// minute later.
+func sleepBackoff(ctx context.Context, poke <-chan struct{}, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-poke:
+		return true
+	case <-timer.C:
+		return true
+	}
 }
 
 func sleepContext(ctx context.Context, d time.Duration) bool {

@@ -177,6 +177,9 @@ type Conn struct {
 	attempts atomic.Uint64
 	linesIn  atomic.Uint64
 	linesOut atomic.Uint64
+	// bytesIn/bytesOut are the raw byte counters TRAFFIC reports.
+	bytesIn  atomic.Uint64
+	bytesOut atomic.Uint64
 
 	mu   sync.Mutex
 	regC chan struct{}
@@ -184,9 +187,25 @@ type Conn struct {
 	// selfNick is the nick the server gave us, read by keepnick and by anything
 	// that must tell our own messages apart.
 	selfNick atomic.Value // string
+	// selfMask is "nick!ident@host" for our own session, learned from the first
+	// line that carries our own prefix. ZNC knows the same thing from the nick
+	// it builds out of the messages it reads, and LISTNETWORKS prints it.
+	selfMask atomic.Value // string
 
 	capsMu sync.RWMutex
 	caps   map[string]bool
+
+	// enabled is ZNC's m_bIRCConnectEnabled: false means the operator asked the
+	// bouncer to stay off IRC. The reconnect loop waits on poke rather than
+	// spinning while it is false, and Disconnect closes the live socket so a
+	// connected network goes down immediately.
+	enabled atomic.Bool
+	poke    chan struct{}
+
+	// liveMu guards live, the socket of the current attempt, so Disconnect can
+	// close exactly that socket and not a later one.
+	liveMu sync.Mutex
+	live   net.Conn
 
 	freeSlabs  chan *slab
 	writeSlabs chan *slab
@@ -249,6 +268,8 @@ func New(cfg Config) (*Conn, error) {
 		writeSlabs: make(chan *slab, slabCount),
 	}
 	c.state.Store(int32(StateConnecting))
+	c.enabled.Store(true)
+	c.poke = make(chan struct{}, 1)
 	for i := 0; i < slabCount; i++ {
 		c.freeSlabs <- &slab{}
 	}
@@ -310,6 +331,75 @@ func (c *Conn) SetCaps(caps []string) {
 	c.capsMu.Unlock()
 }
 
+// NickMask is "nick!ident@host" for the current session, or the bare nick when
+// no line carrying our prefix has been seen yet.
+func (c *Conn) NickMask() string {
+	if v, ok := c.selfMask.Load().(string); ok && v != "" {
+		return v
+	}
+	return c.CurrentNick()
+}
+
+// ConnectEnabled reports whether the bouncer may hold an upstream connection.
+func (c *Conn) ConnectEnabled() bool { return c.enabled.Load() }
+
+// SetConnectEnabled turns the upstream on or off. ZNC's Disconnect sets
+// m_bIRCConnectEnabled to false and CONNECT sets it back; the reconnect loop
+// consults it before every dial, which is why disabling has to interrupt the
+// current attempt as well as the backoff (IRCNetwork.cpp SetIRCConnectEnabled).
+func (c *Conn) SetConnectEnabled(enabled bool) {
+	was := c.enabled.Swap(enabled)
+	if enabled {
+		if !was {
+			c.pokeRun()
+		}
+		return
+	}
+	if was {
+		c.closeLive()
+		c.pokeRun()
+	}
+}
+
+// pokeRun wakes the reconnect loop so it re-reads enabled without waiting out
+// the backoff.
+func (c *Conn) pokeRun() {
+	select {
+	case c.poke <- struct{}{}:
+	default:
+	}
+}
+
+// closeLive closes the socket of the attempt in flight, if any.
+func (c *Conn) closeLive() {
+	c.liveMu.Lock()
+	conn := c.live
+	c.liveMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func (c *Conn) setLive(conn net.Conn) {
+	c.liveMu.Lock()
+	c.live = conn
+	c.liveMu.Unlock()
+}
+
+// Server is the address of the server we are connected to, else the configured
+// one, in ZNC's display form.
+func (c *Conn) Server() string { return c.ServerString() }
+
+// HasPassword reports whether a PASS is configured. The value is never exposed.
+func (c *Conn) HasPassword() bool { return c.cfg.Pass != "" }
+
+// Traffic is bytes received and sent on the socket, summed over every attempt.
+// ZNC counts the same thing per user (CUser::m_uBytesIn/m_uBytesOut in
+// ClientCommand.cpp:1575's TRAFFIC handler).
+func (c *Conn) Traffic() (in, out uint64) {
+	return c.bytesIn.Load(), c.bytesOut.Load()
+}
+
 func (c *Conn) ServerString() string {
 	host, port, err := net.SplitHostPort(c.cfg.Addr)
 	if err != nil {
@@ -366,6 +456,15 @@ func (c *Conn) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		if !c.enabled.Load() {
+			c.setState(StateStopped)
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.poke:
+				continue
+			}
+		}
 		c.setState(StateConnecting)
 		registered, err := c.runOnce(ctx)
 		if ctx.Err() != nil {
@@ -384,7 +483,7 @@ func (c *Conn) Run(ctx context.Context) {
 			backoff = c.cfg.BackoffMin
 		}
 
-		if !sleepContext(ctx, backoff) {
+		if !sleepBackoff(ctx, c.poke, backoff) {
 			return
 		}
 		backoff *= 2

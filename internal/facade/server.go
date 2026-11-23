@@ -43,6 +43,10 @@ type Config struct {
 	// speaks, which is ZNC's clearbufferonmsg module. The module's default rule
 	// set is every message type except QUIT, so a QUIT does not clear.
 	ClearBuffersOnMsg bool
+	// UserName is the name TRAFFIC prints for the single local user. ZNC's
+	// TRAFFIC is admin-only and takes the name from the user map; this daemon
+	// has one user, so the name is configuration.
+	UserName string
 }
 
 // BindHosts is the bind-host state the wire commands mutate. Resolution is
@@ -81,6 +85,22 @@ type Network interface {
 	Windows() []string
 	// Bytes is the total buffered bytes over every window. It is for /stats.
 	Bytes() int
+	// Server is the current upstream server string in ZNC's form: "host port",
+	// or "host +port" when the connection is over TLS. LISTNETWORKS and
+	// LISTSERVERS print it.
+	Server() string
+	// NickMask is "nick!ident@host" as the network knows itself. ZNC prints
+	// this in LISTNETWORKS; when the ident or host is not known yet only the
+	// nick is present.
+	NickMask() string
+	// HasPassword reports whether the configured upstream sends a PASS. The
+	// password itself is never exposed: LISTSERVERS prints ****** for it.
+	HasPassword() bool
+	// Traffic is bytes received and sent on the upstream socket.
+	Traffic() (in, out uint64)
+	// SetConnectEnabled turns the upstream on or off, as CONNECT and
+	// DISCONNECT do (ZNC's m_bIRCConnectEnabled).
+	SetConnectEnabled(enabled bool)
 }
 
 type networkEntry struct {
@@ -388,6 +408,28 @@ func (s *Server) networkName() string {
 // Attached returns the number of clients currently attached to the hub.
 func (s *Server) Attached() int { return s.hub.Len() }
 
+// networkEntry returns the entry for a network, or nil.
+func (s *Server) networkEntry(name string) *networkEntry {
+	for _, ne := range s.netSnapshot() {
+		if ne.name == name {
+			return ne
+		}
+	}
+	return nil
+}
+
+// Traffic sums bytes in and out over every upstream. ZNC keeps per-user
+// counters and prints them in TRAFFIC; this daemon has one user, so the sum is
+// that user's traffic.
+func (s *Server) Traffic() (in, out uint64) {
+	for _, ne := range s.netSnapshot() {
+		i, o := ne.net.Traffic()
+		in += i
+		out += o
+	}
+	return in, out
+}
+
 // OutboundSource returns the client whose line is being sent right now, or nil
 // when the line did not come from a client. The daemon reads it inside OnSend so
 // the echo-message gate can tell the author from everyone else.
@@ -529,6 +571,18 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleDisableChan(rest, false)
 	case ircline.IsVerb(rest, "LISTCHANS"):
 		return c.handleListChans()
+	case ircline.IsVerb(rest, "LISTNETWORKS"):
+		return c.handleListNetworks()
+	case ircline.IsVerb(rest, "LISTSERVERS"):
+		return c.handleListServers()
+	case ircline.IsVerb(rest, "LISTCLIENTS"):
+		return c.handleListClients()
+	case ircline.IsVerb(rest, "TRAFFIC"):
+		return c.handleTraffic()
+	case ircline.IsVerb(rest, "CONNECT"):
+		return c.handleConnect()
+	case ircline.IsVerb(rest, "DISCONNECT"):
+		return c.handleDisconnect()
 	case ircline.IsVerb(rest, "ADDTRUSTEDSERVERFINGERPRINT"):
 		return c.handleTrustedFingerprint(rest, fpAdd)
 	case ircline.IsVerb(rest, "DELTRUSTEDSERVERFINGERPRINT"):

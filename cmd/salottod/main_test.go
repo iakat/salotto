@@ -14,8 +14,12 @@ import (
 )
 
 type fakeNet struct {
-	name string
-	set  *winring.Set
+	name   string
+	set    *winring.Set
+	server string
+	mask   string
+	in     uint64
+	out    uint64
 }
 
 func newFakeNet(name string) *fakeNet {
@@ -26,6 +30,16 @@ func (f *fakeNet) Name() string      { return f.name }
 func (f *fakeNet) Send([]byte) error { return nil }
 func (f *fakeNet) State() string     { return "registered" }
 func (f *fakeNet) Bytes() int        { return f.set.Bytes() }
+
+func (f *fakeNet) Server() string { return f.server }
+
+func (f *fakeNet) NickMask() string { return f.mask }
+
+func (f *fakeNet) HasPassword() bool { return false }
+
+func (f *fakeNet) Traffic() (in, out uint64) { return f.in, f.out }
+
+func (f *fakeNet) SetConnectEnabled(bool) {}
 
 func (f *fakeNet) Window(name string) (facade.WindowRing, bool) {
 	r, ok := f.set.Ring(name)

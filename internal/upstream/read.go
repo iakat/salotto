@@ -36,6 +36,7 @@ func (c *Conn) readLoop(br *bufio.Reader, scratch []byte) error {
 
 		c.trackSelf(rest)
 		c.linesIn.Add(1)
+		c.bytesIn.Add(uint64(len(line)))
 		c.store(line, false)
 	}
 }
@@ -51,6 +52,7 @@ func (c *Conn) trackSelf(rest []byte) {
 		return
 	}
 	if !ircline.IsVerb(rest, "NICK") {
+		c.trackMask(rest)
 		return
 	}
 	_, pfx := ircline.Tags(rest)
@@ -62,6 +64,31 @@ func (c *Conn) trackSelf(rest []byte) {
 	if f := bytes.Fields(ircline.Params(rest)); len(f) > 0 {
 		c.selfNick.Store(string(f[0]))
 	}
+}
+
+// trackMask records our own nick!ident@host from any line whose prefix is us.
+// The 001 only carries the nick, so the mask has to be learned from the first
+// line we send-or-receive under it: ZNC does the same by constructing a CNick
+// out of every message, and LISTNETWORKS prints the result.
+func (c *Conn) trackMask(rest []byte) {
+	mask := c.selfMask.Load()
+	if s, ok := mask.(string); ok && s != "" {
+		return
+	}
+	_, pfx := ircline.Tags(rest)
+	pfx, _ = ircline.Prefix(pfx)
+	if len(pfx) == 0 {
+		return
+	}
+	from := ircline.Nick(pfx)
+	self := c.CurrentNick()
+	if from == "" || self == "" || from != self {
+		return
+	}
+	if bytes.IndexByte(pfx, '@') < 0 {
+		return
+	}
+	c.selfMask.Store(string(pfx))
 }
 
 func readLine(br *bufio.Reader, scratch []byte) ([]byte, error) {

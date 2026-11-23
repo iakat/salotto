@@ -72,6 +72,7 @@ func (c *Conn) writeLoop(conn net.Conn, stop <-chan struct{}) {
 				return
 			}
 			c.linesOut.Add(1)
+			c.bytesOut.Add(uint64(s.n) + 2) // + CRLF
 		}
 	}
 }
@@ -96,6 +97,7 @@ func (c *Conn) writeLine(conn net.Conn, line []byte) error {
 		return err
 	}
 	c.linesOut.Add(1)
+	c.bytesOut.Add(uint64(len(buf)))
 	return nil
 }
 

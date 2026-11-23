@@ -54,6 +54,16 @@ func (n *networkAdapter) Windows() []string { return n.set.Windows() }
 
 func (n *networkAdapter) Bytes() int { return n.set.Bytes() }
 
+func (n *networkAdapter) Server() string { return n.conn.Server() }
+
+func (n *networkAdapter) NickMask() string { return n.conn.NickMask() }
+
+func (n *networkAdapter) HasPassword() bool { return n.conn.HasPassword() }
+
+func (n *networkAdapter) Traffic() (in, out uint64) { return n.conn.Traffic() }
+
+func (n *networkAdapter) SetConnectEnabled(enabled bool) { n.conn.SetConnectEnabled(enabled) }
+
 func main() {
 	os.Exit(run())
 }

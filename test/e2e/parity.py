@@ -242,6 +242,72 @@ def case_fingerprints(b: Bouncer) -> dict:
     }
 
 
+def _rows(lines: list[str]) -> list[list[str]]:
+    """Data rows of a ZNC grid table: the '|' lines minus the header row."""
+    rows = []
+    for line in texts(lines):
+        if not line.startswith("|"):
+            continue
+        cells = [x.strip() for x in line.strip("|").split("|")]
+        rows.append(cells)
+    return rows[1:] if rows else []
+
+
+def case_listnetworks(b: Bouncer) -> dict:
+    got = b.cmd("ListNetworks", seconds=2.0)
+    rows = _rows(got)
+    # The network name and the "is it on IRC" answer are the parity question;
+    # the address and our nick mask legitimately differ between fixtures.
+    return {
+        "answered": bool(rows),
+        "on_irc": any(r[-4].lower() == "yes" for r in rows) if rows else False,
+        "name_listed": any(r and r[0] for r in rows),
+    }
+
+
+def case_listservers(b: Bouncer) -> dict:
+    got = b.cmd("ListServers", seconds=2.0)
+    rows = _rows(got)
+    text = " ".join(texts(got)).lower()
+    return {
+        "answered": bool(rows),
+        # ZNC marks the current server with a trailing '*'.
+        "marks_current": any(r and r[0].endswith("*") for r in rows),
+        # A password is shown as ****** or as nothing, never in clear.
+        "hides_password": "******" in text or "password" in text,
+    }
+
+
+def case_listclients(b: Bouncer) -> dict:
+    got = b.cmd("ListClients", seconds=2.0)
+    rows = _rows(got)
+    return {
+        "answered": bool(rows),
+        # Exactly one client is attached: this harness connection.
+        "one_client": len(rows) == 1,
+    }
+
+
+def case_traffic(b: Bouncer) -> dict:
+    got = b.cmd("Traffic", seconds=2.0)
+    text = " ".join(texts(got)).lower()
+    return {
+        "answered": "in" in text and "out" in text,
+        "has_total": "<total>" in text,
+    }
+
+
+def case_connect_disconnect(b: Bouncer) -> dict:
+    """Disconnect then Connect: both must answer with ZNC's wording."""
+    dis = b.cmd("Disconnect", seconds=2.0)
+    # ZNC stops the upstream then reconnects; give it a moment either way.
+    con = b.cmd("Connect", seconds=2.5)
+    return {
+        "disconnect_answered": says(dis, "disconnected"),
+        "connect_answered": says(con, "connect"),
+    }
+
+
 def run(host: str, port: int, nick: str, dialect: str, password: str | None, channel: str) -> dict:
     b = Bouncer(host, port, nick, dialect, password)
     out: dict[str, dict] = {}
@@ -254,6 +320,10 @@ def run(host: str, port: int, nick: str, dialect: str, password: str | None, cha
         out["disable"] = case_disable(b, channel)
         out["clear"] = case_clear(b, channel, "parity-clear")
         out["fingerprints"] = case_fingerprints(b)
+        out["listnetworks"] = case_listnetworks(b)
+        out["listservers"] = case_listservers(b)
+        out["listclients"] = case_listclients(b)
+        out["traffic"] = case_traffic(b)
     finally:
         b.close()
     return out

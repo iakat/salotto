@@ -26,6 +26,11 @@ type Subscriber struct {
 	// that renders its own messages locally does not get duplicates.
 	echo   bool
 	closed bool
+	// host, network and identifier are what LISTCLIENTS prints: the client's
+	// address, the network it is looking at and its ZNC user@identifier suffix.
+	host    string
+	network string
+	id      string
 
 	wake    chan struct{}
 	done    chan struct{}
@@ -59,6 +64,50 @@ func (s *Subscriber) SetIdentity(nick string, extendedJoin bool) {
 	s.nick = nick
 	s.extended = extendedJoin
 	s.mu.Unlock()
+}
+
+// SetRemoteHost records the client's address, for LISTCLIENTS.
+func (s *Subscriber) SetRemoteHost(host string) {
+	s.mu.Lock()
+	s.host = host
+	s.mu.Unlock()
+}
+
+// SetNetworkName records the network this client is attached to, for
+// LISTCLIENTS. The daemon sets it at registration.
+func (s *Subscriber) SetNetworkName(name string) {
+	s.mu.Lock()
+	s.network = name
+	s.mu.Unlock()
+}
+
+// SetIdentifier records the user@identifier suffix from the PASS line, which
+// ZNC uses to tell two clients of one user apart (Client.cpp:1044).
+func (s *Subscriber) SetIdentifier(id string) {
+	s.mu.Lock()
+	s.id = id
+	s.mu.Unlock()
+}
+
+// RemoteHost is what LISTCLIENTS prints in the Host column.
+func (s *Subscriber) RemoteHost() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.host
+}
+
+// NetworkName is what LISTCLIENTS prints in the Network column.
+func (s *Subscriber) NetworkName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.network
+}
+
+// Identifier is what LISTCLIENTS prints in the Identifier column.
+func (s *Subscriber) Identifier() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.id
 }
 
 // SetEchoMessage records whether the client negotiated echo-message. It is the
@@ -193,6 +242,17 @@ func (h *Hub) Add(s *Subscriber) bool {
 	h.subs[h.n] = s
 	h.n++
 	return true
+}
+
+// Snapshot returns the attached subscribers in registration order. LISTCLIENTS
+// walks it; the slice is a copy so a client connecting mid-command cannot
+// change what the table shows.
+func (h *Hub) Snapshot() []*Subscriber {
+	h.mu.Lock()
+	out := make([]*Subscriber, h.n)
+	copy(out, h.subs[:h.n])
+	h.mu.Unlock()
+	return out
 }
 
 // Remove unregisters a subscriber.

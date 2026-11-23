@@ -17,10 +17,15 @@ import (
 type fakeNet struct {
 	name string
 
-	mu    sync.Mutex
-	sends []string
-	state string
-	set   *winring.Set
+	mu        sync.Mutex
+	sends     []string
+	state     string
+	set       *winring.Set
+	server    string
+	mask      string
+	connected bool
+	in        uint64
+	out       uint64
 }
 
 func newFakeNet(name string) *fakeNet {
@@ -56,6 +61,26 @@ func (f *fakeNet) Window(name string) (WindowRing, bool) {
 
 func (f *fakeNet) Windows() []string { return f.set.Windows() }
 func (f *fakeNet) Bytes() int        { return f.set.Bytes() }
+
+func (f *fakeNet) Server() string { return f.server }
+
+func (f *fakeNet) NickMask() string { return f.mask }
+
+func (f *fakeNet) HasPassword() bool { return false }
+
+func (f *fakeNet) Traffic() (in, out uint64) { return f.in, f.out }
+
+func (f *fakeNet) connectEnabled() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.connected
+}
+
+func (f *fakeNet) SetConnectEnabled(enabled bool) {
+	f.mu.Lock()
+	f.connected = enabled
+	f.mu.Unlock()
+}
 
 func (f *fakeNet) add(window, line string, ts int64) uint64 {
 	return f.set.Append(window, []byte(line), ts)
