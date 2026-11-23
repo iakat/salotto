@@ -79,8 +79,27 @@ func run() int {
 		_ = srv.Shutdown(ctx)
 	}()
 
+	// A transport that dies leaves the page rendering a stale model and every
+	// POST going nowhere, which looks like a working UI until someone reads a
+	// line and sees nothing happened. There is no reconnect here on purpose: the
+	// model is a view of a bouncer that keeps the history, so coming back is a
+	// fresh dial that replays it. Exiting hands that to the supervisor instead of
+	// pretending to be alive.
+	transportDone := make(chan struct{})
 	if tr != nil {
-		go pump(prog, tr)
+		go func() {
+			pump(prog, tr)
+			close(transportDone)
+		}()
+	}
+
+	if tr != nil {
+		go func() {
+			<-transportDone
+			slog.Error("bouncer connection lost; exiting so the front end is restarted",
+				"err", tr.Err())
+			os.Exit(1)
+		}()
 	}
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
