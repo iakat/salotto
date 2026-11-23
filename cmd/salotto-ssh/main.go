@@ -14,6 +14,9 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,6 +30,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/ssh"
 	"github.com/charmbracelet/wish"
+	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/iakat/salotto/internal/ui"
 )
@@ -57,9 +61,15 @@ func run() int {
 	// docs/UI.md.
 	ui.Configure()
 
+	key, err := hostKeyOption(*hostKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "salotto-ssh: %v\n", err)
+		return 1
+	}
+
 	opts := []ssh.Option{
 		wish.WithAddress(*addr),
-		wish.WithHostKeyPath(*hostKey),
+		key,
 		wish.WithBanner(ui.Banner(*banner)),
 		wish.WithMiddleware(session(*window, *bouncer, *nick)),
 	}
@@ -165,4 +175,50 @@ func dialBouncer(addr, nick string) (*ui.Transport, error) {
 	}
 	tr.Register(nick, "")
 	return tr, nil
+}
+
+// hostKeyOption resolves the SSH host key.
+//
+// wish's WithHostKeyPath generates a key and then tries to make its directory
+// 0700, which fails on a read-only or foreign-owned mount — in a container with a
+// mounted volume that is a startup failure for a reason that has nothing to do
+// with SSH. Doing it here means the directory is never chmodded: a key that
+// already exists is used as-is, a missing key file is generated fresh, and no key
+// path at all means an ephemeral in-memory key, which is the right default for a
+// container that has nowhere durable to write.
+func hostKeyOption(path string) (ssh.Option, error) {
+	if path == "" {
+		pem, err := generateHostKey()
+		if err != nil {
+			return nil, err
+		}
+		return wish.WithHostKeyPEM(pem), nil
+	}
+	if _, err := os.Stat(path); err == nil {
+		return wish.WithHostKeyPath(path), nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	pem, err := generateHostKey()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, pem, 0o600); err != nil {
+		return nil, fmt.Errorf("write host key %s: %w", path, err)
+	}
+	return wish.WithHostKeyPEM(pem), nil
+}
+
+// generateHostKey makes an ed25519 key and returns it in OpenSSH PEM form, which
+// is what wish.WithHostKeyPEM parses.
+func generateHostKey() ([]byte, error) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	block, err := gossh.MarshalPrivateKey(priv, "salotto-ssh host key")
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(block), nil
 }

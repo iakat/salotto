@@ -1,0 +1,86 @@
+# The two renderers, deployed so the wiring can be exercised against the real
+# bouncer in this namespace. The daemon (salotto-e2e) is the bouncer they talk
+# to; these are clients of it, exactly like ZNC's own web admin is a client.
+#
+# They share the same image as the daemon (one image, three binaries): the point
+# is that internal/ui is the same code in all of them, so a rendering difference
+# between the SSH and web front ends would be a real bug, not a build difference.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: salotto-ui
+  labels: {app: salotto-ui}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: salotto-ui}
+  template:
+    metadata:
+      labels: {app: salotto-ui}
+    spec:
+      containers:
+        - name: web
+          image: 10.43.135.163:5000/salotto/salottod:e2e
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/salotto-web"]
+          args:
+            - "-addr"
+            - "0.0.0.0:8080"
+            - "-bouncer"
+            - "salotto-e2e:6667"
+            - "-nick"
+            - "e2e"
+            - "-window"
+            - "#e2e"
+          ports:
+            - name: web
+              containerPort: 8080
+          readinessProbe:
+            httpGet: {path: /, port: web}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 10m, memory: 24Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+        - name: ssh
+          image: 10.43.135.163:5000/salotto/salottod:e2e
+          imagePullPolicy: Always
+          command: ["/usr/local/bin/salotto-ssh"]
+          args:
+            - "-addr"
+            - "0.0.0.0:2222"
+            - "-host-key"
+            - "/data/host_key"
+            - "-bouncer"
+            - "salotto-e2e:6667"
+            - "-nick"
+            - "e2e"
+            - "-window"
+            - "#e2e"
+          ports:
+            - name: ssh
+              containerPort: 2222
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests: {cpu: 10m, memory: 24Mi}
+            limits: {cpu: 500m, memory: 128Mi}
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: salotto-ui
+  labels: {app: salotto-ui}
+spec:
+  selector: {app: salotto-ui}
+  ports:
+    - name: web
+      port: 8080
+      targetPort: web
+    - name: ssh
+      port: 2222
+      targetPort: ssh
