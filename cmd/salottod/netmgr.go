@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -150,11 +149,7 @@ func (m *netmgr) Start(nc config.Network) error {
 		// re-joined, which is the only effect ZNC's disabled flag has. Buffering
 		// and replay are unaffected.
 		JoinChannels: func() []string {
-			list := channels.List()
-			out := joinableChannels(list, m.srv, netName)
-			m.log.Info("TEMPDEBUG rejoin", "saved", list, "filtered", out,
-				"nick", m.srv.KnownNick(netName))
-			return out
+			return joinableChannels(channels.List(), m.srv, netName)
 		},
 		// ZNC's perform module: the lines run on every connect, before the
 		// joins, because a JOIN that races an IDENTIFY is the classic bug.
@@ -171,14 +166,7 @@ func (m *netmgr) Start(nc config.Network) error {
 			// chansaver: our own JOIN/PART/KICK decides what gets re-joined on
 			// the next connect, which is what makes the list follow reality
 			// instead of the config file.
-			own := m.srv.KnownNick(netName)
-			if rec := channels.noteSelfJoinPart(line, own); rec {
-				m.log.Info("TEMPDEBUG recorded", "line", string(line), "own", own,
-					"list", channels.List())
-			} else if strings.Contains(string(line), "JOIN ") {
-				m.log.Info("TEMPDEBUG skipped", "line", string(line), "own", own,
-					"list", channels.List())
-			}
+			channels.noteSelfJoinPart(line, m.srv.KnownNick(netName))
 			// awaystore: count private messages that arrive while the network
 			// says we are away, so the returning client is told how much it
 			// missed instead of silently replaying a buffer.

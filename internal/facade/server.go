@@ -152,24 +152,53 @@ func (n *nickCache) set(v string) {
 	n.mu.Unlock()
 }
 
+// knownNick is the nick we hold upstream, as opposed to the nick the client chose:
+// a bouncer client routinely asks for a different one, and a client nick is not an
+// identity on the IRC side.
+//
+// The live network is asked first and the cache is only a fallback. The other order
+// was a real bug: the cache got seeded from the target of the first numeric on the
+// wire, the facade also synthesises numerics addressed to the *client's* nick, and
+// so the daemon came to believe it was "e2e" while upstream it was "e2e_". Every
+// consumer of "is this line ours?" — chansaver's JOIN/PART tracking, the self-kick
+// that disables a channel — then answered no, silently and forever.
 func (ne *networkEntry) knownNick() string {
-	if v := ne.nick.get(); v != "" {
-		return v
-	}
-	if src, ok := ne.net.(upstreamNickSource); ok {
-		if v := src.Nick(); v != "" {
-			ne.nick.set(v)
-			return v
+	if ne.net != nil {
+		if src, ok := ne.net.(upstreamNickSource); ok {
+			if v := src.Nick(); v != "" {
+				if ne.nick != nil {
+					ne.nick.set(v)
+				}
+				return v
+			}
 		}
 	}
-	return ""
+	if ne.nick == nil {
+		return ""
+	}
+	return ne.nick.get()
 }
 
 // advanceNick returns the upstream nick to use for this line and the nick to
 // use for the following line. An upstream NICK change is dropped from the
 // client stream but still advances the cached identity.
 func (ne *networkEntry) advanceNick(un string, line []byte) (forLine, next string) {
+	if ne.nick == nil {
+		// A zero networkEntry has no cache; deriving from the wire still works and
+		// is what the fallback below does, so give it one.
+		ne.nick = &nickCache{}
+	}
 	if un == "" {
+		// Fall back to asking the live network before guessing from the wire.
+		// detectUpstreamNick reads the target of the first numeric, which is the
+		// upstream nick only while the client has not chosen a different nick —
+		// and the client's nick is exactly the one a bouncer client tends to pick.
+		// Caching the guess here is how the facade came to believe its own nick
+		// was "e2e" while upstream it was "e2e_", which made every "is this line
+		// ours?" test answer no.
+		if v := ne.knownNick(); v != "" {
+			return v, v
+		}
 		if v := detectUpstreamNick(line); v != "" {
 			ne.nick.set(v)
 			return v, v
