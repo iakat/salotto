@@ -31,9 +31,10 @@ import (
 var version = "dev"
 
 type networkAdapter struct {
-	name string
-	conn *upstream.Conn
-	set  *winring.Set
+	channels *channelSet
+	name     string
+	conn     *upstream.Conn
+	set      *winring.Set
 }
 
 func (n *networkAdapter) Name() string { return n.name }
@@ -63,6 +64,20 @@ func (n *networkAdapter) HasPassword() bool { return n.conn.HasPassword() }
 func (n *networkAdapter) Traffic() (in, out uint64) { return n.conn.Traffic() }
 
 func (n *networkAdapter) SetConnectEnabled(enabled bool) { n.conn.SetConnectEnabled(enabled) }
+
+func (n *networkAdapter) Servers() []string { return n.conn.Servers() }
+
+func (n *networkAdapter) AddServer(addr string) bool { return n.conn.AddServer(addr) }
+
+func (n *networkAdapter) DelServer(addr string) bool { return n.conn.DelServer(addr) }
+
+// MoveChan moves a channel in the saved order this network re-joins from.
+func (n *networkAdapter) MoveChan(channel string, index int) error {
+	if n.channels == nil {
+		return errors.New("Invalid index")
+	}
+	return n.channels.MoveChan(channel, index)
+}
 
 func (n *networkAdapter) ResizeWindow(window string, lines int) bool {
 	return n.set.Resize(window, lines)

@@ -14,12 +14,13 @@ import (
 )
 
 type fakeNet struct {
-	name   string
-	set    *winring.Set
-	server string
-	mask   string
-	in     uint64
-	out    uint64
+	name    string
+	set     *winring.Set
+	server  string
+	mask    string
+	in      uint64
+	out     uint64
+	servers []string
 }
 
 func newFakeNet(name string) *fakeNet {
@@ -32,6 +33,30 @@ func (f *fakeNet) State() string     { return "registered" }
 func (f *fakeNet) Bytes() int        { return f.set.Bytes() }
 
 func (f *fakeNet) Server() string { return f.server }
+
+func (f *fakeNet) Servers() []string { return f.servers }
+
+func (f *fakeNet) AddServer(addr string) bool {
+	for _, existing := range f.servers {
+		if existing == addr {
+			return false
+		}
+	}
+	f.servers = append(f.servers, addr)
+	return true
+}
+
+func (f *fakeNet) DelServer(addr string) bool {
+	for i, existing := range f.servers {
+		if existing == addr {
+			f.servers = append(f.servers[:i], f.servers[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeNet) MoveChan(string, int) error { return nil }
 
 func (f *fakeNet) NickMask() string { return f.mask }
 

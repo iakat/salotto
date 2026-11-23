@@ -65,12 +65,37 @@ func TestChannelSetIgnoresKicks(t *testing.T) {
 	}
 }
 
-// TestChannelSetListIsSorted pins that reconnect order is stable, so two dials
-// of the same config send the same JOIN sequence.
-func TestChannelSetListIsSorted(t *testing.T) {
+// TestChannelSetListKeepsOrder pins that reconnect order is the saved order, not
+// alphabetical: MOVECHAN's whole purpose is to change it, and a sorted list would
+// silently undo every move.
+func TestChannelSetListKeepsOrder(t *testing.T) {
 	c := newChannelSet([]string{"#zeta", "#alpha", "#mike"})
-	if got, want := c.List(), []string{"#alpha", "#mike", "#zeta"}; !reflect.DeepEqual(got, want) {
+	if got, want := c.List(), []string{"#zeta", "#alpha", "#mike"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("List() = %v, want %v", got, want)
+	}
+}
+
+// TestChannelSetMoveChan is IRCNetwork::MoveChan (IRCNetwork.cpp:942-961),
+// including its order of validation: the index is range-checked before the
+// channel is looked up, so a bad index on a channel you are not in reports
+// "Invalid index" rather than "You are not on #x".
+func TestChannelSetMoveChan(t *testing.T) {
+	c := newChannelSet([]string{"#a", "#b", "#c"})
+
+	if err := c.MoveChan("#c", 0); err != nil {
+		t.Fatalf("MoveChan: %v", err)
+	}
+	if got, want := c.List(), []string{"#c", "#a", "#b"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after move: %v, want %v", got, want)
+	}
+
+	// An out-of-range index is "Invalid index" even for a channel we are not in.
+	if err := c.MoveChan("#zzz", 99); err == nil || err.Error() != "Invalid index" {
+		t.Fatalf("out-of-range index: %v", err)
+	}
+	// A valid index for a channel we are not in is ZNC's "You are not on #x".
+	if err := c.MoveChan("#zzz", 1); err == nil || err.Error() != "You are not on #zzz" {
+		t.Fatalf("unknown channel: %v", err)
 	}
 }
 

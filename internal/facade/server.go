@@ -113,6 +113,19 @@ type Network interface {
 	// SetConnectEnabled turns the upstream on or off, as CONNECT and
 	// DISCONNECT do (ZNC's m_bIRCConnectEnabled).
 	SetConnectEnabled(enabled bool)
+	// Servers is the ordered server list ADDSERVER and DELSERVER mutate, and
+	// LISTSERVERS renders. A network with one configured address returns one
+	// entry, which is the pre-existing behaviour.
+	Servers() []string
+	// AddServer appends a server and reports whether it was added (false when it
+	// was already there, which is ZNC's "Perhaps the server is already added").
+	AddServer(addr string) bool
+	// DelServer removes a server and reports whether it was there.
+	DelServer(addr string) bool
+	// MoveChan moves a channel to a 0-based index in the saved channel order and
+	// reports an error string ZNC would print. It is nil-safe: a network that
+	// keeps no order returns an error.
+	MoveChan(channel string, index int) error
 }
 
 type networkEntry struct {
@@ -624,6 +637,14 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleTraffic()
 	case ircline.IsVerb(rest, "AWAY"):
 		return c.handleAway(rest)
+	case ircline.IsVerb(rest, "ADDSERVER"):
+		return c.handleAddServer(rest)
+	case ircline.IsVerb(rest, "DELSERVER"), ircline.IsVerb(rest, "REMSERVER"):
+		return c.handleDelServer(rest)
+	case ircline.IsVerb(rest, "MOVECHAN"):
+		return c.handleMoveChan(rest)
+	case ircline.IsVerb(rest, "MOVENETWORK"):
+		return c.handleMoveNetwork()
 	case ircline.IsVerb(rest, "CONNECT"):
 		return c.handleConnect()
 	case ircline.IsVerb(rest, "DISCONNECT"):

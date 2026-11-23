@@ -195,6 +195,15 @@ type Conn struct {
 	capsMu sync.RWMutex
 	caps   map[string]bool
 
+	// activeServer is the address of the established connection, which is what
+	// LISTSERVERS marks with an asterisk rather than guessing from the rotation.
+	activeServer atomic.Value // string
+
+	// servers is the ordered server list ADDSERVER/DELSERVER mutate, and the
+	// rotation a failed connect walks. It is seeded from cfg.Addr so a
+	// single-address config behaves as it always did.
+	servers *serverList
+
 	// enabled is ZNC's m_bIRCConnectEnabled: false means the operator asked the
 	// bouncer to stay off IRC. The reconnect loop waits on poke rather than
 	// spinning while it is false, and Disconnect closes the live socket so a
@@ -266,6 +275,7 @@ func New(cfg Config) (*Conn, error) {
 		caps:       make(map[string]bool),
 		freeSlabs:  make(chan *slab, slabCount),
 		writeSlabs: make(chan *slab, slabCount),
+		servers:    newServerList(cfg.Addr),
 	}
 	c.state.Store(int32(StateConnecting))
 	c.enabled.Store(true)
@@ -401,9 +411,19 @@ func (c *Conn) Traffic() (in, out uint64) {
 }
 
 func (c *Conn) ServerString() string {
-	host, port, err := net.SplitHostPort(c.cfg.Addr)
+	// Report the server actually in use — the live one, else the next the
+	// rotation would try — rather than always the configured address, or a
+	// network that failed over would keep claiming the dead host.
+	addr := c.liveServer()
+	if addr == "" {
+		addr = c.servers.Current()
+	}
+	if addr == "" {
+		addr = c.cfg.Addr
+	}
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return c.cfg.Addr
+		return addr
 	}
 	if c.cfg.TLS {
 		return host + " +" + port
@@ -502,3 +522,28 @@ func (c *Config) saslWanted() bool {
 	}
 	return c.SASLUser != ""
 }
+
+// AddServer appends a server to this network's list and reports whether it was
+// added, which is ZNC's IRCNetwork::AddServer (ClientCommand.cpp:843). The
+// address is a salotto "host:port"; ZNC's "+port means SSL" spelling is handled
+// by the command layer, not here.
+func (c *Conn) AddServer(addr string) bool { return c.servers.Add(addr) }
+
+// DelServer removes a server. ZNC answers "No such server" when it was not
+// there (ClientCommand.cpp:876).
+func (c *Conn) DelServer(addr string) bool { return c.servers.Del(addr) }
+
+// Servers returns the configured servers in order.
+func (c *Conn) Servers() []string { return c.servers.Addrs() }
+
+// liveServer is the address of the connection actually established, tracked in
+// conn.go so LISTSERVERS can mark it rather than guessing from the rotation.
+func (c *Conn) liveServer() string {
+	if v := c.activeServer.Load(); v != nil {
+		return v.(string)
+	}
+	return ""
+}
+
+// setLiveServer records which server the current connection went to.
+func (c *Conn) setLiveServer(addr string) { c.activeServer.Store(addr) }

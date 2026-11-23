@@ -1,7 +1,7 @@
 package main
 
 import (
-	"sort"
+	"errors"
 	"strings"
 	"sync"
 
@@ -21,16 +21,21 @@ import (
 // which is also the thing that may write the config — the same boundary ZNC
 // draws between a module flipping a flag and CZNC::WriteConfig.
 type channelSet struct {
-	mu   sync.Mutex
-	set  map[string]struct{}
-	seen bool
+	mu    sync.Mutex
+	set   map[string]struct{}
+	order []string
+	seen  bool
 }
 
 func newChannelSet(configured []string) *channelSet {
 	c := &channelSet{set: make(map[string]struct{}, len(configured))}
 	for _, ch := range configured {
 		if key := channelKey(ch); key != "" {
+			if _, dup := c.set[key]; dup {
+				continue
+			}
 			c.set[key] = struct{}{}
+			c.order = append(c.order, key)
 		}
 	}
 	return c
@@ -46,16 +51,44 @@ func channelKey(name string) string {
 	return strings.ToLower(name)
 }
 
-// List returns the channels to join, sorted, so reconnect order is stable.
+// List returns the channels to join, in the order they are kept, so reconnect
+// order is stable and MOVECHAN means something.
 func (c *channelSet) List() []string {
 	c.mu.Lock()
-	out := make([]string, 0, len(c.set))
-	for ch := range c.set {
-		out = append(out, ch)
-	}
+	out := make([]string, len(c.order))
+	copy(out, c.order)
 	c.mu.Unlock()
-	sort.Strings(out)
 	return out
+}
+
+// MoveChan moves a channel to a 0-based index, which is ZNC's
+// IRCNetwork::MoveChan (IRCNetwork.cpp:942-961). ZNC range-checks the index
+// before looking the channel up, so an out-of-range index reports "Invalid index"
+// even when the channel is not in the list; that order is reproduced because the
+// error text is the observable.
+func (c *channelSet) MoveChan(channel string, index int) error {
+	key := channelKey(channel)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if index < 0 || index >= len(c.order) {
+		return errors.New("Invalid index")
+	}
+	at := -1
+	for i, name := range c.order {
+		if name == key {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		return errors.New("You are not on " + channel)
+	}
+	name := c.order[at]
+	c.order = append(c.order[:at], c.order[at+1:]...)
+	c.order = append(c.order, "")
+	copy(c.order[index+1:], c.order[index:])
+	c.order[index] = name
+	return nil
 }
 
 // Has reports whether a channel is in the set.
@@ -73,7 +106,10 @@ func (c *channelSet) Add(name string) {
 		return
 	}
 	c.mu.Lock()
-	c.set[key] = struct{}{}
+	if _, exists := c.set[key]; !exists {
+		c.set[key] = struct{}{}
+		c.order = append(c.order, key)
+	}
 	c.mu.Unlock()
 }
 
@@ -85,6 +121,12 @@ func (c *channelSet) Remove(name string) {
 	}
 	c.mu.Lock()
 	delete(c.set, key)
+	for i, name := range c.order {
+		if name == key {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
 	c.mu.Unlock()
 }
 

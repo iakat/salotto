@@ -274,10 +274,17 @@ Mapping:
   window's ring (`winring.Set.Resize`) rather than only answering. All eleven
   cases are settled differentially against a deployed ZNC 1.10.2
   (`test/e2e/parity.py`, `docs/E2E.md`).
-- **Still to do**: `AddServer`, `DelServer`, `MoveChan`, `MoveNetwork` — these
-  mutate a persisted server/channel list, and there is no server list: one
-  address per network comes from the config, so the honest implementation
-  arrives with the admin surface (§2.0.2) that writes config.
+- **Implemented (the last four)**: `AddServer`, `DelServer`, `MoveChan` and
+  `MoveNetwork`. The first three needed a server list that did not exist, so
+  `internal/upstream/servers.go` added one: an ordered list seeded from the
+  config address, which the dial path walks on failure (`IRCNetwork`'s server
+  rotation) and `LISTSERVERS` renders. A single-address config behaves exactly
+  as before. `MoveChan` orders the saved channel list — `channelSet` now keeps
+  insertion order instead of sorting, because sorting would silently undo every
+  move. `MoveNetwork` is **refused**: it moves a network between ZNC *users*
+  (ClientCommand.cpp:700-730, admin-only) and salotto is single-user, so the
+  answer says that rather than printing a usage line for a command that could
+  never work.
 - **Correction**: an earlier revision of this table called the above
   "already meaningful for us". Grepping the tree showed `LISTNETWORKS`,
   `LISTSERVERS`, `LISTCLIENTS`, `TRAFFIC`, `CONNECT`, `DISCONNECT` and
@@ -295,8 +302,8 @@ Mapping:
   `Broadcast`, `ListMods`, `ListUsers` (cross-user; no multi-tenant admin over
   IRC — admin lives in the Web UI, per Part 0.3).
 
-So: 22 commands implemented and verified, 4 waiting on the admin surface, 1
-dropped by design (`AddPort`), 6 refused.
+So: 25 commands implemented and verified, 1 refused by nature (`MoveNetwork`,
+single-user), 1 dropped by design (`AddPort`), 6 refused (module/admin surface).
 
 ### 1.4 Bouncer gaps the `log` work exposed
 

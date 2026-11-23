@@ -3,6 +3,7 @@ package facade
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -26,6 +27,8 @@ type fakeNet struct {
 	connected bool
 	resized   map[string]bool
 	nick      string
+	servers   []string
+	chans     []string
 	in        uint64
 	out       uint64
 }
@@ -45,6 +48,65 @@ func (f *fakeNet) Nick() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.nick
+}
+
+// Servers/AddServer/DelServer/MoveChan are the ADDSERVER/DELSERVER/MOVECHAN
+// surface. The fake keeps a real ordered list so the command tests exercise the
+// same ordering logic the daemon does.
+func (f *fakeNet) Servers() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.servers...)
+}
+
+func (f *fakeNet) AddServer(addr string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, existing := range f.servers {
+		if strings.EqualFold(existing, addr) {
+			return false
+		}
+	}
+	f.servers = append(f.servers, addr)
+	return true
+}
+
+func (f *fakeNet) DelServer(addr string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, existing := range f.servers {
+		if strings.EqualFold(existing, addr) {
+			f.servers = append(f.servers[:i], f.servers[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// MoveChan mirrors the daemon's channelSet: index range-checked first, then the
+// channel looked up, matching IRCNetwork::MoveChan's order of validation.
+func (f *fakeNet) MoveChan(channel string, index int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if index < 0 || index >= len(f.chans) {
+		return errors.New("Invalid index")
+	}
+	at := -1
+	for i, name := range f.chans {
+		if strings.EqualFold(name, channel) {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		return errors.New("You are not on " + channel)
+	}
+	name := f.chans[at]
+	f.chans = append(f.chans[:at], f.chans[at+1:]...)
+	f.chans = append(f.chans, "")
+	copy(f.chans[index+1:], f.chans[index:])
+	f.chans[index] = name
+	return nil
 }
 
 func (f *fakeNet) ResizeWindow(window string, lines int) bool {

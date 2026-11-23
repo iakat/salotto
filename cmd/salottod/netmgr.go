@@ -220,7 +220,7 @@ func (m *netmgr) Start(nc config.Network) error {
 
 	// Register before dialling so a line arriving on the first connection has a
 	// network to be routed through.
-	if err := m.srv.AddNetwork(netName, &networkAdapter{name: netName, conn: conn, set: set}); err != nil {
+	if err := m.srv.AddNetwork(netName, &networkAdapter{name: netName, conn: conn, set: set, channels: channels}); err != nil {
 		m.mu.Lock()
 		delete(m.runtimes, netName)
 		delete(m.conns, netName)

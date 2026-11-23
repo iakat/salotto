@@ -66,8 +66,15 @@ func dialerWithBindHost(base *net.Dialer, host string) *net.Dialer {
 func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 	attempt := c.attempts.Add(1)
 
+	// Walk the server list rather than always dialling cfg.Addr: with more than
+	// one server configured, a dead entry must not be a dead network
+	// (IRCNetwork's server rotation, ClientCommand.cpp:820-885).
+	addr := c.servers.Next()
+	if addr == "" {
+		return false, errors.New("upstream: no servers configured")
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	raw, err := c.dialerForDial().DialContext(dialCtx, "tcp", c.cfg.Addr)
+	raw, err := c.dialerForDial().DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		cancel()
 		if bindHost := c.BindHost(); bindHost != "" {
@@ -94,11 +101,15 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 	defer func() { closeOnce.Do(onClose) }()
 
 	c.setLive(raw)
-	defer c.setLive(nil)
+	c.setLiveServer(addr)
+	defer func() {
+		c.setLiveServer("")
+		c.setLive(nil)
+	}()
 
 	conn := raw
 	if c.cfg.TLS {
-		host, _, _ := net.SplitHostPort(c.cfg.Addr)
+		host, _, _ := net.SplitHostPort(addr)
 		tlsCfg := &tls.Config{
 			ServerName:         host,
 			InsecureSkipVerify: c.cfg.InsecureSkipVerify,
