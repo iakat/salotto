@@ -14,11 +14,25 @@ rather than pulling a dependency the deployment does not have.
 import base64
 import json
 import os
+import re
 import socket
 import ssl
 import struct
 import sys
 import time
+
+ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[()][A-Z0-9]")
+
+
+def visible(line):
+    """A line as a terminal would draw it: escape sequences are not characters.
+
+    This matters more than it looks. Counting the raw bytes of a border makes a 40-column
+    frame measure 91 'characters', which reads as "the resize did nothing" when in fact the
+    model resized perfectly - the colour codes are just longer than the border.
+    """
+    return ANSI.sub(b"", line).decode("utf-8", "replace")
+
 
 HOSTS = {
     "alice": "alice.ch-test.katia.sh",
@@ -161,19 +175,30 @@ def main():
             print("  ok   keystroke reached the model")
 
         # 4. A resize reaches the model: the border it redraws is the new width.
+        #
+        # Wait for a NARROW border rather than reading whatever is queued: output from
+        # before the resize is still in flight, and the first frame a naive reader sees is
+        # the old one. That is the difference between "the resize worked" and "the resize
+        # worked and the probe looked at the previous screen".
         ws.send(json.dumps({"type": "resize", "cols": 40, "rows": 12}))
-        resized = ws.text(time.time() + 20)
-        lines = [l for l in resized.split(b"\r\n") if "\u256d".encode() in l]
-        if not lines:
-            print("  FAIL no redraw after the resize")
+        width = None
+        deadline = time.time() + 25
+        while time.time() < deadline and width is None:
+            chunk = ws.text(time.time() + 5)
+            for raw in chunk.split(b"\r\n"):
+                if "\u256d".encode() not in raw:
+                    continue
+                # Visible width, not bytes and not raw characters: the line carries
+                # colour codes, and measuring those makes every frame look wide.
+                w = len(visible(raw).rstrip())
+                if w <= 45:
+                    width = w
+                    break
+        if width is None:
+            print("  FAIL no narrow redraw after the resize: the model ignored it")
             fails.append(nick)
         else:
-            # Count characters, not bytes: box drawing is three bytes each.
-            width = len(lines[-1].decode("utf-8", "replace"))
-            print(f"  ok   resize redrew ({width} chars in the top border)")
-            if width > 70:
-                print(f"  FAIL the model ignored the resize (still {width} wide)")
-                fails.append(nick)
+            print(f"  ok   resize reached the model ({width} chars in the top border)")
 
         ws.close()
 
