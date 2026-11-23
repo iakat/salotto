@@ -365,3 +365,22 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// Windows returns the window list in cycle order. The web client renders it as a
+// sidebar, so it needs the list the model actually has rather than a copy kept in
+// the browser: a second list is a list that drifts.
+func (m Model) Windows() []string {
+	out := make([]string, len(m.order))
+	copy(out, m.order)
+	return out
+}
+
+// SetInput replaces the input buffer, for a client mirroring typing.
+func (m Model) SetInput(text string) Model {
+	m.input = m.input[:0]
+	m.input = append(m.input, []rune(text)...)
+	return m
+}
+
+// Status is the status-bar text.
+func (m Model) Status() string { return m.status }

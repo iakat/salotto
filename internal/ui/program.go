@@ -22,6 +22,12 @@ type Program struct {
 	mu    sync.Mutex
 	model Model
 	tr    *Transport
+
+	// rev counts applied messages. A WebSocket driver needs to know when the
+	// render changed without being told explicitly by every path that changes it;
+	// a counter bumped in one place is that, and a missed frame is harmless
+	// because every frame carries the full render.
+	rev uint64
 }
 
 // NewProgram builds the bridge. The transport is optional: a Program with no
@@ -54,6 +60,7 @@ func (p *Program) step(msg tea.Msg, sync bool) tea.Cmd {
 	p.mu.Lock()
 	next, cmd := p.model.Step(msg)
 	p.model = next
+	p.rev++
 	p.mu.Unlock()
 
 	if cmd != nil {
@@ -106,6 +113,9 @@ func (p *Program) WindowName() string {
 func (p *Program) SetActiveWindow(name string) {
 	p.mu.Lock()
 	p.model = p.model.SetActive(name)
+	// Every state change bumps the revision, or an attached browser never learns
+	// about it: the poller in ServeWS watches this counter and nothing else.
+	p.rev++
 	p.mu.Unlock()
 	// The transport must follow, or the browser's next line goes to whichever
 	// window the last keystroke left active.
@@ -126,6 +136,24 @@ func (p *Program) View() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.model.View()
+}
+
+// Revision reports how many messages have been applied, which is how a poller
+// notices that the render changed. It is deliberately coarse: a UI needs "it
+// changed", not a change log.
+func (p *Program) Revision() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.rev
+}
+
+// SetInput replaces the input buffer, for a client mirroring what is being typed.
+// It is not a submit: the line is still uncommitted.
+func (p *Program) SetInput(text string) {
+	p.mu.Lock()
+	p.model = p.model.SetInput(text)
+	p.rev++
+	p.mu.Unlock()
 }
 
 // Next waits for the next message from the transport, blocking. A driver runs it
