@@ -1034,3 +1034,32 @@ func TestPreviewsAreNotFetchedForOtherWindows(t *testing.T) {
 		t.Fatalf("Links on the active window = %v, want none", links)
 	}
 }
+
+// TestOwnJoinAsksForTheModes pins that we ask. 332 is volunteered by the server on
+// JOIN; 324 is not, so a client that waits for it shows a topic and no modes - which
+// looks like a channel with no modes rather than one nobody asked about.
+func TestOwnJoinAsksForTheModes(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	fb.inject(t, ":irc.test 001 me :welcome")
+	fb.inject(t, ":me!m@h JOIN #c")
+
+	// Read what the bouncer's side of the socket received: the claim is that we
+	// ASKED, which only the wire can show.
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case sent := <-fb.sent:
+			if sent == "MODE #c" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("the client never sent MODE #c after its own JOIN")
+		}
+	}
+}

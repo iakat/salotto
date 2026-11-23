@@ -294,6 +294,11 @@ func (t *Transport) handle(raw []byte) {
 				Text:   "joined " + channel,
 				Kind:   LineSystem,
 			}))
+			// 324 only arrives when asked, unlike 332 which the server volunteers
+			// on JOIN. Without this the header shows a topic and no modes, which
+			// looks like a channel with no modes rather than one we never asked
+			// about.
+			t.Send("MODE " + channel)
 			return
 		}
 		t.push(Incoming(Line{
