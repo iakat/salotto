@@ -624,3 +624,28 @@ func TestNicklistReplacesRatherThanMerges(t *testing.T) {
 		t.Fatalf("after empty nicks = %+v", got)
 	}
 }
+
+// TestNickJSONFieldNames is the regression test for a bug every Go-side test
+// missed: Nick had no JSON tags, so it marshalled as {"Name":..,"Prefix":..} while
+// the browser client reads "name"/"prefix". The nicklist rendered as "undefined"
+// in a real browser and was invisible to any test that only inspected Go values.
+//
+// The field names are the interface. This pins them on the wire, not in the struct.
+func TestNickJSONFieldNames(t *testing.T) {
+	b, err := json.Marshal(Nick{Name: "alice", Prefix: "@"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != `{"name":"alice","prefix":"@"}` {
+		t.Fatalf("Nick marshals to %s; the browser reads lowercase field names", got)
+	}
+	// An ordinary member carries no prefix key at all, so the client's
+	// `n.prefix || ""` is the only thing needed there.
+	b, err = json.Marshal(Nick{Name: "bob"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != `{"name":"bob"}` {
+		t.Fatalf("a plain Nick marshals to %s", got)
+	}
+}

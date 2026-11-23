@@ -62,9 +62,14 @@ type Nicklist struct {
 
 // Nick is one member of a channel: a name and its highest prefix mode, "" for an
 // ordinary member.
+//
+// The JSON tags are lowercase because this type is also what travels to the
+// browser. Without them Go marshals "Name"/"Prefix", the client reads
+// name/prefix, and the nicklist renders as "undefined" while every test that only
+// inspects the Go side passes.
 type Nick struct {
-	Name   string
-	Prefix string
+	Name   string `json:"name"`
+	Prefix string `json:"prefix,omitempty"`
 }
 
 // Sent is the message a transport sends when the user submitted a line.
