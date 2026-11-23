@@ -20,6 +20,7 @@ type event struct {
 	buf        *[]byte
 	n          int
 	out        bool
+	entries    []Entry
 	connect    bool
 	disconnect bool
 	server     string
@@ -103,8 +104,39 @@ func (w *Writer) SetNick(nick string) {
 func (w *Writer) SetHasCap(fn func(string) bool) { w.hasCap = fn }
 func (w *Writer) Tracker() *Tracker              { return w.tracker }
 
+// Route parses line once into the log entries it belongs to, using this
+// writer's tracker, server string and negotiated capabilities. The upstream
+// connection uses it to route and buffer a line; the resulting entries are
+// handed back through OnRouted so the drain does not parse it again.
+func (w *Writer) Route(line []byte, outbound bool) []Entry {
+	hasEcho := false
+	if w.hasCap != nil {
+		hasEcho = w.hasCap("echo-message")
+	}
+	return Route(w.tracker, line, outbound, hasEcho, w.server)
+}
+
 func (w *Writer) OnLine(seq uint64, line []byte) {
 	_ = seq
+	w.enqueue(line, false)
+}
+
+func (w *Writer) OnSend(line []byte) {
+	w.enqueue(line, true)
+}
+
+// OnRouted enqueues a line whose log entries were already produced by the
+// routing step (logfile.Route), so the drain does not parse the same line a
+// second time. entries must be treated as immutable by the caller.
+func (w *Writer) OnRouted(entries []Entry, line []byte, out bool) {
+	w.enqueueEntries(line, out, entries)
+}
+
+func (w *Writer) enqueue(line []byte, out bool) {
+	w.enqueueEntries(line, out, nil)
+}
+
+func (w *Writer) enqueueEntries(line []byte, out bool, entries []Entry) {
 	p := w.pool.Get().(*[]byte)
 	if cap(*p) < len(line) {
 		// oversized: fall back to a fresh slab-sized buffer (should not happen)
@@ -114,23 +146,7 @@ func (w *Writer) OnLine(seq uint64, line []byte) {
 	b := (*p)[:len(line)]
 	copy(b, line)
 	select {
-	case w.queue <- event{buf: p, n: len(line)}:
-	default:
-		w.pool.Put(p)
-		w.dropped.Add(1)
-	}
-}
-
-func (w *Writer) OnSend(line []byte) {
-	p := w.pool.Get().(*[]byte)
-	if cap(*p) < len(line) {
-		b := make([]byte, len(line))
-		p = &b
-	}
-	b := (*p)[:len(line)]
-	copy(b, line)
-	select {
-	case w.queue <- event{buf: p, n: len(line), out: true}:
+	case w.queue <- event{buf: p, n: len(line), out: out, entries: entries}:
 	default:
 		w.pool.Put(p)
 		w.dropped.Add(1)
@@ -246,8 +262,11 @@ func (w *Writer) handle(e event) {
 	// line arrived in: a QUIT or NICK fans out to the channels the nick shared
 	// before it happened. Observing first would erase that membership and log
 	// the event to status while the replay went to the channels, or vice versa.
-	server := w.server
-	entries := Format(w.tracker, now, line, e.out, hasEcho, server)
+	// The routing step normally hands us its entries, so this is the only parse.
+	entries := e.entries
+	if entries == nil {
+		entries = Format(w.tracker, now, line, e.out, hasEcho, w.server)
+	}
 	if !e.out {
 		w.tracker.Observe(line)
 	}

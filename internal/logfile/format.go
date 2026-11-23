@@ -381,6 +381,29 @@ func trMembersMap(tr *Tracker) map[string]map[string]bool {
 	return tr.membersSnapshot()
 }
 
+// Route parses line once and returns the de-duplicated log entries it belongs
+// to. An empty window name is normalised to "status". Routing and the logfile
+// drain both use this result, so a routed line is not parsed twice.
+func Route(tr *Tracker, line []byte, outbound bool, hasEcho bool, server string) []Entry {
+	entries := Format(tr, nil, line, outbound, hasEcho, server)
+	if len(entries) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(entries))
+	out := make([]Entry, 0, len(entries))
+	for _, e := range entries {
+		if e.Window == "" {
+			e.Window = "status"
+		}
+		if seen[e.Window] {
+			continue
+		}
+		seen[e.Window] = true
+		out = append(out, e)
+	}
+	return out
+}
+
 // WindowFor returns the replay window name for an IRC line, using exactly the
 // same rules Format uses to choose the log file, so a replayed window and a
 // logged window can never disagree. When the line produces several entries (a
@@ -390,22 +413,12 @@ func trMembersMap(tr *Tracker) map[string]map[string]bool {
 // ok is false when the line has no window of its own: it produces no entry at
 // all (a CAP reply, a suppressed own echo) or every entry it produces is the
 // "status" window (numerics, PING, ERROR, a QUIT from a nick sharing no
-// channel). The caller treats that as "status". Status lines are not windowed:
-// Broadcast is the status stream.
+// channel). Status lines are not windowed live: Broadcast is the status stream.
 func WindowFor(tr *Tracker, line []byte, outbound bool, hasEcho bool) (first string, all []string, ok bool) {
-	entries := Format(tr, nil, line, outbound, hasEcho, "")
-	seen := make(map[string]bool, len(entries))
+	entries := Route(tr, line, outbound, hasEcho, "")
 	all = make([]string, 0, len(entries))
 	for _, e := range entries {
-		w := e.Window
-		if w == "" {
-			w = "status"
-		}
-		if seen[w] {
-			continue
-		}
-		seen[w] = true
-		all = append(all, w)
+		all = append(all, e.Window)
 	}
 	if len(all) == 0 {
 		return "", nil, false
