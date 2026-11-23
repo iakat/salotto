@@ -581,7 +581,9 @@ Dependency order, not priority-by-excitement. Each line is roughly one milestone
    this.
 4. **B5 + B10–B12**: runtime networks, buffer playback per window, clear,
    enable/disable per channel.
-5. **UI stack skeleton** (§2.0): the `tea.Model` crate, `wish` SSH listener, and
+5. **UI stack skeleton** (§2.0): **done** — `internal/ui` holds one `tea.Model`
+   with three drivers (`cmd/salotto-ssh`, `cmd/salotto-web`, `ui.Headless`), and the
+   ANSI→HTML path is proven over real HTTP. See `docs/UI.md`.
    the ANSI→HTML path proven end to end on one screen. Do this *before* OIDC, so
    the model's shape is set by a rendering that already works in both places.
 6. **OIDC + tickets** (`docs/SPEC.md` §8) and **self-service** (§2.0.2) — the gate
