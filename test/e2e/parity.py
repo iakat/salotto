@@ -172,13 +172,28 @@ def case_registration(b: Bouncer) -> dict:
 
 
 def case_join_echo(b: Bouncer, channel: str) -> dict:
+    ensure_joined(b, channel)
     b.ask("JOIN " + channel, 2.0)
     echo = b.ask("PRIVMSG %s :parity-echo" % channel, 1.5)
     return {"joined": True, "echoed": says(echo, "parity-echo")}
 
 
+def ensure_joined(b: Bouncer, channel: str) -> None:
+    """Join the channel if we are not already in it.
+
+    Cases in this file run against one long-lived bouncer and some of them
+    perturb persistent state on purpose (chansaver parts the channel). Rather
+    than depending on case order, every case that needs the channel asks for it.
+    """
+    lines = b.ask("JOIN " + channel, 1.5)
+    # 366 is RPL_ENDOFNAMES, which a successful JOIN always produces.
+    if not any(" 366 " in l for l in lines):
+        b.drain(1.5)
+
+
 def case_playback(b: Bouncer, channel: str, marker: str) -> dict:
     """A line buffered while we were detached must replay on PlayBuffer."""
+    ensure_joined(b, channel)
     b.cmd("Detach", channel, seconds=1.2)
     b.send("PRIVMSG %s :%s" % (channel, marker))
     b.drain(1.2)
@@ -335,7 +350,18 @@ def case_chansaver(b: Bouncer, channel: str) -> dict:
     b.cmd("Connect", seconds=3.0)
     lines = b.drain(6.0)
     rejoin = any((" JOIN " in l) and (channel.lower() in l.lower()) for l in lines)
+    # Restore the fixture. The probe deliberately perturbs persistent state (the
+    # saved channel list), so it has to put it back or every later case runs
+    # against a bouncer that no longer auto-joins the channel — which is exactly
+    # how this case first made `playback` fail in the next run.
+    b.send("JOIN " + channel)
+    b.drain(2.0)
     return {"rejoined_after_part": rejoin}
+
+
+# ZNC's away reason format, from simple_away + CUtils::CTime: a C-locale %c plus
+# an explicit " UTC" (simple_away.cpp:213-215, Utils.cpp:510-512).
+ZNC_AWAY_RE = re.compile(r"Auto away at \w{3} \w{3} [ \d]\d [\d:]{8} \d{4} UTC")
 
 
 class ErgoObserver:
@@ -352,6 +378,12 @@ class ErgoObserver:
         self.sock.settimeout(0.3)
         self.buf = b""
         self.pending: list[str] = []
+        # away-notify is not optional here: a plain AWAY is never relayed to
+        # other clients, so without this capability the observer would see
+        # nothing, both sides would "agree" on nothing, and the case would pass
+        # for the wrong reason.
+        self.send("CAP REQ :away-notify")
+        self.send("CAP END")
         self.send("NICK " + nick)
         self.send("USER %s 0 * :%s observer" % (nick, nick))
         self.drain(1.5)
@@ -377,6 +409,18 @@ class ErgoObserver:
         out, self.pending = self.pending, []
         return out
 
+    def whois(self, target: str) -> list[str]:
+        """Ask ergo about a nick and return what came back for it."""
+        self.send("WHOIS " + target)
+        out: list[str] = []
+        end = time.time() + 4.0
+        while time.time() < end:
+            for line in self.drain(0.4):
+                out.append(line)
+                if " 318 " in line:  # RPL_ENDOFWHOIS
+                    return out
+        return out
+
     def close(self) -> None:
         try:
             self.send("QUIT :done")
@@ -387,27 +431,48 @@ class ErgoObserver:
 
 def run_away(host: str, port: int, nick: str, dialect: str, password: str | None,
              channel: str, ergo_host: str, ergo_port: int) -> dict:
-    """Detach, wait, and see whether an AWAY reaches ergo.
+    """Detach, wait, and ask ergo whether the bouncer is away.
 
-    The bouncer is driven only to connect; the measurement is taken on the IRC
-    server, which is the only place the away is real. The reason is compared by
-    shape, not by value: the timestamp legitimately differs between the two runs.
+    Two earlier versions of this case were wrong in instructive ways. The first
+    watched the channel for an AWAY line without negotiating away-notify, and
+    a plain AWAY is never relayed to other clients, so it saw nothing and both
+    sides "agreed" on nothing. The second negotiated the capability but the
+    probe still saw nothing, because away-notify only relays to clients that
+    share a channel and neither bouncer was actually in #e2e — the observer sat
+    there alone.
+
+    So the measurement is WHOIS, which needs no shared channel: ergo answers
+    301 RPL_AWAY with the reason for anyone who asks, which is the same thing a
+    human sees in /whois. The probe also re-joins the channel first, so the case
+    repairs the fixture state that the chansaver case perturbs.
     """
     obs = ErgoObserver(ergo_host, ergo_port, "obs" + ("z" if dialect == "znc" else "s"), channel)
     try:
         b = Bouncer(host, port, nick, dialect, password)
         b.drain(2.0)
+        # Make sure the bouncer is in the channel: the chansaver case parts it on
+        # purpose, and a bouncer that is not in the channel makes the away
+        # invisible to channel-based checks.
+        b.send("JOIN " + channel)
+        b.drain(2.0)
+        # The upstream identity may be the alt nick when both bouncers share the
+        # ergo: whoever dialled second gets renamed. Ask about both.
+        candidates = [nick, nick + "_"]
         b.close()          # the last client leaving is what arms simple_away
-        lines = obs.drain(12.0)
+        obs.drain(12.0)
+
+        for candidate in candidates:
+            lines = obs.whois(candidate)
+            away = [l for l in lines if " 301 " in l]
+            if away:
+                reason = away[0].split(" :", 1)[-1]
+                return {
+                    "away": True,
+                    "reason_has_znc_format": bool(ZNC_AWAY_RE.match(reason)),
+                }
+        return {"away": False, "reason_has_znc_format": False}
     finally:
         obs.close()
-
-    aways = [l for l in lines if " AWAY " in l or l.rstrip().endswith(" AWAY")]
-    reason_ok = any(re.search(r"AWAY :Auto away at \w{3} \w{3} [ \d]\d [\d:]{8} \d{4} UTC", l) for l in aways)
-    return {
-        "away_sent": bool(aways),
-        "reason_has_znc_format": reason_ok,
-    }
 
 
 def run(host: str, port: int, nick: str, dialect: str, password: str | None, channel: str) -> dict:
