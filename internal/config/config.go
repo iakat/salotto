@@ -52,6 +52,7 @@ type Config struct {
 	Ident           string
 	RingSegments    int
 	RingSegmentSize int
+	MaxWindows      int
 	MaxClients      int
 	User            User
 	Networks        []Network
@@ -67,6 +68,7 @@ func Default() *Config {
 		LogQueue:        4096,
 		RingSegments:    8,
 		RingSegmentSize: 262144,
+		MaxWindows:      64,
 		MaxClients:      32,
 	}
 }
@@ -171,6 +173,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RingSegmentSize < minRingSegmentSize {
 		return fmt.Errorf("ring_segment_size must be at least %d", minRingSegmentSize)
+	}
+	if c.MaxWindows <= 0 {
+		c.MaxWindows = 64
 	}
 	if c.LogQueue <= 0 {
 		c.LogQueue = 4096
@@ -288,6 +293,8 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.RingSegments, err = parseInt(value)
 	case "ring_segment_size":
 		c.RingSegmentSize, err = parseInt(value)
+	case "max_windows":
+		c.MaxWindows, err = parseInt(value)
 	case "max_clients":
 		c.MaxClients, err = parseInt(value)
 	default:

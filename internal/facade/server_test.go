@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 type fakeNet struct {
@@ -20,14 +20,14 @@ type fakeNet struct {
 	mu    sync.Mutex
 	sends []string
 	state string
-	ring  *ring.Ring
+	set   *winring.Set
 }
 
 func newFakeNet(name string) *fakeNet {
 	return &fakeNet{
 		name:  name,
 		state: "registered",
-		ring:  ring.New(4, 4096),
+		set:   winring.New(8, 4, 4096),
 	}
 }
 
@@ -46,18 +46,19 @@ func (f *fakeNet) Send(line []byte) error {
 	return nil
 }
 
-func (f *fakeNet) Replay(from uint64, emit func(seq uint64, line []byte) bool) uint64 {
-	return f.ring.Replay(from, emit)
+func (f *fakeNet) Window(name string) (WindowRing, bool) {
+	r, ok := f.set.Ring(name)
+	if !ok {
+		return nil, false
+	}
+	return r, true
 }
 
-func (f *fakeNet) Newest() uint64 { return f.ring.Newest() }
-func (f *fakeNet) Oldest() uint64 { return f.ring.Oldest() }
-func (f *fakeNet) Bytes() int     { return f.ring.Bytes() }
+func (f *fakeNet) Windows() []string { return f.set.Windows() }
+func (f *fakeNet) Bytes() int        { return f.set.Bytes() }
 
-func (f *fakeNet) Stamp(seq uint64) (int64, bool) { return f.ring.Stamp(seq) }
-
-func (f *fakeNet) add(line string, ts int64) uint64 {
-	return f.ring.AppendStamp([]byte(line), ts)
+func (f *fakeNet) add(window, line string, ts int64) uint64 {
+	return f.set.Append(window, []byte(line), ts)
 }
 
 func (f *fakeNet) sent() []string {
@@ -166,11 +167,24 @@ func register(t *testing.T, conn net.Conn, br *bufio.Reader, nick string) []stri
 	})
 }
 
+// collectReplay drains the registration replay. With per-window rings a
+// network with no buffered windows emits no batch at all, so an idle deadline,
+// not a final marker, is what ends the replay.
 func collectReplay(t *testing.T, conn net.Conn, br *bufio.Reader) []string {
 	t.Helper()
-	return collectUntil(t, conn, br, func(line string) bool {
-		return strings.Contains(line, " BATCH -replay ")
-	})
+	var out []string
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		line, err := br.ReadString('\n')
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				_ = conn.SetReadDeadline(time.Time{})
+				return out
+			}
+			t.Fatalf("read client line: %v", err)
+		}
+		out = append(out, strings.TrimRight(line, "\r\n"))
+	}
 }
 
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string) {
@@ -206,9 +220,9 @@ func TestRegistration(t *testing.T) {
 func TestReplay(t *testing.T) {
 	fn := newFakeNet("libera")
 	ts := time.Date(2024, 1, 2, 3, 4, 5, 678000000, time.UTC).UnixNano()
-	fn.add("@aaa=bbb PRIVMSG #c :one", ts)
-	fn.add(":n!u@h PRIVMSG #c :two", ts+int64(time.Second))
-	fn.add("PRIVMSG #c :three", ts+2*int64(time.Second))
+	fn.add("#c", "@aaa=bbb PRIVMSG #c :one", ts)
+	fn.add("#c", ":n!u@h PRIVMSG #c :two", ts+int64(time.Second))
+	fn.add("#c", "PRIVMSG #c :three", ts+2*int64(time.Second))
 
 	_, addr := startServer(t, testConfig(fn))
 	conn, br := dialClient(t, addr)
@@ -226,11 +240,11 @@ func TestReplay(t *testing.T) {
 	}
 
 	wantTime := time.Unix(0, ts).UTC().Format("2006-01-02T15:04:05.000Z")
-	if !strings.HasPrefix(msgs[0], "@batch=libera-replay;aaa=bbb;time="+wantTime+" ") {
+	if !strings.HasPrefix(msgs[0], "@batch=libera-#c-replay;aaa=bbb;time="+wantTime+" ") {
 		t.Fatalf("first replayed line = %q, want batch first, existing tag preserved and time tag", msgs[0])
 	}
 	for i, msg := range msgs {
-		if !strings.Contains(msg, "batch=libera-replay") {
+		if !strings.Contains(msg, "batch=libera-#c-replay") {
 			t.Fatalf("line %d lacks batch tag: %q", i, msg)
 		}
 		if !strings.Contains(msg, "time=") {
@@ -243,10 +257,10 @@ func TestReplay(t *testing.T) {
 
 	foundOpen, foundClose := false, false
 	for _, line := range lines {
-		if strings.Contains(line, " BATCH +replay libera-replay") {
+		if strings.Contains(line, " BATCH +replay libera-#c-replay") {
 			foundOpen = true
 		}
-		if strings.Contains(line, " BATCH -replay libera-replay") {
+		if strings.Contains(line, " BATCH -replay libera-#c-replay") {
 			foundClose = true
 		}
 	}
@@ -440,15 +454,15 @@ func replayRewriteFixture(t *testing.T) (*fakeNet, int64) {
 	t.Helper()
 	fn := newFakeNet("libera")
 	ts := time.Date(2024, 2, 3, 4, 5, 6, 789000000, time.UTC).UnixNano()
-	for i, line := range []string{
-		":srv 001 up :Welcome",
-		":up!u@h JOIN #c * :real",
-		":srv 353 up @ #c :up alice +bob",
-		":srv 366 up #c :End",
-		":up!u@h PRIVMSG #c :hi",
-		":alice!a@h PRIVMSG #c :hello",
+	for i, tc := range []struct{ window, line string }{
+		{"status", ":srv 001 up :Welcome"},
+		{"#c", ":up!u@h JOIN #c * :real"},
+		{"#c", ":srv 353 up @ #c :up alice +bob"},
+		{"#c", ":srv 366 up #c :End"},
+		{"#c", ":up!u@h PRIVMSG #c :hi"},
+		{"#c", ":alice!a@h PRIVMSG #c :hello"},
 	} {
-		fn.add(line, ts+int64(i)*int64(time.Second))
+		fn.add(tc.window, tc.line, ts+int64(i)*int64(time.Second))
 	}
 	return fn, ts
 }
@@ -519,7 +533,7 @@ func TestReplayKeepsExtendedJoinWhenNegotiated(t *testing.T) {
 func TestLiveBroadcastRewritesUpstreamIdentity(t *testing.T) {
 	fn := newFakeNet("libera")
 	ts := time.Date(2024, 2, 3, 4, 5, 6, 789000000, time.UTC).UnixNano()
-	fn.add(":srv 001 up :Welcome", ts)
+	fn.add("status", ":srv 001 up :Welcome", ts)
 
 	s, addr := startServer(t, testConfig(fn))
 	conn, br := dialClient(t, addr)

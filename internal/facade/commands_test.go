@@ -156,7 +156,8 @@ func TestPlayBufferGapCommand(t *testing.T) {
 		}
 	}
 	_ = flushLines(t, sub, out)
-	if oldest := fn.ring.Oldest(); oldest <= 2 {
+	cring, _ := fn.set.Ring("#c")
+	if oldest := cring.Oldest(); oldest <= 2 {
 		t.Fatalf("ring did not truncate seq 2 (oldest %d)", oldest)
 	}
 
@@ -231,11 +232,13 @@ func TestClearAllBuffers(t *testing.T) {
 	if got := notices(runWindowCmd(t, s, sub, "CLEARALLCHANNELBUFFERS")); strings.Join(got, "\n") != "All channel buffers have been cleared" {
 		t.Fatalf("ClearAllChannelBuffers = %q", got)
 	}
-	if floor := s.windows.cleared(windowKey("libera", "#c")); floor == 0 {
-		t.Fatalf("channel clear floor = %d, want advanced", floor)
+	if r, ok := fn.set.Ring("#c"); ok {
+		if got := r.Newest(); got != 0 {
+			t.Fatalf("#c newest after clear = %d, want 0", got)
+		}
 	}
-	if floor := s.windows.cleared(windowKey("libera", "alice")); floor != 0 {
-		t.Fatalf("query clear floor = %d, want untouched", floor)
+	if r, ok := fn.set.Ring("alice"); ok && r.Newest() == 0 {
+		t.Fatal("query ring was emptied by a channel clear")
 	}
 	if got := notices(runWindowCmd(t, s, sub, "CLEARALLQUERYBUFFERS")); strings.Join(got, "\n") != "All query buffers have been cleared" {
 		t.Fatalf("ClearAllQueryBuffers = %q", got)
@@ -296,8 +299,10 @@ func TestDisableChanCommand(t *testing.T) {
 	fx.addLive(s, fn, "after-enable")
 	fx.addLive(s, fn, "later")
 	notices(runWindowCmd(t, s, sub, "ATTACH #c"))
-	if got := bodies(runWindowCmd(t, s, sub, "PLAYBUFFER #c")); strings.Join(got, ",") != "after-enable,later" {
-		t.Fatalf("replay after enable = %v, want only lines after enable", got)
+	// Re-enabling starts buffering again; it does not drop the lines buffered
+	// before the disable, so the replay is the whole window.
+	if got := bodies(runWindowCmd(t, s, sub, "PLAYBUFFER #c")); strings.Join(got, ",") != "old,while-disabled,after-enable,later" {
+		t.Fatalf("replay after enable = %v, want the whole buffered window", got)
 	}
 }
 

@@ -44,23 +44,32 @@ type BindHosts interface {
 	ClearUser() error
 }
 
+// WindowRing is one window's replay ring. Sequences are the window's own; two
+// windows sharing a line have independent sequences and cursors.
+type WindowRing interface {
+	Replay(from uint64, emit func(seq uint64, line []byte) bool) uint64
+	Newest() uint64
+	Oldest() uint64
+	Stamp(seq uint64) (int64, bool)
+	// Clear physically drops the window's buffered lines. The window's
+	// sequences stay monotonic, so a stale cursor remains a well-formed gap.
+	Clear()
+}
+
 // Network is a handle to one upstream. The facade deliberately does not depend
 // on internal/upstream.
 type Network interface {
 	Name() string
 	Send(line []byte) error
 	State() string
-	Replay(from uint64, emit func(seq uint64, line []byte) bool) uint64
-	Newest() uint64
-	Oldest() uint64
+	// Window returns the replay ring for one window, if the window has ever
+	// buffered a line. The name is the log window name ("status", "#chan", a
+	// query nick).
+	Window(name string) (WindowRing, bool)
+	// Windows returns the window names with buffered lines, sorted.
+	Windows() []string
+	// Bytes is the total buffered bytes over every window. It is for /stats.
 	Bytes() int
-}
-
-// stampSource is an optional extension implemented by networks that can expose
-// the timestamp stored with a ring record. A network that does not implement it
-// gets a replay-time timestamp for lines that have no time tag of their own.
-type stampSource interface {
-	Stamp(seq uint64) (int64, bool)
 }
 
 type networkEntry struct {
@@ -683,49 +692,66 @@ func (c *client) replayAll() bool {
 	return true
 }
 
+// replayNetwork replays every known window as its own batch, in sorted window
+// order. There is no merged per-network stream any more: a line shared by two
+// windows was buffered into both rings and is replayed once per window.
 func (c *client) replayNetwork(ne networkEntry) bool {
-	id := ne.name + "-replay"
-	if !c.send(":", c.srv.cfg.ServerName, " BATCH +replay ", id) {
-		return false
-	}
-
+	windows := ne.net.Windows()
 	un := ne.knownNick()
 	if un == "" {
-		ne.net.Replay(ne.net.Oldest(), func(seq uint64, line []byte) bool {
-			if v := detectUpstreamNick(line); v != "" {
-				ne.nick.set(v)
-				un = v
+		for _, window := range windows {
+			r, ok := ne.net.Window(window)
+			if !ok {
+				continue
+			}
+			r.Replay(r.Oldest(), func(seq uint64, line []byte) bool {
+				if v := detectUpstreamNick(line); v != "" {
+					ne.nick.set(v)
+					un = v
+					return false
+				}
+				return true
+			})
+			if un != "" {
+				break
+			}
+		}
+	}
+
+	buf := c.replayBuf
+	for _, window := range windows {
+		r, exists := ne.net.Window(window)
+		if !exists {
+			continue
+		}
+		id := ne.name + "-" + window + "-replay"
+		if !c.send(":", c.srv.cfg.ServerName, " BATCH +replay ", id) {
+			return false
+		}
+		wrote := true
+		r.Replay(r.Oldest(), func(seq uint64, line []byte) bool {
+			ts := time.Now().UnixNano()
+			if v, has := r.Stamp(seq); has && v != 0 {
+				ts = v
+			}
+			forLine, next := ne.advanceNick(un, line)
+			un = next
+			buf = appendReplayLine(buf[:0], line, id, ts)
+			if !c.sub.WriteFrom(buf, forLine) {
+				wrote = false
 				return false
 			}
 			return true
 		})
-	}
-
-	st, _ := ne.net.(stampSource)
-	buf := c.replayBuf
-	ok := true
-	ne.net.Replay(ne.net.Oldest(), func(seq uint64, line []byte) bool {
-		ts := time.Now().UnixNano()
-		if st != nil {
-			if v, has := st.Stamp(seq); has && v != 0 {
-				ts = v
-			}
-		}
-		forLine, next := ne.advanceNick(un, line)
-		un = next
-		buf = appendReplayLine(buf[:0], line, id, ts)
-		if !c.sub.WriteFrom(buf, forLine) {
-			ok = false
+		c.replayBuf = buf
+		if !wrote {
 			return false
 		}
-		return true
-	})
-	c.replayBuf = buf
-	if !ok {
-		return false
+		if !c.send(":", c.srv.cfg.ServerName, " BATCH -replay ", id) {
+			return false
+		}
 	}
-
-	return c.send(":", c.srv.cfg.ServerName, " BATCH -replay ", id)
+	return true
 }
 
 // forward sends a line upstream. With more than one network there is no

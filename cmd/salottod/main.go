@@ -24,8 +24,8 @@ import (
 	"github.com/iakat/salotto/internal/facade"
 	"github.com/iakat/salotto/internal/ident"
 	"github.com/iakat/salotto/internal/logfile"
-	"github.com/iakat/salotto/internal/ring"
 	"github.com/iakat/salotto/internal/upstream"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 var version = "dev"
@@ -33,7 +33,7 @@ var version = "dev"
 type networkAdapter struct {
 	name string
 	conn *upstream.Conn
-	ring *ring.Ring
+	set  *winring.Set
 }
 
 func (n *networkAdapter) Name() string { return n.name }
@@ -42,21 +42,23 @@ func (n *networkAdapter) Send(line []byte) error { return n.conn.Send(line) }
 
 func (n *networkAdapter) State() string { return n.conn.State().String() }
 
-func (n *networkAdapter) Replay(from uint64, emit func(seq uint64, line []byte) bool) uint64 {
-	return n.ring.Replay(from, emit)
+func (n *networkAdapter) Window(name string) (facade.WindowRing, bool) {
+	r, ok := n.set.Ring(name)
+	if !ok {
+		return nil, false
+	}
+	return r, true
 }
 
-func (n *networkAdapter) Newest() uint64 { return n.ring.Newest() }
-func (n *networkAdapter) Oldest() uint64 { return n.ring.Oldest() }
-func (n *networkAdapter) Bytes() int     { return n.ring.Bytes() }
+func (n *networkAdapter) Windows() []string { return n.set.Windows() }
 
-func (n *networkAdapter) Stamp(seq uint64) (int64, bool) { return n.ring.Stamp(seq) }
+func (n *networkAdapter) Bytes() int { return n.set.Bytes() }
 
 type networkRuntime struct {
 	name   string
 	addr   string
 	conn   *upstream.Conn
-	ring   *ring.Ring
+	set    *winring.Set
 	writer *logfile.Writer
 }
 
@@ -145,7 +147,11 @@ func run() int {
 		if identStr == "" {
 			identStr = nc.Nick
 		}
-		r := ring.New(cfg.RingSegments, cfg.RingSegmentSize)
+		maxWindows := cfg.MaxWindows
+		if maxWindows <= 0 {
+			maxWindows = 64
+		}
+		set := winring.New(maxWindows, cfg.RingSegments, cfg.RingSegmentSize)
 
 		var serverStr string
 		var conn *upstream.Conn
@@ -165,15 +171,17 @@ func run() int {
 			SASLPass:           nc.SASLPass,
 			Channels:           append([]string(nil), nc.Channels...),
 			BindHost:           bindHost,
-			Ring:               r,
+			Windows:            set,
+			Route:              w.Route,
 			Log:                logger.With("network", netName),
-			OnLine: func(seq uint64, line []byte) {
-				dispatchLine(srv, w.Tracker(), conn != nil && conn.HasCap("echo-message"), netName, seq, line, false)
-				w.OnLine(seq, line)
+			OnLine: func(windows []string, seqs []uint64, entries []logfile.Entry, line []byte) {
+				dispatchRouted(srv, netName, entries, line)
+				w.OnRouted(entries, line, false)
 			},
 			OnSend: func(line []byte) {
-				dispatchLine(srv, w.Tracker(), conn != nil && conn.HasCap("echo-message"), netName, 0, line, true)
-				w.OnSend(line)
+				entries := w.Route(line, true)
+				dispatchRouted(srv, netName, entries, line)
+				w.OnRouted(entries, line, true)
 			},
 			OnConnect: func() {
 				w.Connect(serverStr)
@@ -205,10 +213,10 @@ func run() int {
 			name:   netName,
 			addr:   nc.Addr,
 			conn:   conn,
-			ring:   r,
+			set:    set,
 			writer: w,
 		})
-		var n facade.Network = &networkAdapter{name: netName, conn: conn, ring: r}
+		var n facade.Network = &networkAdapter{name: netName, conn: conn, set: set}
 		networks[netName] = &n
 	}
 
@@ -433,15 +441,33 @@ func run() int {
 // those windows get it once through the window path and clients with no attach
 // get it once through the status fallback. Nothing is delivered twice.
 func dispatchLine(srv *facade.Server, tr *logfile.Tracker, hasEcho bool, netName string, seq uint64, line []byte, outbound bool) {
+	dispatchRouted(srv, netName, logfile.Route(tr, line, outbound, hasEcho, ""), line)
+}
+
+// dispatchRouted delivers one line live using the entries routing already
+// produced. A line whose only window is status is the status stream; a line
+// with a channel or query window goes through BroadcastWindows.
+func dispatchRouted(srv *facade.Server, netName string, entries []logfile.Entry, line []byte) {
 	if srv == nil {
 		return
 	}
-	_, all, ok := logfile.WindowFor(tr, line, outbound, hasEcho)
-	if !ok {
-		srv.Broadcast(netName, seq, line, time.Now().UnixNano())
+	windows := make([]string, 0, len(entries))
+	nonStatus := false
+	for _, e := range entries {
+		window := e.Window
+		if window == "" {
+			window = "status"
+		}
+		if window != "status" {
+			nonStatus = true
+		}
+		windows = append(windows, window)
+	}
+	if !nonStatus {
+		srv.Broadcast(netName, 0, line, time.Now().UnixNano())
 		return
 	}
-	srv.BroadcastWindows(netName, all, seq, line, time.Now().UnixNano())
+	srv.BroadcastWindows(netName, windows, 0, line, time.Now().UnixNano())
 }
 
 func parseLogLevel(value string) (slog.Level, error) {
@@ -515,9 +541,7 @@ func statsHandler(start time.Time, runtimes []*networkRuntime, hub *facade.Hub, 
 			fmt.Fprintf(&b, "net.%s.attempts=%d\n", rt.name, rt.conn.Attempts())
 			fmt.Fprintf(&b, "net.%s.lines_in=%d\n", rt.name, rt.conn.LinesIn())
 			fmt.Fprintf(&b, "net.%s.lines_out=%d\n", rt.name, rt.conn.LinesOut())
-			fmt.Fprintf(&b, "net.%s.ring_oldest=%d\n", rt.name, rt.ring.Oldest())
-			fmt.Fprintf(&b, "net.%s.ring_newest=%d\n", rt.name, rt.ring.Newest())
-			fmt.Fprintf(&b, "net.%s.ring_bytes=%d\n", rt.name, rt.ring.Bytes())
+			fmt.Fprintf(&b, "net.%s.ring_bytes=%d\n", rt.name, rt.set.Bytes())
 			known, disabled := srv.WindowStats(rt.name)
 			fmt.Fprintf(&b, "net.%s.windows_known=%d\n", rt.name, known)
 			fmt.Fprintf(&b, "net.%s.windows_disabled=%d\n", rt.name, disabled)

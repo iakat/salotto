@@ -22,7 +22,7 @@ func newWindowFixture(t *testing.T) (*Server, *fakeNet, *Subscriber, *bytes.Buff
 
 func (fx *windowFixture) addLive(s *Server, fn *fakeNet, body string) uint64 {
 	line := ":n!u@h PRIVMSG #c :" + body
-	seq := fn.add(line, time.Now().UnixNano())
+	seq := fn.add("#c", line, time.Now().UnixNano())
 	s.BroadcastWindow("libera", "#c", seq, []byte(line), time.Now().UnixNano())
 	return seq
 }
@@ -92,7 +92,8 @@ func TestPlayBufferEmitsGap(t *testing.T) {
 		}
 	}
 	_ = flushLines(t, sub, out)
-	if oldest := fn.ring.Oldest(); oldest <= 2 {
+	cring, _ := fn.set.Ring("#c")
+	if oldest := cring.Oldest(); oldest <= 2 {
 		t.Fatalf("ring did not truncate seq 2 (oldest %d)", oldest)
 	}
 
@@ -107,7 +108,7 @@ func TestPlayBufferEmitsGap(t *testing.T) {
 	if !strings.Contains(first, " GAP ") {
 		t.Fatalf("first replay line = %q, want GAP marker", first)
 	}
-	oldest := fn.ring.Oldest()
+	oldest := cring.Oldest()
 	if !strings.Contains(first, " 2 "+uitoa(oldest-1)) {
 		t.Fatalf("GAP = %q, want lost range 2..%d", first, oldest-1)
 	}

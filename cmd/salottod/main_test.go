@@ -10,28 +10,32 @@ import (
 
 	"github.com/iakat/salotto/internal/facade"
 	"github.com/iakat/salotto/internal/logfile"
-	"github.com/iakat/salotto/internal/ring"
+	"github.com/iakat/salotto/internal/winring"
 )
 
 type fakeNet struct {
 	name string
-	ring *ring.Ring
+	set  *winring.Set
 }
 
 func newFakeNet(name string) *fakeNet {
-	return &fakeNet{name: name, ring: ring.New(4, 4096)}
+	return &fakeNet{name: name, set: winring.New(8, 4, 4096)}
 }
 
-func (f *fakeNet) Name() string                 { return f.name }
-func (f *fakeNet) Send([]byte) error            { return nil }
-func (f *fakeNet) State() string                { return "registered" }
-func (f *fakeNet) Newest() uint64               { return f.ring.Newest() }
-func (f *fakeNet) Oldest() uint64               { return f.ring.Oldest() }
-func (f *fakeNet) Bytes() int                   { return f.ring.Bytes() }
-func (f *fakeNet) Stamp(s uint64) (int64, bool) { return f.ring.Stamp(s) }
-func (f *fakeNet) Replay(from uint64, emit func(uint64, []byte) bool) uint64 {
-	return f.ring.Replay(from, emit)
+func (f *fakeNet) Name() string      { return f.name }
+func (f *fakeNet) Send([]byte) error { return nil }
+func (f *fakeNet) State() string     { return "registered" }
+func (f *fakeNet) Bytes() int        { return f.set.Bytes() }
+
+func (f *fakeNet) Window(name string) (facade.WindowRing, bool) {
+	r, ok := f.set.Ring(name)
+	if !ok {
+		return nil, false
+	}
+	return r, true
 }
+
+func (f *fakeNet) Windows() []string { return f.set.Windows() }
 
 func newRouteFixture(t *testing.T) (*facade.Server, *fakeNet, *facade.Hub, *logfile.Writer, *bytes.Buffer, *facade.Subscriber) {
 	t.Helper()
@@ -172,7 +176,7 @@ func newRouteCase(t *testing.T) *routeCase {
 
 func (fx *routeCase) send(t *testing.T, channel, body string) uint64 {
 	line := []byte(":alice!a@h PRIVMSG " + channel + " :" + body)
-	seq := fx.fn.ring.AppendStamp(line, time.Now().UnixNano())
+	seq := fx.fn.set.Append(channel, line, time.Now().UnixNano())
 	dispatchLine(fx.s, fx.w.Tracker(), false, "probe", seq, line, false)
 	return seq
 }

@@ -32,8 +32,8 @@ func newClientWindows() *clientWindows {
 }
 
 // windowState is the in-memory B2 state: per-client cursors, attach/detach and
-// mute flags, plus a per-window clear floor. Nothing is persisted; a client
-// that is not attached simply has no state and starts from Oldest().
+// mute flags. Nothing is persisted; a client that is not attached simply has no
+// state and starts from Oldest().
 //
 // A window is in exactly one of three states for a given client:
 //
@@ -48,15 +48,14 @@ func newClientWindows() *clientWindows {
 // Muting has the same live effect as detaching here; the flags stay separate
 // because the wire commands differ and LISTCHANS reports them differently.
 //
-// The rings are still one per network. Per-window cursors index that shared
-// ring, so replay for a window is an approximation: a busy window can push a
-// quiet window's lines out before the quiet window's client reads them.
+// The rings are one per window (internal/winring). A per-window cursor indexes
+// that window's own ring, so a busy window cannot evict a quiet window's lines
+// and a GAP means this window really overflowed.
 type windowState struct {
 	mu       sync.Mutex
 	clients  map[*Subscriber]*clientWindows
 	known    map[string]bool
 	disabled map[string]bool
-	floor    map[string]uint64
 }
 
 func newWindowState() *windowState {
@@ -64,7 +63,6 @@ func newWindowState() *windowState {
 		clients:  make(map[*Subscriber]*clientWindows),
 		known:    make(map[string]bool),
 		disabled: make(map[string]bool),
-		floor:    make(map[string]uint64),
 	}
 }
 
@@ -131,17 +129,13 @@ func (ws *windowState) cursor(sub *Subscriber, key string) (uint64, bool) {
 	return cursor, ok
 }
 
-func (ws *windowState) cleared(key string) uint64 {
-	ws.mu.Lock()
-	floor := ws.floor[key]
-	ws.mu.Unlock()
-	return floor
-}
-
+// clear marks the window known and advances every client's cursor past the
+// lines being cleared. Clearing is deliberate, not loss: without this a client
+// would see a GAP for lines the operator chose to drop. The ring itself is
+// cleared separately because it lives in the network handle.
 func (ws *windowState) clear(key string, newest uint64) {
 	ws.mu.Lock()
 	ws.known[key] = true
-	ws.floor[key] = newest
 	for _, cw := range ws.clients {
 		if cw.cursors[key] < newest {
 			cw.cursors[key] = newest
@@ -330,19 +324,12 @@ func (s *Server) DetachWindow(sub *Subscriber, network, window string) bool {
 
 // SetDisabled sets the not-buffered flag for a window. ZNC's flag also stops
 // the channel being re-joined after a reconnect; we do not manage joins at
-// runtime, so the observable effect here is "not buffered". Re-enabling
-// advances the clear floor to the newest line so only subsequent lines can be
-// replayed: a disabled window must not replay a stale buffer. It reports
+// runtime, so the observable effect here is "not buffered". Disabling only
+// suppresses replay, it does not stop buffering; re-enabling starts replaying
+// the window's own ring again, so nothing is silently rewound. It reports
 // whether the flag changed.
 func (s *Server) SetDisabled(network, window string, disabled bool) bool {
-	key := windowKey(network, window)
-	changed := s.windows.setDisabled(key, disabled)
-	if changed && !disabled {
-		if ne := s.network(network); ne != nil {
-			s.windows.clear(key, ne.net.Newest())
-		}
-	}
-	return changed
+	return s.windows.setDisabled(windowKey(network, window), disabled)
 }
 
 // Disabled reports whether a window is not buffered.
@@ -376,8 +363,8 @@ func (s *Server) Known(network, window string) bool {
 	return known
 }
 
-// BufferEmpty reports whether a window has nothing to replay: it is disabled,
-// the shared ring has no lines, or a clear floor hides everything.
+// BufferEmpty reports whether a window has nothing to replay: it is disabled or
+// its own ring has no lines.
 func (s *Server) BufferEmpty(network, window string) bool {
 	if s.Disabled(network, window) {
 		return true
@@ -386,15 +373,11 @@ func (s *Server) BufferEmpty(network, window string) bool {
 	if ne == nil {
 		return true
 	}
-	newest := ne.net.Newest()
-	if newest == 0 {
+	r, ok := ne.net.Window(window)
+	if !ok {
 		return true
 	}
-	from := ne.net.Oldest()
-	if floor := s.windows.cleared(windowKey(network, window)); floor >= from {
-		from = floor + 1
-	}
-	return from > newest
+	return r.Newest() == 0
 }
 
 // matchWindows returns the known windows of network whose name matches any
@@ -559,10 +542,10 @@ func (s *Server) BroadcastWindows(netName string, windows []string, seq uint64, 
 	s.linePool.Put(p)
 }
 
-// PlayBuffer replays each requested window from max(oldest, cursor+1). If the
-// shared ring has already dropped the unread part of a client's cursor, a GAP
-// marker is written first, matching docs/SPEC.md §6. Cursors index the shared
-// per-network ring; per-window ring slices are a separate item.
+// PlayBuffer replays each requested window from that window's own ring, from
+// max(oldest, cursor+1). If the window has already dropped the unread part of
+// a client's cursor, a GAP marker is written first, matching docs/SPEC.md §6.
+// With per-window rings a GAP means this window really overflowed.
 func (s *Server) PlayBuffer(sub *Subscriber, network string, windows ...string) bool {
 	ne := s.network(network)
 	if ne == nil {
@@ -571,7 +554,6 @@ func (s *Server) PlayBuffer(sub *Subscriber, network string, windows ...string) 
 	if len(windows) == 0 {
 		windows = []string{"status"}
 	}
-	st, _ := ne.net.(stampSource)
 	un := ne.knownNick()
 
 	for _, window := range windows {
@@ -580,23 +562,25 @@ func (s *Server) PlayBuffer(sub *Subscriber, network string, windows ...string) 
 			continue
 		}
 
-		oldest := ne.net.Oldest()
-		newest := ne.net.Newest()
+		r, ok := ne.net.Window(window)
+		if !ok {
+			continue
+		}
+		oldest := r.Oldest()
+		newest := r.Newest()
 		if newest == 0 {
 			continue
 		}
 		from := oldest
-		if floor := s.windows.cleared(key); floor >= from {
-			from = floor + 1
-		}
 
-		if cursor, ok := s.windows.cursor(sub, key); ok {
+		if cursor, has := s.windows.cursor(sub, key); has {
 			if cursor+1 > from {
 				from = cursor + 1
 			}
 			if cursor+1 < oldest {
-				// At least one line after the cursor is gone from the shared
-				// ring. Report the lost range before replaying the survivors.
+				// At least one line after the cursor is gone from this
+				// window's ring. Report the lost range before replaying the
+				// survivors.
 				gap := appendGapLine(nil, s.cfg.ServerName, network, window, cursor+1, oldest-1)
 				if !sub.Write(gap) {
 					return false
@@ -609,13 +593,11 @@ func (s *Server) PlayBuffer(sub *Subscriber, network string, windows ...string) 
 
 		batch := network + "-" + window + "-replay"
 		buf := make([]byte, 0, maxRingLine+512)
-		ok := true
-		ne.net.Replay(from, func(seq uint64, line []byte) bool {
+		ok = true
+		r.Replay(from, func(seq uint64, line []byte) bool {
 			ts := time.Now().UnixNano()
-			if st != nil {
-				if v, has := st.Stamp(seq); has && v != 0 {
-					ts = v
-				}
+			if v, has := r.Stamp(seq); has && v != 0 {
+				ts = v
 			}
 			forLine, next := ne.advanceNick(un, line)
 			un = next
@@ -637,11 +619,10 @@ func (s *Server) PlayBuffer(sub *Subscriber, network string, windows ...string) 
 	return true
 }
 
-// ClearBuffer hides one window's already-broadcast lines and advances every
-// client's cursor past them, so a cleared buffer is not replayed. The shared
-// ring is not physically erased (that needs per-window rings); a clear floor
-// makes the old lines invisible to this window from then on. It is a no-op with
-// an explanatory message when the window is unknown.
+// ClearBuffer physically drops one window's already-broadcast lines, so a
+// cleared buffer is never replayed. The window's sequences stay monotonic: a
+// stale cursor from a client is a well-formed GAP, not a silent rewind. It is a
+// no-op with an explanatory message when the window is unknown.
 func (s *Server) ClearBuffer(network, window string) (bool, string) {
 	ne := s.network(network)
 	if ne == nil {
@@ -654,7 +635,12 @@ func (s *Server) ClearBuffer(network, window string) (bool, string) {
 	if !known {
 		return false, fmt.Sprintf("unknown window %q", key)
 	}
-	s.windows.clear(key, ne.net.Newest())
+	var newest uint64
+	if r, ok := ne.net.Window(window); ok {
+		newest = r.Newest()
+		r.Clear()
+	}
+	s.windows.clear(key, newest)
 	return true, ""
 }
 
