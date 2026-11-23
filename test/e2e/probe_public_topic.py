@@ -68,6 +68,21 @@ def main():
         print("  FAIL: the topic did not follow the window switch")
         ok = False
 
+    # The mode string sits in the same header as the topic, so check it here too:
+    # a channel the user just created is +nt on ergo, and the header must say so
+    # rather than staying blank.
+    a.send({"type": "select", "active": one})
+    a.state(10.0, lambda f: f.get("active") == one)
+    try:
+        f = a.state(20.0, lambda f: f.get("modes"))
+        print("modes on %s: %r" % (one, f.get("modes")))
+        if not str(f.get("modes")).startswith("+"):
+            print("  FAIL: mode string is not a mode string")
+            ok = False
+    except RuntimeError:
+        print("  FAIL: no mode string arrived for a channel we are in")
+        ok = False
+
     a.close()
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
