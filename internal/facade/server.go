@@ -11,6 +11,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1114,8 +1115,43 @@ func (c *client) forward(line []byte) bool {
 	if err := nets[0].net.Send(line); err != nil {
 		return c.notConnected()
 	}
+	c.attachJoined(line)
 	c.clearOnSpeak(line)
 	return true
+}
+
+// attachJoined attaches a client to the windows a JOIN it sent will create.
+//
+// Without this a client that joins a channel hears nothing about it: the window
+// exists in the bouncer's rings, but the client is only attached to "status", so
+// the JOIN answering its own request is buffered and the window list never grows.
+// ZNC does the same thing for the opposite reason - the joining client is in the
+// channel, so it is attached to it.
+//
+// It runs on the way out rather than on the server's JOIN coming back because the
+// attachments have to exist before that line is routed; a JOIN that arrives before
+// the attach is a line the client is not yet there to receive.
+func (c *client) attachJoined(line []byte) {
+	_, rest := ircline.Tags(line)
+	_, rest = ircline.Prefix(rest)
+	if !ircline.IsVerb(rest, "JOIN") {
+		return
+	}
+	nets := c.srv.netSnapshot()
+	if len(nets) == 0 {
+		return
+	}
+	network := nets[0].name
+	// "JOIN #a,#b key1,key2" - the channels are the first parameter, comma
+	// separated; the keys are irrelevant here.
+	param := string(ircline.FirstParam(ircline.Params(rest)))
+	for _, channel := range strings.Split(param, ",") {
+		channel = strings.TrimSpace(channel)
+		if channel == "" {
+			continue
+		}
+		c.srv.AttachWindow(c.sub, network, channel)
+	}
 }
 
 // clearOnSpeak implements ZNC's clearbufferonmsg: while the user is talking,
