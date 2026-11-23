@@ -1,9 +1,9 @@
 // Package winring keeps one replay ring per window.
 //
 // It replaces the POC's single per-network ring. A Set owns a bounded number of
-// lazily created windows; each window has its own ring.Ring and its own
-// sequence counter. A line shared by two windows is appended to both rings with
-// independent sequences, so a busy window cannot evict a quiet window's lines.
+// live windows; each window has its own ring.Ring and its own sequence counter.
+// A line shared by two windows is appended to both rings with independent
+// sequences, so a busy window cannot evict a quiet window's lines.
 package winring
 
 import (
@@ -20,11 +20,13 @@ type Set struct {
 	segSize int
 	max     int
 	clock   uint64
-	maxSeq  uint64
+	live    int
 	windows map[string]*entry
 }
 
 type entry struct {
+	// ring is nil for an evicted window. The entry is kept as a tombstone so a
+	// window that reappears continues its sequence instead of restarting at 1.
 	ring *ring.Ring
 	// base is the last sequence emitted before the current ring was created.
 	// It keeps sequences monotonic across Clear and eviction: a stale cursor is
@@ -33,8 +35,8 @@ type entry struct {
 	used uint64
 }
 
-// New returns a Set holding at most maxWindows rings, each built with the same
-// clamps as ring.New. maxWindows <= 0 means 1.
+// New returns a Set holding at most maxWindows live rings, each built with the
+// same clamps as ring.New. maxWindows <= 0 means 1.
 func New(maxWindows, segments, segSize int) *Set {
 	if maxWindows < 1 {
 		maxWindows = 1
@@ -48,8 +50,8 @@ func New(maxWindows, segments, segSize int) *Set {
 }
 
 // Append appends line to window and returns that window's sequence number. The
-// sequence is monotonic for the lifetime of the Set, even across Clear and
-// eviction.
+// sequence is monotonic for the lifetime of the Set's knowledge of the window,
+// even across Clear and eviction.
 func (s *Set) Append(window string, line []byte, ts int64) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -57,44 +59,79 @@ func (s *Set) Append(window string, line []byte, ts int64) uint64 {
 	e := s.windows[window]
 	if e == nil {
 		e = s.create(window)
+	} else if e.ring == nil {
+		e.ring = ring.New(s.segs, s.segSize)
+		s.live++
 	}
 	seq := e.base + e.ring.AppendStamp(line, ts)
-	if seq > s.maxSeq {
-		s.maxSeq = seq
-	}
 	s.clock++
 	e.used = s.clock
 	return seq
 }
 
-// create returns a new entry for window, evicting the least recently used
-// window when the set is full. s.mu is held.
+// create returns a new entry for window, evicting the least recently used live
+// window when the set is full. s.mu is held and window has no entry.
 func (s *Set) create(window string) *entry {
-	evicted := false
-	if len(s.windows) >= s.max {
-		var oldestName string
-		var oldestUsed uint64
-		first := true
-		for name, e := range s.windows {
-			if first || e.used < oldestUsed {
-				first = false
-				oldestName = name
-				oldestUsed = e.used
-			}
-		}
-		if oldestName != "" {
-			delete(s.windows, oldestName)
-			evicted = true
-		}
+	if s.live >= s.max {
+		s.evictLRU()
 	}
+	s.trimTombstones()
+
 	e := &entry{ring: ring.New(s.segs, s.segSize)}
-	if evicted {
-		// Start after every sequence this Set has ever handed out, so a stale
-		// cursor cannot replay a new line under an old number.
-		e.base = s.maxSeq
-	}
 	s.windows[window] = e
+	s.live++
 	return e
+}
+
+// evictLRU turns the least recently used live window into a tombstone. s.mu is
+// held.
+func (s *Set) evictLRU() {
+	var name string
+	var used uint64
+	first := true
+	for n, e := range s.windows {
+		if e.ring == nil {
+			continue
+		}
+		if first || e.used < used {
+			first = false
+			name = n
+			used = e.used
+		}
+	}
+	if name == "" {
+		return
+	}
+	e := s.windows[name]
+	e.base += e.ring.Newest()
+	e.ring = nil
+	e.used = 0
+	s.live--
+}
+
+// trimTombstones bounds the bookkeeping for evicted windows: at most max
+// tombstones are kept, oldest first out. s.mu is held.
+func (s *Set) trimTombstones() {
+	tombstones := len(s.windows) - s.live
+	if tombstones <= s.max {
+		return
+	}
+	var name string
+	var used uint64
+	first := true
+	for n, e := range s.windows {
+		if e.ring != nil {
+			continue
+		}
+		if first || e.used < used {
+			first = false
+			name = n
+			used = e.used
+		}
+	}
+	if name != "" {
+		delete(s.windows, name)
+	}
 }
 
 // Ring returns a handle to the window's current ring. The handle keeps the
@@ -102,7 +139,7 @@ func (s *Set) create(window string) *entry {
 func (s *Set) Ring(window string) (*Ring, bool) {
 	s.mu.Lock()
 	e := s.windows[window]
-	if e == nil {
+	if e == nil || e.ring == nil {
 		s.mu.Unlock()
 		return nil, false
 	}
@@ -124,30 +161,36 @@ func (s *Set) Clear(window string) {
 	if e == nil {
 		return
 	}
-	e.base += e.ring.Newest()
-	e.ring = ring.New(s.segs, s.segSize)
+	if e.ring != nil {
+		e.base += e.ring.Newest()
+		e.ring = ring.New(s.segs, s.segSize)
+	}
 	s.clock++
 	e.used = s.clock
 }
 
-// Windows returns the window names that currently have a ring, sorted.
+// Windows returns the window names that currently have a live ring, sorted.
 func (s *Set) Windows() []string {
 	s.mu.Lock()
-	names := make([]string, 0, len(s.windows))
-	for name := range s.windows {
-		names = append(names, name)
+	names := make([]string, 0, s.live)
+	for name, e := range s.windows {
+		if e.ring != nil {
+			names = append(names, name)
+		}
 	}
 	s.mu.Unlock()
 	sort.Strings(names)
 	return names
 }
 
-// Bytes returns the sum of the buffered bytes over every window.
+// Bytes returns the sum of the buffered bytes over every live window.
 func (s *Set) Bytes() int {
 	s.mu.Lock()
 	total := 0
 	for _, e := range s.windows {
-		total += e.ring.Bytes()
+		if e.ring != nil {
+			total += e.ring.Bytes()
+		}
 	}
 	s.mu.Unlock()
 	return total

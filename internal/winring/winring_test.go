@@ -155,20 +155,27 @@ func TestMaxWindowsEvictionKeepsRecent(t *testing.T) {
 	}
 }
 
-// A stale cursor from an evicted window must not replay a new line under an old
-// number.
-func TestEvictedWindowSequenceDoesNotRewind(t *testing.T) {
+// A window evicted and later recreated must not rewind its own sequence: a
+// stale cursor from that window becomes a gap, not a silent rewind.
+func TestRecreatedWindowSequenceDoesNotRewind(t *testing.T) {
 	s := New(1, 8, 512)
 	for i := 0; i < 4; i++ {
 		s.Append("a", []byte("a"), 0)
 	}
 	s.Append("b", []byte("b"), 0) // evicts a
-	r, ok := s.Ring("b")
-	if !ok {
-		t.Fatal("b missing")
+	if _, ok := s.Ring("a"); ok {
+		t.Fatal("a should be evicted")
 	}
-	if r.Oldest() <= 4 {
-		t.Fatalf("new window oldest = %d, want past the evicted sequences", r.Oldest())
+	seq := s.Append("a", []byte("a-again"), 0)
+	if seq <= 4 {
+		t.Fatalf("recreated a seq = %d, want > 4 (monotonic)", seq)
+	}
+	r, ok := s.Ring("a")
+	if !ok {
+		t.Fatal("a missing after recreate")
+	}
+	if got := r.Oldest(); got != seq {
+		t.Fatalf("recreated a oldest = %d, want %d", got, seq)
 	}
 }
 
