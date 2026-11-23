@@ -211,15 +211,15 @@ Grouped, because 59 rows is a wall, and the grouping *is* the decision.
 |---|---|---|
 | `log` | ZNC-format logs | **done** in `lane/zlog` |
 | `chansaver` | persist channel list | currently config-only; needs runtime channels (B5) |
-| `perform` | send commands on connect | one small parser, high value |
-| `keepnick` | retry the nick you want | two words of state, avoids identity drift |
+| `perform` | send commands on connect | **done**, before joins (`perform.cpp` `OnIRCConnected`) |
+| `keepnick` | retry the nick you want | **done**, 30 s loop (`keepnick.cpp Start(30000)`) |
 | `stickychan` | keep channels joined | subsumed by chansaver + rejoin |
 | `awaynick` | change nick when away | needs an away concept (B18) |
 | `awaystore` | store and replay away messages | pairs with B18 |
 | `simple_away` | auto-away on detach | pairs with B18 |
-| `buffextras` | put joins/parts/modes into the replay buffer | windows are split (B2); wiring the extra modes is still open |
+| `buffextras` | put joins/parts/modes into the replay buffer | **done** by B2's routing split; `TestBuffExtrasReachesTheReplayRing` |
 | `savebuff` | persist the buffer across restarts | the "M5 mmapped rings" item, in effect |
-| `clearbufferonmsg` | clear buffer when you speak | a client preference, cheap |
+| `clearbufferonmsg` | clear buffer when you speak | **done** (`clearbufferonmsg.cpp`) |
 | `stripcontrols` | strip control codes before logging | relevant to `log` |
 | `sasl` | SASL PLAIN | **have** |
 | `cert` / `certauth` | SASL EXTERNAL via client cert | B6 |

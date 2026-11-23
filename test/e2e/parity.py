@@ -259,6 +259,24 @@ def run(host: str, port: int, nick: str, dialect: str, password: str | None, cha
     return out
 
 
+# KNOWN_DEVIATIONS are cases where the two bouncers are supposed to differ. A
+# deviation is a claim someone can check, so each one carries the reason and the
+# ZNC source line that makes the difference deliberate rather than a bug. Any
+# difference NOT listed here fails the run.
+KNOWN_DEVIATIONS = {
+    "fingerprints": (
+        "salotto validates a fingerprint on Add and normalises on Del; ZNC does "
+        "neither (IRCNetwork.h AddTrustedFingerprint only escapes the string, "
+        "ClientCommand.cpp:918-943 accepts anything non-empty). A bad fingerprint "
+        "in ZNC is accepted and then silently never matches, and Del erases the "
+        "unescaped form so a listed fingerprint cannot be removed. Verified by "
+        "driving both: ZNC answers Add with 'Done.' for 'not-a-fingerprint' and "
+        "keeps listing it after Del. salotto refuses the add with "
+        "'not a SHA-256 fingerprint' and does remove what it listed."
+    ),
+}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--znc", default="salotto-e2e-znc:6667")
@@ -281,15 +299,26 @@ def main() -> int:
     znc = run(zh, zp, args.nick, "znc", args.znc_pass, args.channel)
     sal = run(sh, sp, args.nick, "salotto", None, args.channel)
 
-    diffs, same = [], []
+    diffs, same, deviations = [], [], []
     for case in sorted(set(znc) | set(sal)):
         z, s = znc.get(case), sal.get(case)
         if z == s:
             same.append(case)
+        elif case in KNOWN_DEVIATIONS:
+            deviations.append(
+                {"case": case, "znc": z, "salotto": s,
+                 "why": KNOWN_DEVIATIONS[case]}
+            )
         else:
             diffs.append({"case": case, "znc": z, "salotto": s})
 
-    report = {"same": same, "different": diffs, "znc": znc, "salotto": sal}
+    report = {
+        "same": same,
+        "deviations": deviations,
+        "different": diffs,
+        "znc": znc,
+        "salotto": sal,
+    }
     if args.json:
         with open(args.json, "w") as fh:
             json.dump(report, fh, indent=2, sort_keys=True)
