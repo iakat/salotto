@@ -85,6 +85,24 @@ rest:
   sides before the comparison runs. `{"x": false} == {"x": false}` is a matching
   pair, and the harness used to call that agreement. Without this table, `chansaver`
   reported `kept_after_reconnect: false` on both sides and was counted as `same`.
+- **The witness has to be the IRCd.** chansaver's verdict is now read from ergo, not
+  from the bouncer: an observer joins each throwaway channel as a third party and
+  sends `NAMES`, and the bouncer's nick in the member list means it really is in the
+  channel. Both bouncer-side readings were wrong in different directions. The client
+  stream cannot answer it because a window's lines are delivered live only to a client
+  attached to that window, so the JOIN answering its own rejoin is buffered and
+  invisible. The list commands cannot answer it either: ZNC's `ListChans` lists
+  channels in its config and salotto's lists known windows, so comparing them compares
+  two different questions. The observer must itself be in the channel first, because
+  ergo answers `NAMES` outside it with an empty `366` - which reads as "absent"
+  whatever the bouncer did.
+- **A front end is a separate client and needs its own nick.** The UI deployment
+  connected as `e2e`, the nick the harness drives the bouncer with, so the two clients
+  fought over the name and the loser was killed mid-case with a broken pipe. It now
+  connects as `e2e-ui`.
+- **A case that changes shared state settles it before returning.**
+  `case_connect_disconnect` left the upstream dialling; the next case measured its
+  dropped JOIN and blamed the feature under test.
 - **chansaver's positive control.** Its only original assertion was that a parted
   channel does *not* come back after a reconnect — which is exactly what a dead
   chansaver produces. It now joins a throwaway channel first and requires that to
