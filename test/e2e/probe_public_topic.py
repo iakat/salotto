@@ -72,15 +72,18 @@ def main():
     # a channel the user just created is +nt on ergo, and the header must say so
     # rather than staying blank.
     a.send({"type": "select", "active": one})
-    a.state(10.0, lambda f: f.get("active") == one)
+    # The server pushes a frame only when something CHANGES, so the modes are on the
+    # frame we just received, not on one still to come. Waiting for a fresh frame
+    # here is what made an earlier version of this probe time out on a working
+    # feature and report nothing.
     try:
-        f = a.state(20.0, lambda f: f.get("modes"))
+        f = a.state(10.0, lambda f: f.get("active") == one)
         print("modes on %s: %r" % (one, f.get("modes")))
         if not str(f.get("modes")).startswith("+"):
             print("  FAIL: mode string is not a mode string")
             ok = False
     except RuntimeError:
-        print("  FAIL: no mode string arrived for a channel we are in")
+        print("  FAIL: could not get a frame for", one)
         ok = False
 
     a.close()
