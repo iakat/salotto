@@ -701,7 +701,7 @@ func (c *client) replayNetwork(ne networkEntry) bool {
 	if un == "" {
 		for _, window := range windows {
 			r, ok := ne.net.Window(window)
-			if !ok {
+			if !ok || r.Newest() == 0 {
 				continue
 			}
 			r.Replay(r.Oldest(), func(seq uint64, line []byte) bool {
@@ -721,7 +721,7 @@ func (c *client) replayNetwork(ne networkEntry) bool {
 	buf := c.replayBuf
 	for _, window := range windows {
 		r, exists := ne.net.Window(window)
-		if !exists {
+		if !exists || r.Newest() == 0 {
 			continue
 		}
 		id := ne.name + "-" + window + "-replay"
