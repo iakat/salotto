@@ -43,11 +43,12 @@ type netmgr struct {
 // networkRuntime is one live network: what /stats reports and what Stop tears
 // down.
 type networkRuntime struct {
-	name   string
-	addr   string
-	conn   *upstream.Conn
-	set    *winring.Set
-	writer *logfile.Writer
+	name     string
+	addr     string
+	conn     *upstream.Conn
+	set      *winring.Set
+	writer   *logfile.Writer
+	channels *channelSet
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -115,6 +116,7 @@ func (m *netmgr) Start(nc config.Network) error {
 		maxWindows = 64
 	}
 	set := winring.New(maxWindows, m.cfg.RingSegments, m.cfg.RingSegmentSize)
+	channels := newChannelSet(nc.Channels)
 
 	netName := nc.Name
 	serverStr := nc.Addr
@@ -146,7 +148,7 @@ func (m *netmgr) Start(nc config.Network) error {
 		// re-joined, which is the only effect ZNC's disabled flag has. Buffering
 		// and replay are unaffected.
 		JoinChannels: func() []string {
-			return joinableChannels(nc.Channels, m.srv, netName)
+			return joinableChannels(channels.List(), m.srv, netName)
 		},
 		// ZNC's perform module: the lines run on every connect, before the
 		// joins, because a JOIN that races an IDENTIFY is the classic bug.
@@ -160,6 +162,10 @@ func (m *netmgr) Start(nc config.Network) error {
 			dispatchRouted(m.srv, netName, windows, line)
 			w.OnRouted(entries, line, false)
 			noteSelfKick(m.srv, netName, line)
+			// chansaver: our own JOIN/PART/KICK decides what gets re-joined on
+			// the next connect, which is what makes the list follow reality
+			// instead of the config file.
+			channels.noteSelfJoinPart(line, m.srv.KnownNick(netName))
 		},
 		OnSend: func(line []byte) {
 			entries := w.Route(line, true)
@@ -192,12 +198,13 @@ func (m *netmgr) Start(nc config.Network) error {
 	w.SetHasCap(conn.HasCap)
 
 	rt := &networkRuntime{
-		name:   netName,
-		addr:   nc.Addr,
-		conn:   conn,
-		set:    set,
-		writer: w,
-		done:   make(chan struct{}),
+		name:     netName,
+		addr:     nc.Addr,
+		conn:     conn,
+		set:      set,
+		writer:   w,
+		channels: channels,
+		done:     make(chan struct{}),
 	}
 	ctx, cancel := context.WithCancel(m.parent)
 	rt.cancel = cancel
