@@ -60,9 +60,9 @@ written here. Nothing gets to be quietly missing.
 | B16 | Runtime module load/unload | `LoadMod`/`UnloadMod`/`ListMods`/`ReloadMod` | **refuse** (see R3) |
 | B17 | Config save/restart from the wire | `SaveConfig`, `Restart`, `ReloadMod` | **refuse** (R4) |
 
-**Work estimate for 1.1**: B2 (per-window buffers + per-client cursor), B5
-(runtime network management), B10/B11/B12, B6-EXTERNAL, B13, B14, B15. This is
-the real bouncer backlog; everything below is a feature layer on top.
+**Work estimate for 1.1**: B5 (runtime network management), B10/B11/B12,
+B6-EXTERNAL, B13, B14, B15. This is the real bouncer backlog; everything below
+is a feature layer on top.
 
 ### 1.1.1 B13 in full: bind host, user bind host, FREEBIND (must have)
 
