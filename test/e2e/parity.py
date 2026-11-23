@@ -390,103 +390,112 @@ def join_and_confirm(b: Bouncer, channel: str, budget: float = 90.0) -> bool:
     return False
 
 
-def _reconnect_and_watch(b: Bouncer, needle: str, budget: float = 75.0) -> tuple[bool, list[str]]:
-    """Disconnect and reconnect, then watch for a JOIN of `needle`.
+def joined_channels(b: Bouncer) -> set[str]:
+    """The channels the bouncer says it is joined to, from its own list command.
 
-    Every window is scanned, not just the one after the commands: a fast bouncer
-    brings the channel back *inside* the Connect command's own drain, so looking
-    only at later output reports a working rejoin as a failure. And the budget has
-    to outlast the slower bouncer's reconnect backoff — a short window measures the
-    harness's patience, not the bouncer's behaviour, which is how this case managed
-    to fail identically on both sides while the feature worked on one.
-
-    Returns (found, all lines seen).
+    This is the honest measurement for chansaver, and it is the same question on both
+    sides. Watching the client stream does not work: a bouncer only delivers a window's
+    lines live to a client attached to that window, so the JOIN answering its own
+    rejoin is buffered rather than sent, and "I did not see a JOIN" says nothing about
+    whether the rejoin happened. Reading the bouncer's list avoids the ambiguity
+    entirely.
     """
-    seen: list[str] = []
-    b.cmd("Disconnect", seconds=2.5)
-    seen.extend(b.cmd("Connect", seconds=2.5))
-
-    def is_live_join(l: str) -> bool:
-        # A replayed line is tagged with its batch; replaying a past JOIN of this
-        # channel would otherwise look like a successful rejoin after a reconnect
-        # that never happened.
-        if "batch=" in l and "-replay" in l:
-            return False
-        return (" JOIN " in l) and (needle.lower() in l.lower())
-
-    end = time.time() + budget
-    found = any(is_live_join(l) for l in seen)
-    while not found and time.time() < end:
-        seen.extend(b.drain(0.5))
-        found = any(is_live_join(l) for l in seen)
-    return found, seen
+    out: set[str] = set()
+    for line in b.cmd("ListChans", seconds=2.5):
+        # Both bouncers render a table; the name is a cell starting with #, and the
+        # next cell is its status. A buffer size or mode column also starts with a
+        # digit or +, so requiring the status word keeps the parse honest.
+        cells = [c.strip().lstrip("@+") for c in re.split(r"[|]", line)]
+        for k, cell in enumerate(cells):
+            if not cell.startswith("#"):
+                continue
+            status = cells[k + 1] if k + 1 < len(cells) else ""
+            if re.search(r"\b(Joined|Detached|Disabled)\b", status, re.I):
+                out.add(cell.lower())
+    return out
 
 
-def case_chansaver(b: Bouncer, channel: str) -> dict:
+def case_chansaver(b: Bouncer, channel: str, observer: "ErgoObserver") -> dict:
     """Does a channel joined inside the session survive a reconnect, and does a
     channel parted inside the session stay gone?
 
-    Both halves are needed. chansaver's job is that the saved list follows our own
-    JOIN and PART (chansaver.cpp:69-92), and Disconnect/Connect drives the same
-    rejoin path as a real reconnect without restarting either bouncer.
+    Both halves are needed, and the positive control comes first. chansaver's job is
+    that the channel list follows our own JOIN and PART (chansaver.cpp:69-92); a case
+    that only checks "a parted channel did not come back" passes for a chansaver that
+    records nothing at all, which is how this case found a real bug.
 
-    The negative half cannot use the configured channel: it is in the network
-    config, so it comes back after a reconnect whether chansaver works or not.
-    Both throwaway channels are therefore unique per run and absent from any
-    config file — a channel name reused from a previous run would already be in
-    the saved list, making the join a no-op and the control meaningless.
-
-    The negative half alone is not enough either: "nothing came back" is also what
-    a dead chansaver produces. So the positive control comes first, and the case is
-    only a pass if the control holds *and* the parted channel stays away.
+    The verdict comes from the IRCd, not from either bouncer. The bouncers answer
+    different questions through their list commands — ZNC lists channels in its config,
+    salotto lists known windows — and neither reflects "am I actually in this channel
+    now". The observer joins the same network as a third party and asks ergo who is in
+    the channel: after a reconnect the bouncer must be there for the channel it kept
+    and absent for the one it parted.
     """
     stamp = int(time.time()) % 100000
     keep = "%s-keep%d" % (channel, stamp)
     gone = "%s-gone%d" % (channel, stamp)
+    bnick = b.nick
 
-    # Positive control: joined in-session, so a reconnect must bring it back. The
-    # join is confirmed against the server first: a bouncer whose upstream is down
-    # drops the client's JOIN, and then the control is testing nothing.
+    # The observer joins both channels: NAMES only lists members to a client that is
+    # itself in the channel.
+    observer.join(keep)
+    observer.join(gone)
+
     joined_keep = join_and_confirm(b, keep)
-
-    # Negative: joined then parted in-session, so a reconnect must leave it out.
     joined_gone = join_and_confirm(b, gone)
+
+    # Part the second one in-session: it must not come back.
     b.send("PART " + gone)
     b.drain(2.0)
 
-    kept, seen_keep = _reconnect_and_watch(b, keep)
-    back, seen_part = _reconnect_and_watch(b, gone)
+    b.cmd("Disconnect", seconds=2.5)
+    b.cmd("Connect", seconds=2.5)
+
+    def present(ch: str) -> bool:
+        # NAMES is answered by the IRCd, so this is about the wire, not about what
+        # the bouncer believes. The bouncer's own nick may be e2e or e2e_ (the fixture
+        # shares one IRCd between two bouncers), so any name starting with the base
+        # nick counts.
+        lines = observer.names(ch)
+        if os.environ.get("CHANSAVER_DEBUG"):
+            for line in lines:
+                print("### names %s: %r" % (ch, line), file=sys.stderr)
+        for line in lines:
+            if " 353 " not in line:
+                continue
+            names = line.split(":", 1)[-1]
+            for name in re.split(r"[\s]+", names):
+                name = name.lstrip("@+%~&")
+                if name and bnick and name.lower().startswith(bnick.lower()[:3]):
+                    return True
+        return False
+
+    end = time.time() + 120.0
+    kept = False
+    while time.time() < end and not kept:
+        kept = present(keep)
+        if not kept:
+            time.sleep(5.0)
+
+    # Same patience for the negative: absence is only meaningful once the positive
+    # has been observed on the same run.
+    back = present(gone)
 
     if os.environ.get("CHANSAVER_DEBUG"):
-        # The bouncer's own view of the saved list: this separates "the module never
-        # recorded the channel" from "it recorded it but did not re-join".
-        saved = b.cmd("ListChans", seconds=2.0)
-        print("### saved list:", file=sys.stderr)
-        for l in saved:
-            if l.strip():
-                print("###   %r" % l, file=sys.stderr)
-        for tag, lines in (("keep", seen_keep), ("gone", seen_part)):
-            print("### %s: %d lines" % (tag, len(lines)), file=sys.stderr)
-            for l in lines:
-                if "JOIN" in l.upper() or "366" in l:
-                    print("###   %r" % l, file=sys.stderr)
+        print("### keep=%s present=%s | gone=%s present=%s"
+              % (keep, kept, gone, back), file=sys.stderr)
 
-    # Tidy up: the keep channel is now in the saved list, so remove it, and make
-    # sure the fixture channel is joined for the cases that follow.
+    # Tidy up so later cases start from the configured channel only.
     b.send("PART " + keep)
     b.drain(1.5)
     b.send("JOIN " + channel)
     b.drain(1.5)
 
     return {
-        # The joins had to land upstream for the rest to mean anything; if they did
-        # not, say so instead of reporting a chansaver verdict built on nothing.
         "joined_keep": joined_keep,
         "joined_gone": joined_gone,
         "kept_after_reconnect": kept,
         "parted_channel_came_back": back,
-        # False whenever the control failed, so two matching silences cannot look
-        # like agreement.
         "chansaver_ok": joined_keep and joined_gone and kept and not back,
     }
 
@@ -539,6 +548,30 @@ class ErgoObserver:
                 raw, self.buf = self.buf.split(b"\n", 1)
                 self.pending.append(raw.rstrip(b"\r").decode("utf-8", "replace"))
         out, self.pending = self.pending, []
+        return out
+
+    def join(self, channel: str) -> None:
+        """Join a channel so NAMES on it answers. ergo replies 353 with the member
+        list only to a client in the channel; outside it, NAMES returns an empty 366,
+        which would read as "the bouncer is not there" no matter what it did.
+        """
+        self.send("JOIN " + channel)
+        self.drain(1.5)
+
+    def names(self, channel: str) -> list[str]:
+        """Who ergo says is in a channel. The bouncer's own list cannot answer this:
+        ZNC lists channels in its config and salotto lists known windows, so the two
+        commands are different questions. The IRCd is the only witness both sides
+        answer identically.
+        """
+        self.send("NAMES " + channel)
+        out: list[str] = []
+        end = time.time() + 4.0
+        while time.time() < end:
+            for line in self.drain(0.4):
+                out.append(line)
+                if " 366 " in line:  # RPL_ENDOFNAMES
+                    return out
         return out
 
     def whois(self, target: str) -> list[str]:
@@ -607,7 +640,7 @@ def run_away(host: str, port: int, nick: str, dialect: str, password: str | None
         obs.close()
 
 
-def run(host: str, port: int, nick: str, dialect: str, password: str | None, channel: str, only: set[str] | None = None) -> dict:
+def run(host: str, port: int, nick: str, dialect: str, password: str | None, channel: str, only: set[str] | None = None, observer: "ErgoObserver | None" = None) -> dict:
     b = Bouncer(host, port, nick, dialect, password)
     out: dict[str, dict] = {}
 
@@ -642,7 +675,11 @@ def run(host: str, port: int, nick: str, dialect: str, password: str | None, cha
         if want("connect_disconnect"):
             out["connect_disconnect"] = case_connect_disconnect(b)
         if want("chansaver"):
-            out["chansaver"] = case_chansaver(b, channel)
+            if observer is None:
+                out["chansaver"] = {"error": "no observer: cannot read the IRCd, so "
+                                    "the case would compare two silences"}
+            else:
+                out["chansaver"] = case_chansaver(b, channel, observer)
     finally:
         b.close()
     return out
@@ -708,8 +745,22 @@ def main() -> int:
 
     eh, ep = split(args.ergo)
 
-    znc = run(zh, zp, args.nick, "znc", args.znc_pass, args.channel, only)
-    sal = run(sh, sp, args.nick, "salotto", None, args.channel, only)
+    # One observer per bouncer, on the same IRCd: it is the only witness that answers
+    # "is the bouncer in this channel" identically for both.
+    def make_observer(nick: str) -> "ErgoObserver | None":
+        try:
+            return ErgoObserver(eh, ep, nick, args.channel)
+        except OSError as exc:
+            print("observer unavailable: %s" % exc, file=sys.stderr)
+            return None
+
+    zobs = make_observer("zobs")
+    znc = run(zh, zp, args.nick, "znc", args.znc_pass, args.channel, only, zobs)
+    sobs = make_observer("sobs")
+    sal = run(sh, sp, args.nick, "salotto", None, args.channel, only, sobs)
+    for o in (zobs, sobs):
+        if o is not None:
+            o.close()
     # The away case runs after the others and one bouncer at a time: both are
     # attached to the same ergo under nick e2e/e2e_, and an away probe needs the
     # channel quiet.

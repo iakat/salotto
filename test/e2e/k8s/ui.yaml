@@ -28,8 +28,11 @@ spec:
             - "0.0.0.0:8080"
             - "-bouncer"
             - "salotto-e2e:6667"
+            # Not "e2e": the parity harness drives the bouncer under that nick, and
+            # two clients on one bouncer fight over it — the loser gets a broken pipe
+            # mid-case. A front end is a separate client and takes its own name.
             - "-nick"
-            - "e2e"
+            - "e2e-ui"
             - "-window"
             - "#e2e"
           ports:
@@ -53,8 +56,11 @@ spec:
             - "/data/host_key"
             - "-bouncer"
             - "salotto-e2e:6667"
+            # Not "e2e": the parity harness drives the bouncer under that nick, and
+            # two clients on one bouncer fight over it — the loser gets a broken pipe
+            # mid-case. A front end is a separate client and takes its own name.
             - "-nick"
-            - "e2e"
+            - "e2e-ui"
             - "-window"
             - "#e2e"
           ports:
