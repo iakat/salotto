@@ -119,11 +119,13 @@ func run() int {
 	}
 	hub := facade.NewHub(maxClients)
 	srv, err := facade.New(facade.Config{
-		ServerName: cfg.ServerName,
-		Hub:        hub,
-		BindHosts:  bindState,
-		Log:        logger,
-		MaxClients: maxClients,
+		ServerName:  cfg.ServerName,
+		Hub:         hub,
+		BindHosts:   bindState,
+		Log:         logger,
+		MaxClients:  maxClients,
+		MOTDBlocked: cfg.MOTDBlocked,
+		MOTDMissing: cfg.MOTDMissing,
 	})
 	if err != nil {
 		logger.Error("facade config invalid", "err", err)

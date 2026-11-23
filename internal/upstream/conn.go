@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/iakat/salotto/internal/certhash"
 	"github.com/iakat/salotto/internal/ircline"
 )
 
@@ -94,10 +96,42 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 	conn := raw
 	if c.cfg.TLS {
 		host, _, _ := net.SplitHostPort(c.cfg.Addr)
-		tconn := tls.Client(raw, &tls.Config{
+		tlsCfg := &tls.Config{
 			ServerName:         host,
 			InsecureSkipVerify: c.cfg.InsecureSkipVerify,
-		})
+		}
+		if c.cfg.TrustFingerprint != nil && !c.cfg.InsecureSkipVerify {
+			// Verify the chain ourselves so a pinned fingerprint can rescue a
+			// certificate the PKI rejects, without ever trusting an unverified
+			// chain: ZNC's CheckSSLCert accepts on PKI or on an exact pin, and
+			// refuses otherwise.
+			tlsCfg.InsecureSkipVerify = true
+			tlsCfg.VerifyConnection = func(cs tls.ConnectionState) error {
+				if len(cs.PeerCertificates) == 0 {
+					return fmt.Errorf("upstream: %s presented no certificate", c.cfg.Name)
+				}
+				cert := cs.PeerCertificates[0]
+				pool := x509.NewCertPool()
+				for _, c := range cs.PeerCertificates[1:] {
+					pool.AddCert(c)
+				}
+				opts := x509.VerifyOptions{DNSName: host, Roots: nil, Intermediates: pool}
+				_, verifyErr := cert.Verify(opts)
+				if verifyErr == nil {
+					return nil
+				}
+				fp := certhash.Fingerprint(cert)
+				if c.cfg.TrustFingerprint(fp) {
+					if c.cfg.Log != nil {
+						c.cfg.Log.Info("tls: accepting pinned certificate",
+							"name", c.cfg.Name, "fingerprint", fp, "pki_error", verifyErr.Error())
+					}
+					return nil
+				}
+				return fmt.Errorf("upstream: %s certificate not trusted: %w", c.cfg.Name, verifyErr)
+			}
+		}
+		tconn := tls.Client(raw, tlsCfg)
 		if err := tconn.HandshakeContext(dialCtx); err != nil {
 			cancel()
 			raw.Close()

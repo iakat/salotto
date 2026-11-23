@@ -143,6 +143,11 @@ func (m *netmgr) Start(nc config.Network) error {
 		JoinChannels: func() []string {
 			return joinableChannels(nc.Channels, m.srv, netName)
 		},
+		// Read at every handshake, so a pin added with
+		// AddTrustedServerFingerprint applies to the next reconnect.
+		TrustFingerprint: func(fp string) bool {
+			return m.srv.TrustedServerFingerprints().Trusted(netName, fp)
+		},
 		OnLine: func(windows []string, seqs []uint64, entries []logfile.Entry, line []byte) {
 			dispatchRouted(m.srv, netName, windows, line)
 			w.OnRouted(entries, line, false)

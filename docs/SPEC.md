@@ -412,7 +412,11 @@ Precedence, highest first:
 
 - A session = one user + one network + one socket + one ring.
 - Connect: TCP → TLS (verify by default; `insecure_skip_verify` allowed per
-  network with a warning in `STATUS`) → `CAP LS 302` → request
+  network with a warning in `STATUS`, and a certificate the PKI rejects may be
+  accepted if the operator pinned its SHA-256 fingerprint with
+  `AddTrustedServerFingerprint` — ZNC's `CheckSSLCert` rule: PKI first, then an
+  exact pin, refuse otherwise. A wrong pin fails closed, it does not degrade to
+  "trust anything") → `CAP LS 302` → request
   `message-tags server-time batch echo-message away-notify account-notify
   extended-join cap-notify sasl chathistory` when offered → `SASL` if the
   network has credentials → `NICK`/`USER` → done.

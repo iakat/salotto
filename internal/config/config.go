@@ -54,8 +54,13 @@ type Config struct {
 	RingSegmentSize int
 	MaxWindows      int
 	MaxClients      int
-	User            User
-	Networks        []Network
+	// MOTDBlocked and MOTDMissing are the B15 knobs: ZNC's block_motd and
+	// missingmotd modules, which are per-user settings there but process-wide
+	// here because this daemon is single-user.
+	MOTDBlocked bool
+	MOTDMissing bool
+	User        User
+	Networks    []Network
 }
 
 // Default returns the built-in configuration. Networks are intentionally empty:
@@ -297,6 +302,10 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.MaxWindows, err = parseInt(value)
 	case "max_clients":
 		c.MaxClients, err = parseInt(value)
+	case "motd_blocked":
+		c.MOTDBlocked, err = parseBool(value)
+	case "motd_missing":
+		c.MOTDMissing, err = parseBool(value)
 	default:
 		return fmt.Errorf("unknown key %q", key)
 	}

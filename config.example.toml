@@ -28,6 +28,13 @@ ring_segment_size = 262144
 max_windows = 64
 max_clients = 32
 
+# B15: MOTD control, ZNC's block_motd and missingmotd.
+# motd_blocked = true suppresses 375/372 and answers 376 with "MOTD blocked by
+# ZNC"; motd_missing = true answers login with 422 instead of a MOTD. Turning
+# both off serves the bouncer's own one-line MOTD.
+motd_blocked = false
+motd_missing = false
+
 [user]
 bind_host = ""                   # default source address for every network; empty = kernel picks
 deny_set_bind_host = false       # operator policy: refuse Set*BindHost from the client

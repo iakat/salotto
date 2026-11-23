@@ -36,6 +36,12 @@ type Config struct {
 	// (IRCNetwork.cpp:998 checks IsDisabled before JoinChan; CClient::AddBuffer
 	// never does, so a disabled channel keeps buffering and replaying).
 	JoinChannels func() []string
+	// TrustFingerprint, when non-nil, is consulted only after the normal PKI
+	// verification fails: ZNC's CheckSSLCert (Socket.cpp) accepts a certificate
+	// whose SHA-256 fingerprint the operator pinned, so a self-signed server can
+	// be used without InsecureSkipVerify and a wrong pin still fails closed.
+	// It receives the colon-separated uppercase fingerprint.
+	TrustFingerprint func(fp string) bool
 	// Windows owns one replay ring per window for this network. The connection
 	// routes every line to the windows the logger gives it and appends the line
 	// to each of those rings.

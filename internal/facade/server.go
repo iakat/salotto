@@ -33,6 +33,11 @@ type Config struct {
 	// BindHosts, when set, answers the SetBindHost/ClearBindHost family. It is
 	// optional so the facade stays usable without an upstream dialer.
 	BindHosts BindHosts
+	// MOTDBlocked suppresses 375/372 and replaces 376's text, as ZNC's
+	// block_motd does; the client still gets a complete 375/376 pair.
+	MOTDBlocked bool
+	// MOTDMissing answers login with 422 instead of a MOTD, as missingmotd does.
+	MOTDMissing bool
 }
 
 // BindHosts is the bind-host state the wire commands mutate. Resolution is
@@ -130,14 +135,15 @@ func (ne *networkEntry) advanceNick(un string, line []byte) (forLine, next strin
 
 // Server is the client-facing IRC facade.
 type Server struct {
-	cfg     Config
-	log     *slog.Logger
-	hub     *Hub
-	netsMu  sync.RWMutex
-	nets    []*networkEntry
-	windows *windowState
-	created string
-	active  atomic.Int64
+	cfg          Config
+	log          *slog.Logger
+	hub          *Hub
+	netsMu       sync.RWMutex
+	nets         []*networkEntry
+	windows      *windowState
+	fingerprints *Fingerprints
+	created      string
+	active       atomic.Int64
 
 	linePool sync.Pool
 }
@@ -182,10 +188,11 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:     cfg,
-		log:     cfg.Log,
-		windows: newWindowState(),
-		created: time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 MST"),
+		cfg:          cfg,
+		log:          cfg.Log,
+		windows:      newWindowState(),
+		fingerprints: NewFingerprints(),
+		created:      time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 MST"),
 	}
 
 	names := make([]string, 0, len(cfg.Networks))
@@ -505,6 +512,12 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleDisableChan(rest, false)
 	case ircline.IsVerb(rest, "LISTCHANS"):
 		return c.handleListChans()
+	case ircline.IsVerb(rest, "ADDTRUSTEDSERVERFINGERPRINT"):
+		return c.handleTrustedFingerprint(rest, fpAdd)
+	case ircline.IsVerb(rest, "DELTRUSTEDSERVERFINGERPRINT"):
+		return c.handleTrustedFingerprint(rest, fpDel)
+	case ircline.IsVerb(rest, "LISTTRUSTEDSERVERFINGERPRINTS"):
+		return c.handleTrustedFingerprint(rest, fpList)
 	default:
 		return c.forward(line)
 	}
@@ -769,9 +782,37 @@ func (c *client) sendRegistration() bool {
 		c.send(":", srv, " 003 ", nick, " :This server was created ", c.srv.created) &&
 		c.send(":", srv, " 004 ", nick, " ", srv, " salotto-0.1 i s") &&
 		c.send(":", srv, " 005 ", nick, " CHANTYPES=# PREFIX=(ov)@+ CASEMAPPING=rfc1459 NETWORK=", net, " :are supported by this server") &&
-		c.send(":", srv, " 375 ", nick, " :- ", srv, " Message of the day -") &&
-		c.send(":", srv, " 372 ", nick, " :- salotto proof of concept: replayed history follows.") &&
-		c.send(":", srv, " 376 ", nick, " :End of /MOTD command.")
+		c.sendMOTD(nick)
+}
+
+// sendMOTD writes the login-time MOTD according to the operator's policy, which
+// is ZNC's block_motd and missingmotd in one place (B15):
+//
+//   - block (block_motd, default on): 375/372 are suppressed and 376's text is
+//     replaced with "MOTD blocked by ZNC", exactly as block_motd does. A client
+//     still gets a complete 375/376 pair, so it does not think the server is
+//     broken.
+//   - missing (missingmotd): a 422 instead of any MOTD, which is what a server
+//     without one sends.
+//
+// The MOTD here is the bouncer's own, not the upstream server's: it explains
+// that replayed history follows. Blocking it is therefore about client noise,
+// not about hiding the network's MOTD, which the network's own 375/372 reach the
+// client unmodified only if the operator allows them.
+func (c *client) sendMOTD(nick string) bool {
+	srv := c.srv.cfg.ServerName
+	switch {
+	case c.srv.cfg.MOTDMissing:
+		return c.send(":", srv, " 422 ", nick, " :MOTD File is missing")
+	case c.srv.cfg.MOTDBlocked:
+		// 375 is suppressed too: ZNC HALTs both 375 and 372, so a client sees
+		// only the 376 with the replaced text.
+		return c.send(":", srv, " 376 ", nick, " :MOTD blocked by ZNC")
+	default:
+		return c.send(":", srv, " 375 ", nick, " :- ", srv, " Message of the day -") &&
+			c.send(":", srv, " 372 ", nick, " :- salotto proof of concept: replayed history follows.") &&
+			c.send(":", srv, " 376 ", nick, " :End of /MOTD command.")
+	}
 }
 
 func (c *client) replayAll() bool {
