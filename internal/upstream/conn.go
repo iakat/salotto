@@ -100,6 +100,15 @@ func (c *Conn) runOnce(ctx context.Context) (registered bool, err error) {
 			ServerName:         host,
 			InsecureSkipVerify: c.cfg.InsecureSkipVerify,
 		}
+		if c.cfg.CertFile != "" && c.cfg.KeyFile != "" {
+			cert, err := tls.LoadX509KeyPair(c.cfg.CertFile, c.cfg.KeyFile)
+			if err != nil {
+				cancel()
+				raw.Close()
+				return false, fmt.Errorf("upstream: %s client certificate: %w", c.cfg.Name, err)
+			}
+			tlsCfg.Certificates = []tls.Certificate{cert}
+		}
 		if c.cfg.TrustFingerprint != nil && !c.cfg.InsecureSkipVerify {
 			// Verify the chain ourselves so a pinned fingerprint can rescue a
 			// certificate the PKI rejects, without ever trusting an unverified

@@ -26,6 +26,16 @@ type Config struct {
 	Pass               string
 	SASLUser           string
 	SASLPass           string
+	// SASLExternal selects SASL EXTERNAL (ZNC's module sasl.cpp, mechanism
+	// EXTERNAL: "TLS certificate, for use with the *cert module") instead of
+	// PLAIN. It sends no credentials: the identity is the client certificate, so
+	// a server that does not see one refuses the mechanism and the connection
+	// fails closed rather than silently falling back to PLAIN.
+	SASLExternal bool
+	// CertFile and KeyFile are the client certificate presented on the TLS
+	// handshake, which is what SASL EXTERNAL authenticates. Both or neither.
+	CertFile string
+	KeyFile  string
 	// Channels is the static channel list used when JoinChannels is nil. It is
 	// kept for tests and for callers that have no runtime state to consult.
 	Channels []string
@@ -366,4 +376,14 @@ func (c *Conn) Run(ctx context.Context) {
 			backoff = c.cfg.BackoffMax
 		}
 	}
+}
+
+// saslWanted reports whether the handshake should request the sasl capability.
+// EXTERNAL needs a client certificate, not a username, which is why it is a
+// separate condition rather than "SASLUser != \"\"".
+func (c *Config) saslWanted() bool {
+	if c.SASLExternal {
+		return true
+	}
+	return c.SASLUser != ""
 }

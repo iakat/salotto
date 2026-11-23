@@ -44,7 +44,7 @@ func (c *Conn) register(conn net.Conn, br *bufio.Reader, scratch []byte) error {
 		}
 	}
 
-	want, sasl := selectCaps(offered, c.cfg.SASLUser != "")
+	want, sasl := selectCaps(offered, c.cfg.saslWanted())
 	c.SetCaps(want)
 	if len(want) > 0 {
 		if err := c.writeLine(conn, []byte("CAP REQ :"+strings.Join(want, " "))); err != nil {
@@ -53,13 +53,24 @@ func (c *Conn) register(conn net.Conn, br *bufio.Reader, scratch []byte) error {
 	}
 
 	if sasl {
-		if err := c.writeLine(conn, []byte("AUTHENTICATE PLAIN")); err != nil {
+		mech := "PLAIN"
+		if c.cfg.SASLExternal {
+			mech = "EXTERNAL"
+		}
+		if err := c.writeLine(conn, []byte("AUTHENTICATE "+mech)); err != nil {
 			return err
 		}
 		if err := c.waitAuthenticate(conn, br, scratch); err != nil {
 			return err
 		}
-		payload := base64.StdEncoding.EncodeToString([]byte(c.cfg.SASLUser + "\x00" + c.cfg.SASLUser + "\x00" + c.cfg.SASLPass))
+		// EXTERNAL authenticates with the TLS client certificate, so the
+		// response is empty: ZNC sends a single "+" for every mechanism other
+		// than PLAIN (sasl.cpp:198-213), and the server reads the identity from
+		// the certificate.
+		payload := "+"
+		if !c.cfg.SASLExternal {
+			payload = base64.StdEncoding.EncodeToString([]byte(c.cfg.SASLUser + "\x00" + c.cfg.SASLUser + "\x00" + c.cfg.SASLPass))
+		}
 		if err := c.writeLine(conn, []byte("AUTHENTICATE "+payload)); err != nil {
 			return err
 		}

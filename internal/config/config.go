@@ -23,14 +23,20 @@ type User struct {
 
 // Network describes one upstream IRC network.
 type Network struct {
-	Name               string
-	Addr               string
-	TLS                bool
-	Nick               string
-	RealName           string
-	Pass               string
-	SASLUser           string
-	SASLPass           string
+	Name     string
+	Addr     string
+	TLS      bool
+	Nick     string
+	RealName string
+	Pass     string
+	SASLUser string
+	SASLPass string
+	// SASLExternal selects SASL EXTERNAL: the identity is the client
+	// certificate, not a password pair.
+	SASLExternal bool
+	// CertFile/KeyFile are the client certificate presented to the network.
+	CertFile           string
+	KeyFile            string
 	Channels           []string
 	BindHost           string
 	InsecureSkipVerify bool
@@ -342,6 +348,12 @@ func (c *Config) parseNetworkKey(n *Network, key, value string) error {
 		n.Pass, err = parseString(value)
 	case "sasl_user":
 		n.SASLUser, err = parseString(value)
+	case "sasl_external":
+		n.SASLExternal, err = parseBool(value)
+	case "cert_file":
+		n.CertFile, err = parseString(value)
+	case "key_file":
+		n.KeyFile, err = parseString(value)
 	case "sasl_pass":
 		n.SASLPass, err = parseString(value)
 	case "channels":

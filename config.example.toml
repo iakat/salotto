@@ -49,6 +49,12 @@ pass = ""
 # SASL is optional; uncomment both lines and fill them in if the network needs it.
 # sasl_user = "mynick"
 # sasl_pass = "secret"
+# Or authenticate with a client certificate instead (SASL EXTERNAL, ZNC's *cert
+# setup): set sasl_external and point at a PEM certificate plus key. The identity
+# comes from the certificate, so no username or password is sent.
+# sasl_external = true
+# cert_file = "/etc/salotto/client.pem"
+# key_file = "/etc/salotto/client.key"
 # Channels joined after every successful (re)connect.
 channels = ["#chan1", "#chan2"]
 bind_host = ""                   # override for this network only; empty = use the user value

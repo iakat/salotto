@@ -431,3 +431,52 @@ nick = "nick"
 		})
 	}
 }
+
+// TestSASLExternalConfig covers B6's certificate path: sasl_external selects
+// EXTERNAL, cert_file/key_file are the client certificate, and the two booleans
+// are independent of sasl_user so a cert-authenticated network needs no password
+// at all.
+func TestSASLExternalConfig(t *testing.T) {
+	cfg, err := loadString(t, `
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+tls = true
+sasl_external = true
+cert_file = "/etc/salotto/client.pem"
+key_file = "/etc/salotto/client.key"
+`)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Networks) != 1 {
+		t.Fatalf("networks = %d", len(cfg.Networks))
+	}
+	n := cfg.Networks[0]
+	if !n.SASLExternal {
+		t.Fatal("sasl_external not parsed")
+	}
+	if n.CertFile != "/etc/salotto/client.pem" || n.KeyFile != "/etc/salotto/client.key" {
+		t.Fatalf("cert/key = %q/%q", n.CertFile, n.KeyFile)
+	}
+	if n.SASLUser != "" || n.SASLPass != "" {
+		t.Fatalf("EXTERNAL should need no password, got %q/%q", n.SASLUser, n.SASLPass)
+	}
+
+	cfg, err = loadString(t, `
+motd_blocked = true
+motd_missing = true
+
+[[network]]
+name = "libera"
+addr = "irc.libera.chat:6697"
+nick = "nick"
+`)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.MOTDBlocked || !cfg.MOTDMissing {
+		t.Fatalf("motd_* = %v/%v", cfg.MOTDBlocked, cfg.MOTDMissing)
+	}
+}
