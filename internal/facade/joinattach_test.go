@@ -1,7 +1,9 @@
 package facade
 
 import (
+	"bytes"
 	"testing"
+	"time"
 
 	"github.com/iakat/salotto/internal/ircline"
 )
@@ -72,5 +74,48 @@ func TestNonJoinLinesDoNotAttach(t *testing.T) {
 
 	if s.WindowAttached(sub, "libera", "#notjoined") {
 		t.Fatal("a PRIVMSG attached the client to a channel it did not join")
+	}
+}
+
+// TestJoinAttachesOnTheNetworkTheChannelIsOn pins the second half of the same
+// rule: the attach has to name the network the line was actually sent to.
+//
+// With two networks the bouncer has one namespace for nicks and one per network
+// for channels, so "#salotto" can exist on either. Attaching "the first network's
+// #salotto" while sending the JOIN to the second joins a channel with no attached
+// client at all: it is joined, it is buffered, and it is invisible - an empty
+// window, with the live traffic going to a key nobody holds. That is exactly what
+// the browser showed: bob's line was in the bouncer's ring and never drawn.
+//
+// The network names are "aaa" and "zzz" because the server sorts its networks by
+// name: the channel has to live on the one that is *not* index zero, or the test
+// passes without resolving anything.
+func TestJoinAttachesOnTheNetworkTheChannelIsOn(t *testing.T) {
+	first := newFakeNet("aaa")
+	first.add("status", ":srv 001 me :welcome", time.Now().UnixNano())
+	second := newFakeNet("zzz")
+	second.add("#salotto", ":other!u@h PRIVMSG #salotto :hi", time.Now().UnixNano())
+
+	s, err := New(testConfig(first, second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	sub := NewSubscriber(&out, 64*1024)
+	t.Cleanup(sub.Close)
+	c := &client{srv: s, sub: sub, nick: "test"}
+
+	raw := []byte("JOIN #salotto")
+	_, rest := ircline.Tags(raw)
+	_, rest = ircline.Prefix(rest)
+	if !c.handle(raw, rest) {
+		t.Fatal("handle closed the client")
+	}
+
+	if !s.WindowAttached(sub, "zzz", "#salotto") {
+		t.Fatal("the client is not attached to the channel it joined")
+	}
+	if s.WindowAttached(sub, "aaa", "#salotto") {
+		t.Fatal("the client was attached to the first network's #salotto instead")
 	}
 }

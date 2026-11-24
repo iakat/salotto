@@ -1245,10 +1245,11 @@ func (c *client) forward(line []byte) bool {
 	if len(nets) == 0 {
 		return c.notConnected()
 	}
-	if err := c.targetNetwork(nets, line).net.Send(line); err != nil {
+	ne := c.targetNetwork(nets, line)
+	if err := ne.net.Send(line); err != nil {
 		return c.notConnected()
 	}
-	c.attachJoined(line)
+	c.attachJoined(nets, ne, line)
 	c.clearOnSpeak(line)
 	return true
 }
@@ -1299,17 +1300,22 @@ func (c *client) targetNetwork(nets []*networkEntry, line []byte) *networkEntry 
 // It runs on the way out rather than on the server's JOIN coming back because the
 // attachments have to exist before that line is routed; a JOIN that arrives before
 // the attach is a line the client is not yet there to receive.
-func (c *client) attachJoined(line []byte) {
+//
+// It attaches on the network the line was actually sent to, not on the first one:
+// "JOIN #salotto" resolves to whichever network has that channel (targetNetwork),
+// and attaching the first network's #salotto instead leaves the joined channel with
+// no attached client at all. The channel is then joined, buffered, and invisible -
+// the user sees an empty window and the live traffic goes to a key nobody holds.
+func (c *client) attachJoined(nets []*networkEntry, ne *networkEntry, line []byte) {
 	_, rest := ircline.Tags(line)
 	_, rest = ircline.Prefix(rest)
 	if !ircline.IsVerb(rest, "JOIN") {
 		return
 	}
-	nets := c.srv.netSnapshot()
-	if len(nets) == 0 {
+	if len(nets) == 0 || ne == nil {
 		return
 	}
-	network := nets[0].name
+	network := ne.name
 	// "JOIN #a,#b key1,key2" - the channels are the first parameter, comma
 	// separated; the keys are irrelevant here.
 	param := string(ircline.FirstParam(ircline.Params(rest)))
