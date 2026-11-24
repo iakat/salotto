@@ -444,6 +444,39 @@ untouched. This is written down as an exception because it is the kind of thing
 that becomes ten exceptions if nobody stops it: no channel cap, or this
 paragraph. Recommendation: take the paragraph.
 
+### 9.2 Vendor verb: `PREF` (client settings held by the bouncer)
+
+Client settings are not a rendering detail that belongs only to the client
+process: the constraint is that the bouncer keeps all of them so the state is
+synchronised at the bouncer and not per client. The bouncer holds one opaque
+blob and never parses it.
+
+```
+PREF GET
+PREF SET <base64>
+:<server> PREF <nick> <base64>
+```
+
+- The blob is the client's settings JSON, base64-encoded so it survives as one
+  IRC parameter. The bouncer does not know a setting name, has no field list and
+  performs no validation beyond a 64 KiB cap; a new client-side setting needs no
+  daemon change.
+- `PREF GET` answers the stored blob, or an explicit empty `PREF` when none is
+  stored. The empty answer is what lets a client seed the bouncer's settings
+  without a timer: silence would make "nothing stored" indistinguishable from
+  "not answered yet".
+- `PREF SET` stores the blob and fans it out to every other attached client,
+  never to the sender. A `SET` with no argument, an oversized blob, or a token
+  that is not base64 is refused with a status `NOTICE`.
+- When `state_dir` is configured the token is written to
+  `<state_dir>/prefs.json` as `{"prefs":"<base64>"}` with a temporary file and
+  rename, `0o600`, and loaded at startup. Without `state_dir` the blob is in
+  memory only, like the rings and cursors.
+- The client sends `PREF GET` on its own `001`, adopts a returned blob without
+  echoing it, and treats an empty answer as "be the seed". `/fset` and `/alias`
+  write the client's local file first (the offline copy for a plain IRCd) and
+  then send `PREF SET`.
+
 ## 10. The client
 
 - TUI first (`salotto`), one process, one connection to the bouncer per
