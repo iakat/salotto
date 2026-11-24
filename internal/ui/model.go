@@ -1848,7 +1848,21 @@ func (m Model) searchIntoWindow(query string) Model {
 		// returning nothing are different problems and the message should say which.
 		return m.appendSystem("no matches for " + query + "\n")
 	}
-	const maxShown = 50
+	// The cap is the terminal's height, not a fixed number. A fixed 50 in a 30-row terminal is a
+	// list whose own count line has already scrolled off the top by the time it finishes - so the
+	// user sees the tail of a result with no idea how many there were, and the answer to "did I
+	// spell it right" is exactly the line that got pushed away. Found by the live probe, which
+	// could not find the count on screen and turned out to be right.
+	// The count line, the frame's two rows, and the "... and N more" line if it appears, plus the
+	// input row. Getting this wrong by one is what makes the count scroll away, which is the whole
+	// point of the cap.
+	maxShown := m.height - 6
+	if maxShown < 5 {
+		maxShown = 5 // a tiny terminal still shows a result rather than nothing
+	}
+	if maxShown > 50 {
+		maxShown = 50 // and never more than this, however tall the window
+	}
 	shown := hits
 	extra := 0
 	if len(shown) > maxShown {

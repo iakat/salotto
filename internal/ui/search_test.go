@@ -102,8 +102,55 @@ func TestASearchIsCapped(t *testing.T) {
 	}
 	// The rendered hits are the rows beginning "  <window>". Counting the word "line" would count
 	// the 200 stuffed source lines too, which is the mistake this test made first.
-	if n := strings.Count(body, "\n  #"); n > 60 {
-		t.Fatalf("%d rendered hits: the cap did not hold", n)
+	hits := 0
+	for _, ln := range strings.Split(body, "\n") {
+		if strings.HasPrefix(ln, "  ") && strings.Contains(ln, "  <") {
+			hits++
+		}
+	}
+	if hits > 60 {
+		t.Fatalf("%d rendered hits: the cap did not hold", hits)
+	}
+	// And the cap is the terminal's height, so the count line is still on the screen with them.
+	// A fixed cap is what this test is here to prevent: 50 hits in a 10-row window pushes the
+	// count, which is the answer to the question, off the top.
+	if got := m.height - 4; got >= 5 && hits > got {
+		t.Fatalf("%d hits in a %d row terminal: the list outgrew its own window", hits, m.height)
+	}
+}
+
+// TestTheSearchListFitsTheTerminal pins that a tall result in a short terminal keeps its count
+// line visible. This was a live defect: with a fixed cap of 50, the count scrolled off the top of a
+// 30-row screen and the user saw the tail of a list with no idea how long it was.
+func TestTheSearchListFitsTheTerminal(t *testing.T) {
+	for _, height := range []int{12, 20, 40} {
+		m := New("status")
+		m, _ = m.Step(tea.WindowSizeMsg{Width: 100, Height: height})
+		m, _ = m.Step(tea.KeyMsg{Type: tea.KeyCtrlN})
+		for i := 0; i < 200; i++ {
+			m = appendSystemLine(m, "common word line")
+		}
+		m = typeLine(m, "/search common")
+		body := systemText(m)
+		if !strings.Contains(body, "match(es)") {
+			t.Fatalf("height %d: no count line", height)
+		}
+		// A hit row is "  <window>  <nick> text". The window is whatever the line was in, which
+		// is not always a channel - matching only "#" here is how this test first reported "no
+		// hits at all" while the list was plainly on screen.
+		hits := 0
+		for _, ln := range strings.Split(body, "\n") {
+			if strings.HasPrefix(ln, "  ") && strings.Contains(ln, "  <") {
+				hits++
+			}
+		}
+		if hits == 0 {
+			t.Fatalf("height %d: no hits at all", height)
+		}
+		// The rendered answer has to fit the terminal, or its own count scrolls away.
+		if rendered := hits + 1; rendered > height {
+			t.Fatalf("height %d: the answer renders %d rows, more than the screen", height, rendered)
+		}
 	}
 }
 
