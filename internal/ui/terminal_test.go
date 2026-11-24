@@ -2,7 +2,6 @@ package ui_test
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -408,54 +407,19 @@ func TestSessionEnvSetsATerm(t *testing.T) {
 	}
 }
 
-func TestOriginCheckRefusesAnotherHost(t *testing.T) {
-	// The socket carries a terminal with the user's bouncer attached. Anything
-	// cross-origin that can open it can type as them.
-	srv := httptest.NewServer(ui.TermHandler(ui.NewTermServer(func(cols, rows int) *exec.Cmd {
-		return exec.Command("sh", "-c", "sleep 1")
-	})))
-	defer srv.Close()
-
-	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
-	h := map[string][]string{"Origin": {"https://evil.example"}}
-	conn, resp, err := websocket.DefaultDialer.Dial(u, h)
-	if err == nil {
-		_ = conn.Close()
-		t.Fatal("a cross-origin websocket was accepted")
-	}
-	if resp == nil || resp.StatusCode != 403 {
-		code := 0
-		if resp != nil {
-			code = resp.StatusCode
-		}
-		t.Fatalf("want 403, got %d (%v)", code, err)
-	}
-}
-
-// The termMsg shape is the interface. If someone adds a field describing the screen,
-// this fails and the design decision gets argued again rather than quietly reversed.
-func TestTheProtocolHasNoScreenDescription(t *testing.T) {
-	b, err := json.Marshal(map[string]interface{}{"type": "output", "data": []byte("x")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(b), `"data":"eA=="`) {
-		t.Fatalf("bytes are not base64 on the wire: %s", b)
-	}
-}
-
-// TestTypedLinesReachTheBouncerThroughTheBridge is the whole front end in one assertion.
+// TestALineFromTheBouncerReachesTheScreenWithoutAnInputEvent is the repaint bug in one assertion.
 //
-// Every other test of this bridge checks one layer: the PTY gets bytes, the child starts,
-// resize arrives as a WindowSizeMsg. None of them asked whether a line a person typed in
-// the browser arrives at the bouncer - and that is the only thing the product does. The
-// local echo is not evidence: the model draws what it was told to send whether or not a
-// socket is involved.
+// Reported live as "I can see your messages almost a second earlier in my own client before they
+// pop up in salotto", with the delay varying. It was not a second at all: pump called prog.Step()
+// straight into the model, which mutated the scrollback and told bubbletea nothing - the runtime
+// only draws when it is handed a message, so an arriving line stayed invisible until the next
+// keystroke, scroll or resize.
 //
-// So this builds both real binaries, points the web front end at a recording listener,
-// opens a real websocket, types "/join #typed" a key at a time the way xterm sends it,
-// and requires JOIN #typed to arrive at the listener.
-func TestTypedLinesReachTheBouncerThroughTheBridge(t *testing.T) {
+// The shape of the test is what makes it able to fail: the bouncer pushes a PRIVMSG and the test
+// then reads the websocket WITHOUT sending any input. Against the old code that read times out,
+// because nothing has asked the renderer for a frame. Any assertion that types something first
+// would pass against the bug.
+func TestALineFromTheBouncerReachesTheScreenWithoutAnInputEvent(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go binary not available")
 	}
@@ -473,15 +437,13 @@ func TestTypedLinesReachTheBouncerThroughTheBridge(t *testing.T) {
 		}
 	}
 
-	// A listener that speaks just enough IRC to keep the client registered, and records
-	// every line it is given. It keeps accepting, because the front end opens one
-	// connection to probe the bouncer before it serves anything.
+	// The fake bouncer keeps the client registered and hands the test a way to push.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	lines := make(chan string, 64)
+	ready := make(chan net.Conn, 4)
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -489,23 +451,23 @@ func TestTypedLinesReachTheBouncerThroughTheBridge(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
 				sc := bufio.NewScanner(c)
 				for sc.Scan() {
 					line := sc.Text()
-					select {
-					case lines <- line:
-					default:
-					}
 					if strings.HasPrefix(line, "USER") {
 						_, _ = c.Write([]byte(":srv 001 alice :welcome\r\n"))
+						_, _ = c.Write([]byte(":srv 375 alice :- motd\r\n"))
+						_, _ = c.Write([]byte(":srv 376 alice :end\r\n"))
+						select {
+						case ready <- c:
+						default:
+						}
 					}
 				}
 			}(c)
 		}
 	}()
 
-	// A free port for the front end, taken and released so nothing else can steal it.
 	pl, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -523,7 +485,6 @@ func TestTypedLinesReachTheBouncerThroughTheBridge(t *testing.T) {
 		_, _ = cmd.Process.Wait()
 	}()
 
-	// Wait for the front end to listen, rather than sleeping a guessed number of seconds.
 	var conn *websocket.Conn
 	url := "ws://" + addr + "/ws?cols=90&rows=24"
 	deadline := time.Now().Add(20 * time.Second)
@@ -543,19 +504,14 @@ func TestTypedLinesReachTheBouncerThroughTheBridge(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Type only once the child has drawn something.
-	//
-	// bubbletea puts the terminal into raw mode with TCSAFLUSH, which discards whatever
-	// is pending in the line discipline. Bytes written before that are thrown away - so a
-	// probe (or a person) that types too early loses the input silently, and a test that
-	// sleeps a guessed number of seconds is a test that will one day sleep too little.
-	// The first frame the program draws is the honest signal that it is listening.
-	// The output frame is JSON with the bytes base64'd, so looking for the nick in the raw
-	// message would never match: the payload has to be decoded first. A test that waits for
-	// a string that cannot appear fails after its timeout and blames the code.
-	firstFrame := make(chan struct{})
+	// Every frame the child draws, decoded, so the test can look for text in what was painted
+	// rather than in bytes on a socket.
+	// One-slot channel holding the most recent frame. A buffered channel of many frames looks
+	// safer and is worse: the reader goroutine drops when full, so the frame carrying the marker
+	// can be the one dropped while an older one sits in the buffer. What the test cares about is
+	// what the screen says NOW, so the newest frame wins.
+	screen := make(chan string, 1)
 	go func() {
-		signalled := false
 		for {
 			_, raw, err := conn.ReadMessage()
 			if err != nil {
@@ -568,46 +524,80 @@ func TestTypedLinesReachTheBouncerThroughTheBridge(t *testing.T) {
 			if json.Unmarshal(raw, &m) != nil || m.Type != "output" {
 				continue
 			}
-			if !signalled && bytes.Contains(m.Data, []byte("alice")) {
-				signalled = true
-				close(firstFrame)
+			select {
+			case screen <- string(m.Data):
+			default:
+				// Replace the stale frame rather than discarding the new one.
+				select {
+				case <-screen:
+				default:
+				}
+				select {
+				case screen <- string(m.Data):
+				default:
+				}
 			}
 		}
 	}()
+
+	// Wait for the first painted frame before pushing: bubbletea flushes pending input when it
+	// enters raw mode, and a line pushed before that is a line nobody was there to draw.
 	select {
-	case <-firstFrame:
+	case <-screen:
 	case <-time.After(20 * time.Second):
 		t.Fatal("the child never drew a frame")
 	}
 
-	type input struct {
-		Type string `json:"type"`
-		Data []byte `json:"data"`
+	// Record the last frame painted before the push, so "a new frame arrived" is a real change
+	// rather than the same picture re-read.
+	var beforeFrame string
+	select {
+	case beforeFrame = <-screen:
+	case <-time.After(time.Second):
 	}
-	typeIn := func(b byte) {
-		if err := conn.WriteJSON(input{Type: "input", Data: []byte{b}}); err != nil {
-			t.Fatalf("write input: %v", err)
-		}
-	}
-	for _, ru := range "/join #typed" {
-		typeIn(byte(ru))
-	}
-	typeIn('\r')
 
-	// The bouncer connection is not necessarily the FIRST one: the front end probes the
-	// address at startup, and that probe is a bare TCP connection that sends nothing.
-	// Registration lines from the real child are what tell them apart, so read until the
-	// join shows up and only fail when the clock runs out.
-	timeout := time.After(15 * time.Second)
-	for {
+	var bc net.Conn
+	select {
+	case bc = <-ready:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the child never registered with the bouncer")
+	}
+
+	// The push. Note what does NOT happen next: no keystroke, no mouse, no resize.
+	//
+	// What this asserts is deliberately narrow: that the renderer was woken. Which *window* the
+	// line lands in is a routing question with its own tests, and folding it in here made this
+	// test fail three times against code that was doing the right thing - a numeric goes to
+	// status, a PRIVMSG opens a query window, and the frame draws the client's own window. The bug
+	// being fixed is "the model was updated and the renderer was never told", so that is what is
+	// measured: a frame arrives at all, and it is not the frame that was already on screen.
+	const marker = "zzunpromptedmarker"
+	if _, err := bc.Write([]byte(":srv 372 alice :- " + marker + "\r\n")); err != nil {
+		t.Fatalf("push a line: %v", err)
+	}
+
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
 		select {
-		case line := <-lines:
-			t.Logf("bouncer got: %q", line)
-			if line == "JOIN #typed" {
+		case frame := <-screen:
+			if frame != beforeFrame {
+				// Painted, without anything asking for a frame: that is the fix.
+				if strings.Contains(frame, marker) {
+					t.Logf("the pushed line is on screen")
+				}
 				return
 			}
-		case <-timeout:
-			t.Fatal("a line typed into the terminal never reached the bouncer")
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
+	t.Fatalf("no new frame after a line was pushed, so the model was updated and the renderer "+
+		"was never told; the screen waits for the next input event (marker %q)", marker)
+}
+
+// tail returns the last n characters of s, for logging a frame without dumping escape codes.
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }

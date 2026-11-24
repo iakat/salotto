@@ -1600,13 +1600,14 @@ func (m Model) View() string {
 		b.WriteString(strings.Repeat(" ", l.winWidth))
 		b.WriteString(borderStyle.Render("│"))
 	}
+	// The input cell is l.inner wide, so it must be filled to l.inner. Drawing it to l.inner-1 was
+	// the second half of the one-cell-short frame: the conversation column's closing pipe sat one
+	// column left of every other row's.
 	input := "> " + string(m.input)
-	b.WriteString(inputStyle.Render(truncateTo(input, l.inner-1)))
-	if pad := l.inner - 1 - lipgloss.Width(inputStyle.Render(input)); pad > 0 {
+	shown := truncateTo(input, l.inner)
+	b.WriteString(inputStyle.Render(shown))
+	if pad := l.inner - lipgloss.Width(shown); pad > 0 {
 		b.WriteString(strings.Repeat(" ", pad))
-	}
-	if pad := l.inner - 1 - lipgloss.Width(input); pad < 0 {
-		_ = pad
 	}
 	if l.nickWidth > 0 {
 		b.WriteString(borderStyle.Render("│" + strings.Repeat(" ", l.nickWidth)))
@@ -1622,7 +1623,10 @@ func (m Model) View() string {
 
 // closeTop fills the rest of the top border and closes it.
 func (m Model) closeTop(b *strings.Builder, width int, corner string) {
-	head := lipgloss.Width(b.String()) + lipgloss.Width(borderStyle.Render(" "+corner))
+	// head is what the corner will cost, and it is the corner alone: an earlier version counted
+	// " "+corner here and then wrote no space, so every top border came out one cell short and the
+	// frame's right-hand pipes landed in two different columns.
+	head := lipgloss.Width(b.String()) + lipgloss.Width(borderStyle.Render(corner))
 	if pad := width - head; pad > 0 {
 		b.WriteString(borderStyle.Render(strings.Repeat("─", pad) + corner))
 	} else {

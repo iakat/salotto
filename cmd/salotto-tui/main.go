@@ -10,6 +10,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	tea "github.com/charmbracelet/bubbletea"
 	"log/slog"
 	"os"
 
@@ -78,27 +79,40 @@ func main() {
 		settings = os.Getenv("SALOTTO_SETTINGS")
 	}
 	prog := ui.NewProgram(active, tr).WithSettings(settings)
-	if tr != nil {
-		// The transport is pumped into the model from one goroutine, and bubbletea's
-		// update loop is what renders it: two writers to the model would interleave.
-		go pump(prog, tr)
-	}
 
 	p := ui.TUIProgram(prog, os.Stdin, os.Stdout)
+	// The transport is pumped into bubbletea's *message loop*, not into the model.
+	//
+	// pump used to call prog.Step(msg) directly from its own goroutine, which mutated the model
+	// and told the renderer nothing: bubbletea only repaints when it is handed a message, so a
+	// line that arrived while the user was idle sat in the model until the next keystroke, scroll
+	// or resize drew a frame. Measured live as "I can see your messages almost a second earlier in
+	// my own client before they pop up in salotto", with the delay varying because it was really
+	// "until you next touched something".
+	//
+	// Send puts the message on the runtime's channel, so Update applies it and the frame is drawn
+	// in the same turn. It also means the model has exactly one writer - the runtime - and the lock
+	// inside Program is left protecting reads from other goroutines rather than being the thing
+	// that makes this correct.
+	if tr != nil {
+		// Started in its own goroutine before Run so it cannot deadlock waiting for a loop that
+		// has not started yet: Send blocks until bubbletea is running, and Run is what runs it.
+		go pump(p, tr)
+	}
 	if _, err := p.Run(); err != nil {
 		slog.Error("tui exited", "err", err)
 		os.Exit(1)
 	}
 }
 
-// pump feeds the transport into the Program. It is the only goroutine that touches the
-// model from the transport side, which is why the Program's lock exists.
-func pump(prog *ui.Program, tr *ui.Transport) {
-	for {
-		msg, ok := prog.Next()
-		if !ok {
-			return
-		}
-		prog.Step(msg)
+// pump feeds the transport into bubbletea's message loop.
+//
+// It sends rather than calling into the model: a message the runtime never sees is a message the
+// screen never shows, and "no repaint until the next event" is indistinguishable from a slow
+// server. The transport closes its channel on shutdown, so a closed stream ends the pump.
+func pump(p *tea.Program, tr *ui.Transport) {
+	for msg := range tr.Msgs() {
+		slog.Warn("pump forwarding", "type", fmt.Sprintf("%T", msg))
+		p.Send(msg)
 	}
 }
