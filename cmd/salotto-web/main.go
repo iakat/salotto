@@ -56,6 +56,7 @@ func run() int {
 	pushSubject := flag.String("vapid-subject", "mailto:admin@localhost", "contact for the push service")
 	subsPath := flag.String("push-subscriptions", "", "path to the subscription store")
 	pushToken := flag.String("push-token", "", "bearer token /push/notify requires (default: $SALOTTO_PUSH_TOKEN)")
+	settingsPath := flag.String("settings", "", "path to the client settings file shared by every browser session (default: $SALOTTO_SETTINGS)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -85,6 +86,22 @@ func run() int {
 		_ = probe.Close()
 	}
 
+	// Client settings live in one file per deployment, on this pod's own volume. Every
+	// browser session reads and writes the same file because they are the same person's
+	// front end: "/fset highlight salotto" typed in one tab has to be there in the next
+	// one, and a per-session temporary file would forget it on every reconnect - which
+	// is exactly the bug this fixes. It is not in the ConfigMap for the same reason the
+	// push key is not: the file is state, not configuration.
+	settings := *settingsPath
+	if settings == "" {
+		settings = os.Getenv("SALOTTO_SETTINGS")
+	}
+	if settings != "" {
+		if err := os.MkdirAll(filepath.Dir(settings), 0o755); err != nil {
+			slog.Warn("cannot create the settings directory", "path", settings, "err", err)
+		}
+	}
+
 	// Each session builds its own child. The child owns the bouncer connection, so it
 	// dies with the session and a closed tab closes its client - which is what any IRC
 	// client does, and what a shared in-process Program could not do.
@@ -100,6 +117,9 @@ func run() int {
 		}
 		if *window != "" {
 			args = append(args, "-window", *window)
+		}
+		if settings != "" {
+			args = append(args, "-settings", settings)
 		}
 		cmd := exec.Command(bin, args...)
 		cmd.Env = ui.SessionEnv()
