@@ -67,31 +67,36 @@
   // no Shift, and "you cannot copy this on mobile" is not a thing to leave as a known
   // limitation when one button fixes it.
   //
-  // xterm has no runtime switch for mouse reporting, but it does have the escape hatch: hold
-  // Shift and it selects instead of reporting. So this mode makes every mouse event look
-  // shifted, which is the same code path a real terminal takes and cannot drift from it.
+  // The switch is xterm's own protocol setting rather than a synthetic Shift: with the
+  // protocol off, xterm's normal selection handling runs, which is the same code path a
+  // terminal without mouse reporting takes. Faking the modifier would run the same handling
+  // but leave the protocol on, and the program would still get a click for every drag.
   var selecting = false;
+  var savedProtocol = null;
+
+  function mouseService() {
+    return term._core && term._core.coreMouseService;
+  }
 
   function setSelectMode(on) {
     selecting = on;
+    var svc = mouseService();
+    if (svc) {
+      if (on) {
+        if (savedProtocol === null) savedProtocol = svc.activeProtocol;
+        svc.activeProtocol = "NONE";
+      } else if (savedProtocol !== null) {
+        svc.activeProtocol = savedProtocol;
+        savedProtocol = null;
+      }
+    }
+    if (!on) term.clearSelection();
     if (selectBtn) {
       selectBtn.textContent = on ? "\u2713 text" : "\u2197 select";
       selectBtn.title = on ? "back to clicking" : "select text to copy";
       selectBtn.classList.toggle("on", on);
     }
-    if (!on) term.clearSelection();
   }
-
-  ["mousedown", "mousemove", "mouseup", "click", "dblclick"].forEach(function (name) {
-    // Capture before xterm's own listener so the patched event is the one it acts on.
-    termEl.addEventListener(name, function (ev) {
-      if (!selecting) return;
-      if (!("shiftKey" in ev)) return;
-      try {
-        Object.defineProperty(ev, "shiftKey", { value: true, configurable: true });
-      } catch (e) {}
-    }, true);
-  });
 
   if (selectBtn) {
     selectBtn.addEventListener("click", function () { setSelectMode(!selecting); });
