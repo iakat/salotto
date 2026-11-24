@@ -51,12 +51,25 @@ func TestTwoNetworksKeepSeparateWindowsOfTheSameName(t *testing.T) {
 		}
 	}
 
-	// And the sidebar shows both, under their own headings, each reachable by number.
+	// And the sidebar shows both, each reachable by number, with the server row standing in for
+	// that network's own status buffer.
 	rows := sidebarText(m)
 	joined := strings.Join(rows, "\n")
-	for _, want := range []string{"first", "second", "status"} {
+	for _, want := range []string{"first", "second"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("the sidebar is missing %q:\n%s", want, joined)
+		}
+	}
+	// Each server row selects its status window rather than being an inert label.
+	for _, name := range []string{"first", "second"} {
+		var key string
+		for _, row := range m.sidebarRows(12) {
+			if row.heading && strings.HasSuffix(row.text, name) {
+				key = row.window
+			}
+		}
+		if key == "" || winName(key) != "status" {
+			t.Fatalf("the row for %q selects %q, want that network's status window", name, key)
 		}
 	}
 	if a, b := m.bufferNo[firstKey], m.bufferNo[secondKey]; a == 0 || b == 0 || a == b {

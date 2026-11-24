@@ -2855,11 +2855,16 @@ func cell(col []string, i, width int) string {
 // on #salotto selecting the row above it, or the server heading quietly standing in for
 // whichever window happens to be third.
 type sidebarRow struct {
-	// window is the window this row selects, and is empty for a heading: a heading is not a
-	// window, so clicking it must do nothing rather than switch to its first child.
+	// window is the window this row selects, and is empty for a heading that has no window of
+	// its own, so clicking it does nothing rather than switching to its first child.
 	window string
 	// heading marks a server heading, which is drawn unindented and styled as context.
 	heading bool
+	// status marks the heading that is also the network's own status buffer. A server is a
+	// connection, and its status buffer is where that connection talks - so the server row is
+	// the status window rather than a label above it. Drawing both would be two rows for one
+	// thing, and the indented "status" underneath would be the one that never gets a mention.
+	status bool
 	// text is the label: the window name, or the network name for a heading.
 	text string
 	// badge is the right-aligned unread count or mention mark, already rendered as a string.
@@ -2939,12 +2944,42 @@ func (m Model) groupedSidebarRows() []sidebarRow {
 
 	rows := make([]sidebarRow, 0, len(m.order)+len(nets))
 	for _, net := range nets {
-		rows = append(rows, sidebarRow{heading: true, text: net})
 		names := groups[net]
 		sort.Slice(names, func(i, j int) bool {
 			return strings.ToLower(names[i]) < strings.ToLower(names[j])
 		})
-		for _, name := range names {
+		// The network's own status window becomes the heading row. It is the window the
+		// server talks in - connection notices, motd, errors - so a heading that is only a
+		// label leaves that window stranded underneath it, and a user looking for "where do
+		// I see what the server said" has to guess that "status" under "libera" is it.
+		//
+		// Only status, not any window: every other window under a server is a conversation
+		// and belongs at the indented level where its siblings are.
+		head := sidebarRow{heading: true, text: net}
+		rest := names[:0]
+		for _, key := range names {
+			if head.window == "" && winName(key) == "status" {
+				// The row is built by windowRow and then relabelled: the buffer number and the
+				// unread badge belong to the status window, and a row assembled by hand here
+				// would be the one row in the sidebar that quietly lost both.
+				row := m.windowRow(key)
+				row.heading = true
+				row.status = true
+				row.text = net
+				head = row
+				// The number is prefixed to the server name, so "libera" reads as "2 libera" -
+				// /b 2 still reaches it, which is the whole point of a number.
+				if m.settings.BufferNumbers {
+					if n := m.bufferNo[key]; n > 0 {
+						head.text = strconv.Itoa(n) + " " + net
+					}
+				}
+				continue
+			}
+			rest = append(rest, key)
+		}
+		rows = append(rows, head)
+		for _, name := range rest {
 			rows = append(rows, m.windowRow(name))
 		}
 	}
@@ -3013,7 +3048,10 @@ func (m Model) windowColumn(width, n int) []string {
 	activeNet := m.networkOf(m.active)
 	out := make([]string, 0, len(rows))
 	for _, row := range rows {
-		if row.heading {
+		// A heading that is also the network's status buffer is drawn as a window - marker,
+		// badge, selectable - because that is what it is. The only thing it keeps from a
+		// plain heading is that it is not indented: it is the top of its group.
+		if row.heading && !row.status {
 			// A heading is context, not a window: no marker column, no badge, dimmer than a
 			// name, and bold - but not in the title colour - when it is the server the active
 			// window is on. Bold alone is what keeps the heading from competing with the row
@@ -3027,11 +3065,13 @@ func (m Model) windowColumn(width, n int) []string {
 			continue
 		}
 		marker := "  "
-		if row.window == m.active {
+		if row.window != "" && row.window == m.active {
 			marker = "▸ "
 		}
 		indent := ""
-		if grouped {
+		// The status heading is not indented even in a grouped list: indenting it would make
+		// the server look like one of its own channels.
+		if grouped && !row.heading {
 			// Two spaces under the heading: the indent is what makes a heading read as a
 			// heading rather than as a window with no number, and the marker sits inside it so
 			// the active window's arrow lines up with its siblings.
@@ -3052,8 +3092,13 @@ func (m Model) windowColumn(width, n int) []string {
 			line += row.badge
 		}
 		switch {
-		case row.window == m.active:
+		case row.window != "" && row.window == m.active:
 			out = append(out, titleStyle.Render(line))
+		case row.status:
+			// The inactive server row is still a name, not dimmed context: it is a window
+			// like the ones under it, and dimming it would hide the one row that says what
+			// server this whole group belongs to.
+			out = append(out, topicStyle.Bold(true).Render(line))
 		case m.mention[row.window]:
 			out = append(out, mentionStyle.Render(line))
 		default:

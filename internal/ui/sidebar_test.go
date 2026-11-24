@@ -23,6 +23,10 @@ func sidebarFixture(t *testing.T) Model {
 	m, _ = m.Step(Incoming(Line{Window: "status", Network: "libera", Text: "connected", Kind: LineSystem}))
 	m, _ = m.Step(Incoming(Line{Window: "#salotto", Network: "libera", Nick: "alice", Text: "ciao", Kind: LineMessage}))
 	m, _ = m.Step(Incoming(Line{Window: "#other", Network: "freenode", Nick: "bob", Text: "hi", Kind: LineMessage}))
+	// Every real connection says something on its own status buffer - a 001, at least - so a
+	// fixture without one is a network the client has never finished connecting to, and its
+	// server row would be a label with no window behind it.
+	m, _ = m.Step(Incoming(Line{Window: "status", Network: "freenode", Nick: "srv", Text: "connected", Kind: LineSystem}))
 	// The two quiet channels still count as unread, because they arrived while the user was in
 	// status. Cleared here so the layout tests below assert on layout: the badge has its own
 	// test, and a count in the middle of a string comparison is noise that hides the real
@@ -55,12 +59,13 @@ func TestTheSidebarGroupsWindowsUnderTheirServer(t *testing.T) {
 	// Two spaces of indent under the heading, then the marker column: an inactive row is four
 	// cells in, an active one has its arrow in the marker column so the arrow and the names line
 	// up as two ranks of the same list.
+	// Each server row is that network's status buffer, so it is drawn as a window (marker column,
+	// number, name) and not as an inert heading; the channels are indented under it.
 	want := []string{
-		"freenode",
+		"  4 freenode",
 		"    3 #other",
-		"libera",
+		"▸ 1 libera",
 		"    2 #salotto",
-		"  ▸ 1 status",
 	}
 	if len(got) < len(want) {
 		t.Fatalf("the sidebar drew %d rows, want at least %d:\n%s", len(got), len(want), strings.Join(got, "\n"))
@@ -81,7 +86,9 @@ func TestGroupingCanBeTurnedOff(t *testing.T) {
 	m := sidebarFixture(t)
 	m.settings.GroupByServer = false
 	got := sidebarText(m)
-	want := []string{"▸ 1 status", "  2 #salotto", "  3 #other"}
+	// The flat list is the old client: every window in arrival order, no headings, and both
+	// status windows drawn as themselves because there is no server row to stand in for them.
+	want := []string{"▸ 1 status", "  2 #salotto", "  3 #other", "  4 status"}
 	if len(got) < len(want) {
 		t.Fatalf("the flat list drew %d rows, want at least %d:\n%s", len(got), len(want), strings.Join(got, "\n"))
 	}
@@ -91,7 +98,13 @@ func TestGroupingCanBeTurnedOff(t *testing.T) {
 		}
 	}
 	for _, row := range got {
-		if !strings.Contains(row, "1 ") && !strings.Contains(row, "2 ") && !strings.Contains(row, "3 ") {
+		numbered := false
+		for _, n := range []string{"1 ", "2 ", "3 ", "4 "} {
+			if strings.Contains(row, n) {
+				numbered = true
+			}
+		}
+		if !numbered {
 			t.Fatalf("a row without its buffer number survived the layout change: %q", row)
 		}
 	}
@@ -331,39 +344,32 @@ func TestAnUngroupedWindowRidesAlongWithTheGroupedOnes(t *testing.T) {
 	}
 }
 
-// TestHeadingsAreDroppedWhenTheyDoNotFit: a heading per server costs a row, and in a short
-// terminal those rows are the windows. The rule is the one the sidebar already followed for
-// narrow terminals - drop rather than clip - because a list that shows two servers and hides
-// the channels under the second one is worse than the flat list it replaced.
-func TestHeadingsAreDroppedWhenTheyDoNotFit(t *testing.T) {
+// TestGroupingCostsNoRowsForItsHeadings: the server row is the network's status buffer, so a
+// grouped list has exactly as many rows as the flat one. That is not a coincidence worth leaving
+// unasserted: it is the reason the "drop the headings when they do not fit" fallback is no longer
+// needed, and a change that went back to a separate heading row would quietly reintroduce a
+// truncation that hides real windows.
+func TestGroupingCostsNoRowsForItsHeadings(t *testing.T) {
 	m := sidebarFixture(t)
-	// Four rows of content: the flat list of three fits, the grouped list of five does not.
-	m, _ = m.Step(tea.WindowSizeMsg{Width: 100, Height: 9})
-	l := m.layout()
-	if l.contentRows >= 5 || l.contentRows < 3 {
-		t.Fatalf("setup: %d content rows is not the tight window this test needs", l.contentRows)
-	}
-	rows := m.sidebarRows(l.contentRows)
-	for _, row := range rows {
-		if row.heading {
-			t.Fatalf("a heading was drawn in %d rows: %+v", l.contentRows, rows)
-		}
-	}
-	// Every window, not the first contentRows of them: dropping the headings is meant to buy
-	// the rows back for the windows, not to trade one truncation for another.
-	if len(rows) != len(m.windows) {
-		t.Fatalf("the flat list drew %d of %d windows in %d cells", len(rows), len(m.windows), l.contentRows)
+	grouped := m.sidebarRows(20)
+	m.settings.GroupByServer = false
+	flat := m.sidebarRows(20)
+
+	if len(grouped) != len(flat) {
+		t.Fatalf("the grouped list is %d rows and the flat one %d; a heading that costs a row "+
+			"of its own hides a window in a short terminal\ngrouped: %s\nflat: %s",
+			len(grouped), len(flat), dumpRows(grouped), dumpRows(flat))
 	}
 }
 
-// TestClickingAHeadingSelectsNothing: a heading is not a window, so a click on it must do
-// nothing at all. The alternative - it selects its first child - is a click that switches to a
-// window the user did not point at.
+// TestClickingAServerRowOpensThatServersStatus: the server row is a buffer, not a label, so a
+// click on it opens it. What it must never do is open its first child - that is a click that
+// switches to a window the user did not point at.
 //
-// The rows below the heading are checked too, because the bug this guards against is the
-// off-by-one: with the hit-test reading m.order, every row after the first heading selects its
-// neighbour, and a click on #salotto opens #other.
-func TestClickingAHeadingSelectsNothing(t *testing.T) {
+// The rows below it are checked too, because the bug this guards against is the off-by-one: with
+// the hit-test reading m.order, every row after the first heading selects its neighbour, and a
+// click on #salotto opens #other.
+func TestClickingAServerRowOpensThatServersStatus(t *testing.T) {
 	m := sidebarFixture(t)
 	l := m.layout()
 
@@ -371,7 +377,7 @@ func TestClickingAHeadingSelectsNothing(t *testing.T) {
 	rows := m.sidebarRows(l.contentRows)
 	for i, row := range rows {
 		switch {
-		case row.heading && row.text == "freenode":
+		case row.heading && strings.HasSuffix(row.text, "freenode"):
 			headingRow = i
 		case winName(row.window) == "#salotto":
 			salottoRow = i
@@ -385,8 +391,9 @@ func TestClickingAHeadingSelectsNothing(t *testing.T) {
 
 	// WindowAt works in screen coordinates: row 0 is the top border.
 	screen := func(row int) int { return row + 1 }
-	if got := m.WindowAt(3, screen(headingRow)); got != "" {
-		t.Fatalf("a click on the %q heading selected %q", "freenode", got)
+	if got := m.WindowAt(3, screen(headingRow)); winName(got) != "status" || m.networkOf(got) != "freenode" {
+		t.Fatalf("a click on the %q server row selected %q; it is that network's status buffer",
+			"freenode", got)
 	}
 	if got := m.WindowAt(3, screen(salottoRow)); winName(got) != "#salotto" {
 		t.Fatalf("a click on the #salotto row selected %q", got)
@@ -466,7 +473,7 @@ func TestALineInTheActiveWindowStillNamesItsNetwork(t *testing.T) {
 		t.Fatalf("a line with no window left status on network %q, want libera", got)
 	}
 	rows := m.sidebarRows(m.layout().contentRows)
-	if len(rows) == 0 || !rows[0].heading || rows[0].text != "libera" {
+	if len(rows) == 0 || !rows[0].heading || !strings.HasSuffix(rows[0].text, "libera") {
 		t.Fatalf("status is not grouped under its server: %+v", rows)
 	}
 }
@@ -487,7 +494,7 @@ func TestAnUntaggedLineDoesNotUngroupAWindow(t *testing.T) {
 		if winName(row.window) != "#salotto" {
 			continue
 		}
-		if i == 0 || !rows[i-1].heading || rows[i-1].text != "libera" {
+		if i == 0 || !rows[i-1].heading || !strings.HasSuffix(rows[i-1].text, "libera") {
 			t.Fatalf("#salotto is no longer under the libera heading: %+v", rows)
 		}
 		return

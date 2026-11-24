@@ -33,8 +33,9 @@ func TestTheTitleShowsTheNameNotTheKey(t *testing.T) {
 	}
 }
 
-// TestTheSidebarShowsNamesNotKeys: two rows may both say "status" - that is what the headings
-// are for - but neither may say "libera/status", which is not a window name.
+// TestTheSidebarShowsNamesNotKeys: the sidebar names servers, not keys. The two networks' status
+// buffers are now their server rows, so what must never appear is "libera/status" - an internal
+// key, not a window name, and not a server name either.
 func TestTheSidebarShowsNamesNotKeys(t *testing.T) {
 	m := New("status")
 	m, _ = m.Step(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -46,8 +47,16 @@ func TestTheSidebarShowsNamesNotKeys(t *testing.T) {
 	if strings.Contains(joined, "libera/status") || strings.Contains(joined, "freenode/status") {
 		t.Fatalf("the sidebar shows an internal key:\n%s", joined)
 	}
-	if n := strings.Count(joined, "status"); n != 2 {
-		t.Fatalf("expected one status row per network, got %d:\n%s", n, joined)
+	// Each network is one row, and that row is its status buffer: the server name is what is
+	// drawn, because the status buffer of a connection has no name of its own worth showing.
+	for _, net := range []string{"libera", "freenode"} {
+		if !strings.Contains(joined, net) {
+			t.Fatalf("no row for the server %q:\n%s", net, joined)
+		}
+	}
+	if n := strings.Count(joined, "status"); n != 0 {
+		t.Fatalf("the sidebar still draws %d separate status rows; the server row is the status "+
+			"buffer:\n%s", n, joined)
 	}
 }
 
