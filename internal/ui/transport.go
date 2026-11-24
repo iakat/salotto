@@ -62,6 +62,11 @@ type Transport struct {
 	modes  map[string]string
 	active string
 
+	// whois holds the answers being assembled, per nick in lower case. A whois reply arrives as
+	// up to eight numerics and is one answer; collecting them is what lets it be drawn as a
+	// block when it is complete instead of as eight protocol lines. See whois.go.
+	whois map[string]*whoisPending
+
 	// prefsAsked records that this connection has already asked for the
 	// bouncer's settings. Replayed upstream numerics include 001 too, so a bare
 	// verb test would ask once per replayed registration line and, on an empty
@@ -105,6 +110,7 @@ func Dial(addr string) (*Transport, error) {
 		members: make(map[string]map[string]string),
 		topics:  make(map[string]string),
 		modes:   make(map[string]string),
+		whois:   make(map[string]*whoisPending),
 		active:  "status",
 		outq:    make(chan string, 64),
 		msgs:    make(chan tea.Msg, 256),
@@ -301,6 +307,13 @@ func (t *Transport) Command(text string) string {
 				return "PRIVMSG " + target + " :" + msg
 			}
 			return "PRIVMSG " + rest + " :"
+		}
+		if upper == "WHOIS" {
+			// Remember where the answer belongs before it can arrive. The reply is up to eight
+			// numerics later and the user may have moved windows in between; the answer goes
+			// where the question was asked, which is the only place they will look for it.
+			t.noteWhois(strings.TrimSpace(strings.SplitN(rest, " ", 2)[0]))
+			return strings.TrimRight("WHOIS "+rest, " ")
 		}
 		if upper == "TOPIC" {
 			// "/topic" alone is the question "what is this channel's topic", and in the
@@ -894,6 +907,13 @@ func (t *Transport) handle(raw []byte) {
 	// same grey as the MOTD is a refusal the user never reads: the question they
 	// ask afterwards is "why did my message not send", and the answer was on
 	// screen. Numeric replies are 3 digits; anything else is a verb.
+	//
+	// The whois family is the exception, and it is not a rendering nicety: eight raw numerics in
+	// place of one answer is a protocol dump the user cannot read. Collected and drawn as a block
+	// when 318 closes the reply - see whois.go for what each field says in words.
+	if t.handleWhois(verb, params) {
+		return
+	}
 	kind := LineSystem
 	if len(verb) == 3 && verb[0] >= '4' && verb[0] <= '5' {
 		kind = LineError

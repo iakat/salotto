@@ -340,6 +340,51 @@ The second bug also existed one layer down: the transport filed a private messag
 window named after ourselves. It is filed under the other party now: when the sender is us, the
 window is the target.
 
+## A whois answer is one block, not eight numerics
+
+`/whois alice` used to draw the server's numerics raw into `status`:
+
+```
+311 nicholas alice ~a h * :Alice Smith
+319 nicholas alice :#salotto #dev
+312 nicholas alice irc.libera.chat :Libera Chat
+330 nicholas alice alicesmith :is logged in as
+317 nicholas alice 7300 1700000000 :seconds idle, signon time
+318 nicholas alice :End of /WHOIS list
+```
+
+That is not an answer to "who is alice". The numbers are the server's names for fields, the colons
+are separators the wire needs and the reader does not, `7300` makes the reader divide by 600, and
+the last line exists only because the reply had no other way to say it was finished.
+
+Now the family is collected and drawn once, when `318` closes the reply:
+
+```
+alice
+  ~a@host.example (Alice Smith)
+  on #salotto #dev
+  on irc.libera.chat (Libera Chat)
+  logged in as alicesmith
+  idle 2h1m, signed on Tue 14 Nov 22:13
+```
+
+Four decisions hold it up:
+
+- **The answer goes where the question was asked.** Typed in `#salotto`, it is drawn in `#salotto`.
+  The bouncer does not know where the user was looking, so the transport remembers it at send time
+  (`noteWhois`) - and remembers it *then*, because by the time the reply arrives the user may have
+  moved, and the answer belongs where the question was, not where they wandered. A reply to a
+  question this client never asked has no such window and goes to `status`.
+- **An unknown numeric in the family is still drawn raw.** A raw line is worse than a good one and
+  much better than silence; the family is a list of verbs, and anything outside it falls through to
+  the old path.
+- **Two interleaved whois replies stay separate** because the answers are collected per subject,
+  keyed case-insensitively: the wire does not promise to finish one before starting the next.
+- **Idle time is said in hours.** `7300` seconds is a number; `2h1m` is an answer.
+
+The collection is a `map[nick]*whoisPending` on the transport, deleted when `318` draws it - state
+that exists for the length of one exchange, not a second store of anything the bouncer owns.
+
 ## What is deliberately not here yet
 
 - **No WebSocket.** W1 replaces the request-per-page part; the render half in
