@@ -547,3 +547,55 @@ func TestSlashMsgInStatusGoesOutAsACommand(t *testing.T) {
 		t.Fatalf("channel window /msg became %q", got)
 	}
 }
+
+// TestSlashMsgFromTheRuntimeReachesTheWire drives the path the real program uses: keys into
+// the runtime and a fake upstream reading the socket.
+//
+// The screen during the live probe showed "<me> /msg <nick> hello" - a *chat* line - and the
+// server's refusal never arrived. A direct Transport.Command test cannot catch that: it asserts
+// the function, and the function is right. What can be wrong is what the runtime asks it, so
+// this test asks the way the runtime does and reads the wire.
+func TestSlashMsgFromTheRuntimeReachesTheWire(t *testing.T) {
+	for _, window := range []string{"status", "#chan"} {
+		t.Run(window, func(t *testing.T) {
+			Configure()
+			fb := newFakeBouncer(t)
+			tr, err := Dial(fb.ln.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tr.Close()
+			tr.Register("alice", "")
+			p := NewProgram(window, tr)
+			p.Step(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+			for _, ru := range "/msg zz9nosuchnick hello" {
+				if ru == ' ' {
+					p.Step(tea.KeyMsg{Type: tea.KeySpace})
+				} else {
+					p.Step(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ru}})
+				}
+			}
+			p.Step(tea.KeyMsg{Type: tea.KeyEnter})
+
+			deadline := time.After(5 * time.Second)
+			for {
+				select {
+				case line := <-fb.sent:
+					if !strings.Contains(line, "PRIVMSG") {
+						continue
+					}
+					if strings.Contains(line, "/msg") {
+						t.Fatalf("the command went out as chat: %q", line)
+					}
+					if !strings.Contains(line, "PRIVMSG zz9nosuchnick") {
+						t.Fatalf("the command did not reach the wire as addressed: %q", line)
+					}
+					return
+				case <-deadline:
+					t.Fatal("nothing was sent")
+				}
+			}
+		})
+	}
+}

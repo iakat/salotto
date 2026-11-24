@@ -66,14 +66,37 @@ def main():
             if any("401" in l for l in ws.term.lines()):
                 break
 
+        if not any("401" in l for l in ws.term.lines()):
+            print("  (reading again after a further 20s, in case the upstream was slow)")
+            ws.read(time.time() + 20)
+        # Decisive: is the 401 anywhere in the byte stream this client received? If it is in
+        # the bytes but not on the screen, the bouncer delivered it and the rendering is what
+        # is wrong; if it is in neither, the bouncer never sent it to *this* client. Those are
+        # two different bugs and guessing between them wastes a deployment.
+        # Search for the distinctive part of the line, not the bare digits: "401" occurs
+        # inside msgids, timestamps and 005 tokens, so a substring test on it answers yes for
+        # reasons that have nothing to do with this probe. The nick cannot occur anywhere
+        # else.
+        # Not the nick: the client echoes what it typed, so the nick is in the stream before
+        # anything reaches the network. The server's own words are the only ones that can
+        # come from a refusal.
+        in_bytes = b"No such nick" in ws.raw
+        print(f"  the refusal is in the raw stream: {in_bytes}")
         row = next((i for i, l in enumerate(ws.term.lines()) if "401" in l), None)
         if row is None:
-            print("  FAIL no 401 on screen: the refusal never reached the client")
-            for l in [x for x in ws.term.lines()[1:] if x.strip()][-6:]:
+            if not in_bytes:
+                print("  FAIL the refusal never reached this client at all")
+            else:
+                print("  FAIL the refusal arrived but is not drawn")
+            print("  --- the whole screen:")
+            for i, l in enumerate(ws.term.lines()):
+                print(f"   {i}: {l[:96]}")
+            for l in [x for x in ws.term.lines()[1:] if x.strip()][-8:]:
                 print("    ", l[:100])
             ws.close()
             return 1
 
+        print("  header now:", ws.term.lines()[0][:34])
         colours = ws.term.row_colours(row)
         print(f"  line: {ws.term.lines()[row][:96]}")
         print(f"  colours on that row: {sorted(c for c in colours if c is not None)}")
