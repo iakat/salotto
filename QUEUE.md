@@ -712,7 +712,7 @@ constraint on us**, not a bug report we inherit:
 |---|---|---|
 | 1 | Link prefetch global-only, no per-channel/pattern control; request amplification (#4805) | preview only on explicit human action; allowlist; cache; §2.2.1 |
 | 2 | Remote media embedded directly unless server-side caching is enabled; leaks user details (config L125-143) | never embed remote media inline; proxy+cache or nothing |
-| 3 | Search single-channel, cannot jump to result context, slow for heavy users | server-side cross-window search with offsets + context jump (§2.1 W4) |
+| 3 | Search single-channel, cannot jump to result context, slow for heavy users | **fixed in the client**: `/search` opens a walkable result list - arrows move, enter jumps to the hit with context around it, escape leaves without undoing the jump, and any other keystroke closes the list and goes to the input. Cross-window and context jump done; the *server-side* half (offsets over the bouncer's ring, so a client can search further back than it holds) is still §2.1 W4 |
 | 4 | History deletion of "low-value messages" aimed at "data hoarders" (#4799) | no automatic deletion, ever; retention is an explicit operator policy |
 | 5 | SQLite schema stores messages as JSON in a TEXT field (#407 in `messageStorage/sqlite.ts`) | plain files + derived index; `grep` must work |
 | 6 | Cannot rotate through multiple servers of one network; breaks with round-robin DNS (#966) | `AddServer`/`DelServer`/`MoveNetwork` in the backlog (B-side §1.3); DNS round-robin must work by default |

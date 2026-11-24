@@ -454,6 +454,24 @@ type Model struct {
 
 	// settingsRow is the selected row on the settings screen.
 	settingsRow int
+	// searchHits is the result list a /search opened, and searchAt is which hit is selected.
+	//
+	// Search used to end at a numbered list of text in the status window, which answered "did I
+	// spell it right" and left the user to find the line themselves - in a different window,
+	// possibly a thousand lines back, with no way to even know which of two identical-looking rows
+	// was the one they wanted. QUEUE item 3 is exactly that: "cannot jump to result context".
+	//
+	// The list is a mode, like the settings screen: while it is open the arrows walk it, enter
+	// jumps, escape leaves. It is not a separate window because a search is a question about the
+	// windows, not a place the conversation happened.
+	searchHits []SearchResult
+	searchAt   int
+
+	// searchJumpedAt is the index in the target window of the line the user jumped to, or -1.
+	// A search hit is a position, and showing the window without moving the view to it would be
+	// a jump in name only: the user lands at the bottom of a buffer that scrolled weeks ago.
+	searchJumpedAt int
+
 	// windowChosen is whether anything has moved this client off its opening window - the user
 	// switching, a click, or our own JOIN. It is what lets an adopted blob put a fresh client
 	// where the last one left off without dragging a client that is already somewhere else.
@@ -1205,6 +1223,27 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	if m.showSettings {
 		return m.updateSettingsKey(msg)
 	}
+	// The search picker is a mode for the same reason: while it is up the arrows belong to it,
+	// and a keystroke meant for the list must not become text in the input box.
+	if len(m.searchHits) > 0 {
+		switch msg.Type {
+		case tea.KeyEsc:
+			return m.closeSearch(), nil
+		case tea.KeyDown, tea.KeyCtrlN:
+			return m.walkSearch(1), nil
+		case tea.KeyUp, tea.KeyCtrlP:
+			return m.walkSearch(-1), nil
+		case tea.KeyEnter:
+			// Enter commits the hit the walk has already shown, and closes the list: the jump
+			// is done, and leaving the picker up would mean the next keypress goes to a list
+			// the user has finished with.
+			m = m.jumpToHit(m.searchHits[m.searchAt])
+			return m.closeSearch(), nil
+		}
+		// Anything else is a keystroke the list has no use for, so it closes and lets the
+		// conversation have it. Silently swallowing typing is how a mode traps a user.
+		m = m.closeSearch()
+	}
 	switch msg.Type {
 	case tea.KeyEnter:
 		text := strings.TrimSpace(string(m.input))
@@ -1266,7 +1305,7 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// picking one for the user is a guess. Each row names its window, so the next /go
 		// reaches it.
 		if query, ok := searchCommand(text); ok {
-			return m.searchIntoWindow(query), nil
+			return m.openSearch(query), nil
 		}
 		if text == "/close" {
 			// Closing is the mirror of /go and needs the same knowledge of the window list.
@@ -2371,7 +2410,11 @@ var (
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	gapStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	inputStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
-	barStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
+	// selectedStyle marks the row the search picker is on. Reverse video rather than a colour
+	// because it reads as a cursor: a colour alone is invisible to anyone who cannot tell the two
+	// apart, and the whole point of the marker is to say "this is the one".
+	selectedStyle = lipgloss.NewStyle().Reverse(true)
+	barStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 )
 
 // View renders the whole screen: a titled box with the scrollback and an input
@@ -2986,6 +3029,9 @@ func (m Model) bodyLines(width, n int) []string {
 	if width < 1 {
 		width = 1
 	}
+	if len(m.searchHits) > 0 {
+		return m.searchLines(width, n)
+	}
 	lines := m.windows[m.active]
 	end := len(lines) - m.scroll
 	if end > len(lines) {
@@ -3384,6 +3430,46 @@ func (m Model) Search(query string) []SearchResult {
 	return out
 }
 
+// openSearch turns a query into a result list the user can walk.
+//
+// The list replaces the old behaviour of writing the hits into the active window as text. That was
+// a dead end: the answer to "where did somebody say this" is the line, and a numbered list of lines
+// you cannot reach is an answer that costs the user a second search by hand.
+func (m Model) openSearch(query string) Model {
+	if query == "" {
+		return m.appendSystem("usage: /search <text>\n")
+	}
+	hits := m.Search(query)
+	if len(hits) == 0 {
+		// Naming the query matters: "/search sat" returning nothing and "/search satloto"
+		// returning nothing are different problems and the message should say which.
+		return m.appendSystem("no matches for " + query + "\n")
+	}
+	m.searchHits = hits
+	m.searchAt = 0
+	m.searchJumpedAt = -1
+	return m
+}
+
+// walkSearch moves the selection by delta and shows the hit it lands on, so the user sees the
+// context before committing to it. Wrapping keeps a long list usable with one repeated key.
+func (m Model) walkSearch(delta int) Model {
+	if len(m.searchHits) == 0 {
+		return m
+	}
+	n := len(m.searchHits)
+	m.searchAt = ((m.searchAt+delta)%n + n) % n
+	return m.jumpToHit(m.searchHits[m.searchAt])
+}
+
+// closeSearch leaves the result list, staying wherever the last jump took the user. Cancelling a
+// search must not move them back: the walk already showed them the place they were looking for.
+func (m Model) closeSearch() Model {
+	m.searchHits = nil
+	m.searchAt = 0
+	return m
+}
+
 // searchIntoWindow renders the hits of a search into the active window as system lines.
 //
 // It reports the count first, because "3 hits" is the answer to "did I spell it right" and a list
@@ -3434,6 +3520,83 @@ func (m Model) searchIntoWindow(query string) Model {
 		m = m.appendSystem(fmt.Sprintf("  ... and %d more\n", extra))
 	}
 	return m
+}
+
+// searchLines renders the result list the way the conversation is rendered: one row per hit, the
+// selection marked, the window and nick ahead of the text so a hit is placed before it is read.
+//
+// The list scrolls to keep the selection visible rather than showing the first n hits: walking past
+// the bottom of a long result set and watching the highlight leave the screen is how a picker
+// becomes unusable exactly when the search was worth running.
+func (m Model) searchLines(width, n int) []string {
+	out := make([]string, 0, n)
+
+	// The header states the question and the position, so a user who came back to the list
+	// knows what it is and how far along it they are.
+	head := fmt.Sprintf("%d of %d matches", m.searchAt+1, len(m.searchHits))
+	out = append(out, systemStyle.Render(truncateTo(head, width)))
+
+	rows := n - 1
+	if rows < 1 {
+		rows = 1
+	}
+	// Keep the selection on screen.
+	first := 0
+	if m.searchAt >= rows {
+		first = m.searchAt - rows + 1
+	}
+	for i := first; i < len(m.searchHits) && i < first+rows; i++ {
+		hit := m.searchHits[i]
+		nick := hit.Line.Nick
+		if nick == "" {
+			nick = "-"
+		}
+		row := fmt.Sprintf("%s  <%s> %s", hit.Window, nick, hit.Line.Text)
+		row = truncateTo(row, width-2)
+		if i == m.searchAt {
+			out = append(out, selectedStyle.Render("> "+row))
+			continue
+		}
+		out = append(out, "  "+row)
+	}
+	return out
+}
+
+// jumpToHit switches to the window a hit came from and scrolls the view so the hit is on screen.
+//
+// The scroll is expressed the way the renderer already understands it - a number of lines above the
+// bottom - so there is one scrolling mechanism and not a second one for jumps.
+func (m Model) jumpToHit(hit SearchResult) Model {
+	// The window name the hit carries is a display name; SetActive resolves it.
+	m = m.SetActive(hit.Window)
+
+	// Where the line is now. The hit carries a copy, and the same line can appear more than once;
+	// the search walks a window in order, so the hit's own position is recoverable by identity -
+	// and if it is not, landing at the bottom is still the right window, which is the part that
+	// matters for everything the user does next.
+	want := hit.Line
+	idx := -1
+	for i := len(m.windows[m.active]) - 1; i >= 0; i-- {
+		have := m.windows[m.active][i]
+		if have.Nick == want.Nick && have.Text == want.Text && have.Kind == want.Kind {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		m.searchJumpedAt = -1
+		return m
+	}
+	m.searchJumpedAt = idx
+	// Scroll so the hit sits a few lines from the top rather than exactly at it: a match flush
+	// against the frame's edge reads as the first line of the buffer, and the point of arriving
+	// is to read the context around it.
+	const lead = 3
+	m.scroll = len(m.windows[m.active]) - 1 - idx - lead
+	if m.scroll < 0 {
+		m.scroll = 0
+	}
+	return m.clampScroll()
 }
 
 // Nicklist returns the members of the active window, or of a named one. An empty

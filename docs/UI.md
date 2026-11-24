@@ -185,6 +185,37 @@ came back as 4000, and a batch of 700 identical lines over a window holding none
 because a capped scan loses as well as repeats. Tallying once makes the per-line work a map lookup,
 so there is no cap to get wrong.
 
+## A search result is something you can go to
+
+`/search` used to write its hits into the active window as a numbered list of text. That answered
+"did I spell it right" and stopped: the line a user was looking for was in another window, possibly
+a thousand lines back, and the list gave them a name and no way to reach it.
+
+The hits are now a list you walk. `/search <text>` opens it in place of the conversation, the
+arrows move the selection, `enter` commits, `escape` leaves. Moving the selection already moves the
+view, so a hit is read in its context before it is committed to - a picker that only shows text and
+jumps on enter asks the user to choose blind.
+
+Three decisions in that:
+
+- **The list is a mode, not a window.** A search is a question about the windows, not a place the
+  conversation happened; giving it a buffer would put it in the sidebar, in the unread counts, in
+  `/b`, and in the replay, none of which it belongs in.
+- **`escape` does not undo the walk.** The user already found what they were looking for; dragging
+  them back to where they started would hide it again. Leaving the list stays wherever the last hit
+  was.
+- **Any other keystroke closes the list and goes to the input.** A mode that swallows typing traps
+  the user in it, and the first thing anyone does after finding a line is say something about it.
+
+The jump scrolls so the hit sits a few rows below the top rather than exactly at it: a match flush
+against the frame edge reads as the first line of the buffer, and the point of arriving is to read
+around it. A hit is placed by its whole identity - nick, text and kind - because two people can say
+the same words, and finding it by text alone lands on whichever copy is nearer the bottom.
+
+Search still covers only what this client holds in memory. Searching the bouncer's whole ring is
+§2.1 W4 and is a different feature: it needs the daemon to answer, and it is not what "jump to
+result context" was.
+
 ## The window you were in is a setting
 
 A refresh should not land you on `status`. The window a client is looking at travels in the
