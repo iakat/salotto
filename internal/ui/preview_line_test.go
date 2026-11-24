@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -144,11 +145,15 @@ func (f fakeFetcher) Fetch(_ context.Context, rawURL string) (Preview, error) {
 	return p, nil
 }
 
-type recordingFetcher struct{ n int }
+// recordingFetcher counts fetches from the goroutine that does them, so the counter is
+// atomic: the test reads it while a fetch may be in flight, and an unsynchronised int
+// here is a race report that has nothing to do with the model - the kind that teaches
+// people to run -race less often.
+type recordingFetcher struct{ n atomic.Int64 }
 
 func (f *recordingFetcher) Fetch(_ context.Context, rawURL string) (Preview, error) {
-	f.n++
+	f.n.Add(1)
 	return Preview{URL: rawURL, Title: "T", Kind: "link"}, nil
 }
 
-func (f *recordingFetcher) count(context.Context) int { return f.n }
+func (f *recordingFetcher) count(context.Context) int { return int(f.n.Load()) }
