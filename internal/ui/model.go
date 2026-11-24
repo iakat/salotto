@@ -264,12 +264,30 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
+		// The wheel scrolls the conversation. A terminal's scrollback is the emulator's,
+		// but this program runs on the alt screen, where there is no emulator scrollback
+		// to fall back on - so a wheel event has to move the model's own scroll or the
+		// wheel does nothing at all. Three lines a notch is the usual feel.
+		if msg.Action == tea.MouseActionPress {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				return m.scrollBy(3), nil
+			case tea.MouseButtonWheelDown:
+				return m.scrollBy(-3), nil
+			}
+		}
 		// A click in the window list selects that window. The model drew the list, so
 		// the model is what knows where it is; a click handler in the page would be a
 		// second copy of the layout, and the two would disagree the first time a
 		// breakpoint moved.
-		if win := m.WindowAt(msg.X, msg.Y); win != "" {
-			return m.SetActive(win), nil
+		//
+		// Only a press, and only the left button: a wheel notch is also a MouseMsg with
+		// coordinates, and treating it as a click would switch window every time the user
+		// scrolled over the sidebar.
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			if win := m.WindowAt(msg.X, msg.Y); win != "" {
+				return m.SetActive(win), nil
+			}
 		}
 		return m, nil
 
@@ -366,6 +384,25 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if text == "" {
 			return m, nil
 		}
+		// "/go pattern" switches windows. It is resolved here rather than sent, because the
+		// window list is the model's: a bouncer has no idea which windows this client is
+		// showing, so a command sent upstream could only ever be wrong. Fuzzy rather than
+		// exact because the point of the command is to avoid typing the whole name, and a
+		// prefix test would make "/go #sal" and "/go salotto" behave differently for no
+		// reason a user can see.
+		if arg, ok := goCommand(text); ok {
+			if name, found := m.matchWindow(arg); found {
+				return m.SetActive(name), nil
+			}
+			if arg == "" {
+				return m, nil
+			}
+			return m.appendSystem("no window matches " + arg + "\n"), nil
+		}
+		if text == "/close" {
+			// Closing is the mirror of /go and needs the same knowledge of the window list.
+			return m.closeActive(), nil
+		}
 		return m, func() tea.Msg { return Sent{Text: text} }
 
 	case tea.KeyBackspace:
@@ -428,6 +465,137 @@ func (m Model) cycle(delta int) Model {
 	idx = (idx + delta + len(m.order)) % len(m.order)
 	m.active = m.order[idx]
 	m.scroll = 0
+	return m
+}
+
+// scrollBy moves the conversation by n lines, clamped to the buffer. Positive scrolls up
+// into history. The clamp is at both ends because an unclamped scroll is a blank window the
+// user cannot get out of without scrolling back by exactly the same amount.
+func (m Model) scrollBy(n int) Model {
+	m.scroll += n
+	if m.scroll < 0 {
+		m.scroll = 0
+	}
+	if top := len(m.windows[m.active]); m.scroll > top {
+		m.scroll = top
+	}
+	return m
+}
+
+// goCommand parses "/go <pattern>". The argument is everything after the verb, spaces and
+// all: a window name can contain spaces in a query window, so cutting at the first space
+// would silently search for half of what the user typed.
+func goCommand(text string) (arg string, ok bool) {
+	body := strings.TrimPrefix(text, "/")
+	verb, rest, _ := strings.Cut(body, " ")
+	if !strings.EqualFold(verb, "go") {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
+}
+
+// matchWindow fuzzy-matches a window name. It scores rather than filters, so "/go sat"
+// finds "#salotto" and "/go st" finds "status" without either being a special case. An
+// exact match always wins, and an empty pattern matches nothing: "/go" alone is a user who
+// has not finished typing, and jumping to an arbitrary window would be worse than staying.
+func (m Model) matchWindow(pattern string) (string, bool) {
+	if pattern == "" {
+		return "", false
+	}
+	lower := strings.ToLower(pattern)
+	best, bestScore := "", -1
+	for _, name := range m.order {
+		nameLower := strings.ToLower(name)
+		score := fuzzyScore(strings.TrimPrefix(nameLower, "#"), lower)
+		// The name with its "#" included is also tried, so "/go #sal" and "/go sal" are the
+		// same search; a user should not have to know which one this program stores.
+		if s := fuzzyScore(nameLower, lower); s > score {
+			score = s
+		}
+		// The comparison is on the name without its "#" as well, or no channel is ever an
+		// exact match: the stored name is "#sal" and nobody types the sigil.
+		if nameLower == lower || strings.TrimPrefix(nameLower, "#") == strings.TrimPrefix(lower, "#") {
+			score = 1 << 20
+		}
+		if score > bestScore {
+			best, bestScore = name, score
+		}
+	}
+	return best, bestScore >= 0
+}
+
+// fuzzyScore reports how well pattern matches text as a subsequence, higher is better, and
+// -1 when it does not match at all. Matching in order but not contiguously is what makes
+// the command useful for long channel names; the bonuses prefer a prefix run (the common
+// case: "/go sal" for "#salotto") over scattered letters.
+func fuzzyScore(text, pattern string) int {
+	if pattern == "" {
+		return 0
+	}
+	ti, pi, score, run := 0, 0, 0, 0
+	for ti < len(text) && pi < len(pattern) {
+		if text[ti] == pattern[pi] {
+			score += 2
+			if run == pi {
+				// Every character so far has been contiguous from the start.
+				score += 3
+			}
+			if ti == 0 {
+				score += 4
+			}
+			run++
+			pi++
+			ti++
+			continue
+		}
+		run = 0
+		ti++
+		score -= 1
+	}
+	if pi < len(pattern) {
+		return -1
+	}
+	return score
+}
+
+// closeActive removes the current window from the list without telling the server. It is the
+// client-side "I am done looking at this", for a query window whose conversation is over or a
+// channel someone else already parted; a PART is a different thing and still has to be typed.
+func (m Model) closeActive() Model {
+	name := m.active
+	if len(m.order) <= 1 {
+		return m
+	}
+	out := make([]string, 0, len(m.order))
+	for _, w := range m.order {
+		if w != name {
+			out = append(out, w)
+		}
+	}
+	delete(m.windows, name)
+	delete(m.unread, name)
+	delete(m.mention, name)
+	delete(m.nicks, name)
+	m.order = out
+	idx := 0
+	for i, w := range m.order {
+		if w == m.active {
+			idx = i
+			break
+		}
+	}
+	if idx >= len(m.order) {
+		idx = len(m.order) - 1
+	}
+	m.active = m.order[idx]
+	m.scroll = 0
+	return m
+}
+
+// appendSystem puts a note in the active window. It is used for the client's own refusals -
+// "no window matches" and friends - which are not chat and must not be sent anywhere.
+func (m Model) appendSystem(text string) Model {
+	m.append(Line{Window: m.active, Text: text, Kind: LineSystem})
 	return m
 }
 

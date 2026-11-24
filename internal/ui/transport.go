@@ -194,6 +194,25 @@ func (t *Transport) Command(text string) string {
 			}
 			return "PRIVMSG " + rest + " :"
 		}
+		if upper == "TOPIC" {
+			// "/topic" alone is the question "what is this channel's topic", and in the
+			// window of a channel it means that channel. Sent bare it reaches the bouncer
+			// as "TOPIC" with no target, which is a command for the client, not for the
+			// server, and the user gets nothing back. Filling in the window is what every
+			// other client does.
+			t.mu.Lock()
+			window := t.active
+			t.mu.Unlock()
+			if strings.HasPrefix(window, "#") {
+				// "/topic" asks, "/topic <anything>" sets. The test is on whether there is
+				// an argument at all, not on whether it contains a space: a topic is free
+				// text and "timestamps and day rules" is one argument, not two.
+				if rest == "" {
+					return "TOPIC " + window
+				}
+				return "TOPIC " + window + " :" + rest
+			}
+		}
 		return strings.TrimRight(upper+" "+rest, " ")
 	}
 	// Everything else is a salotto bouncer command, sent as the bare verb. A
@@ -492,7 +511,11 @@ func (t *Transport) handle(raw []byte) {
 		// it goes in the window as a line. Both, because "the topic changed" is
 		// exactly the moment a user wants to know what it changed to.
 		fields := strings.SplitN(params, " ", 2)
-		if len(fields) >= 2 {
+		// The channel has to be a channel. Our own "/topic timestamps and day rules" sent
+		// from a channel window is "TOPIC #chan :timestamps and day rules" and parses; a
+		// stray line where the first word is not a channel must not invent a window named
+		// after that word, which is how a window called "timestamps" appeared in the list.
+		if len(fields) >= 2 && strings.HasPrefix(fields[0], "#") {
 			channel := fields[0]
 			topic := strings.TrimPrefix(fields[1], ":")
 			t.setTopic(channel, topic)
@@ -613,6 +636,8 @@ func (t *Transport) windowFor(target, from string) string {
 	// A message to us: the window is the other party. Without knowing our own nick
 	// a NOTICE from the server to us and a PM look identical, so anything that is
 	// not a channel is treated as a query window named after the sender.
+	// A server NOTICE never reaches here: handle() routes it to the status window before
+	// this point, which is what keeps "/msg *status help" answering where the user asked.
 	if from == "" {
 		return "status"
 	}
