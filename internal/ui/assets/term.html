@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>salotto</title>
 <link rel="stylesheet" href="/xterm.css">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#101014">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <style>
   /* The page is the terminal. There is no layout to keep in sync with the TUI because
      there is no layout: the model draws it, and this element is the whole visible UI.
@@ -57,12 +61,28 @@
   }
   #selectmode:hover, #selectmode.on { opacity: 1; }
   #selectmode.on { border-color: #6a6aa8; color: #e6e6f0; }
+  /* The notifications control. Same reasoning as select: the page owns the one thing the
+     terminal cannot say, which here is "this device can be told about a mention while the
+     tab is closed". It is a second small button and it only appears once the service worker
+     is registered, so a browser without push never sees a dead control. */
+  #notify {
+    position: fixed; z-index: 20;
+    left: calc(8px + env(safe-area-inset-left));
+    bottom: calc(8px + env(safe-area-inset-bottom));
+    padding: 6px 10px; border-radius: 4px;
+    border: 1px solid #3a3a55; background: #1c1c2a; color: #b9b9cc;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    cursor: pointer; opacity: 0.55; display: none;
+  }
+  #notify.on { opacity: 1; }
+  #notify.on { border-color: #3ad08a; color: #e6e6f0; }
 </style>
 </head>
 <body>
 <div id="term"></div>
 <div id="banner"></div>
 <button id="selectmode" title="select text to copy">&#8599; select</button>
+<button id="notify" title="notify this device about mentions">&#9787; notify</button>
 <script src="/xterm.js"></script>
 <script src="/term.js"></script>
 </body>

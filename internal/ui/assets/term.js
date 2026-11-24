@@ -291,4 +291,110 @@
   connect();
   setTimeout(fit, 0);
   setTimeout(fit, 250);
+
+  // Push notifications, registered once the terminal is up: a browser whose terminal never
+  // connected should not end up with a worker, and the button should not appear if it cannot
+  // work. Every failure here is silent on purpose - notifications are an addition to a client
+  // that already works, and a modal about push permissions over a live conversation is worse
+  // than no notifications.
+  setupNotifier();
 })();
+
+// setupNotifier wires the notify button.
+//
+// The button is the permission gate. Browsers require a user gesture for
+// Notification.requestPermission(), so a page that asks on load either gets a prompt the user
+// dismisses out of surprise or gets refused permanently by a policy - and a refused permission
+// cannot be asked for again from the page. So the request happens on click, which is also the
+// only moment the user has said they want this.
+function setupNotifier() {
+  var btn = document.getElementById("notify");
+  if (!btn) return;
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+    return;
+  }
+
+  var reg = null;
+
+  fetch("/push/status", { cache: "no-store" })
+    .then(function (r) { return r.json(); })
+    .then(function (st) {
+      if (!st || !st.enabled) return; // nothing to offer
+      btn.style.display = "block";
+      if (st.devices > 0) btn.classList.add("on");
+      navigator.serviceWorker
+        .register("/sw.js", { scope: "/" })
+        .then(function (r) { reg = r; return navigator.serviceWorker.ready; })
+        .then(function (r) {
+          reg = r;
+          return reg.pushManager.getSubscription();
+        })
+        .then(function (sub) {
+          if (sub) btn.classList.add("on");
+        })
+        .catch(function () {});
+    })
+    .catch(function () {});
+
+  btn.addEventListener("click", function () {
+    if (btn.dataset.busy === "1") return;
+    btn.dataset.busy = "1";
+    subscribePush(reg)
+      .then(function (ok) {
+        if (ok) {
+          btn.classList.add("on");
+          btn.textContent = "\u2713 notify";
+        }
+      })
+      .finally(function () { btn.dataset.busy = "0"; });
+  });
+}
+
+// subscribePush asks for permission, subscribes, and POSTs the subscription.
+//
+// The applicationServerKey has to be bytes, not the base64url string: passing the string is the
+// single most common way this silently fails, because the browser accepts it and then throws
+// "InvalidAccessError" from somewhere else.
+function subscribePush(reg) {
+  if (!reg) {
+    return navigator.serviceWorker.ready.then(function (r) {
+      reg = r;
+      return subscribePush(reg);
+    });
+  }
+  return Notification.requestPermission()
+    .then(function (perm) {
+      if (perm !== "granted") return false;
+      return fetch("/push/vapid", { cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (v) {
+          if (!v || !v.key) return false;
+          var key = b64urlToBytes(v.key);
+          return reg.pushManager
+            .subscribe({ userVisibleOnly: true, applicationServerKey: key })
+            .then(function (sub) {
+              var j = sub.toJSON();
+              return fetch("/push/subscribe", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  endpoint: sub.endpoint,
+                  p256dh: j.keys.p256dh,
+                  auth: j.keys.auth,
+                }),
+              });
+            })
+            .then(function (r) { return r.ok; });
+        });
+    })
+    .catch(function () { return false; });
+}
+
+function b64urlToBytes(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  var bin = atob(s);
+  var out = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}

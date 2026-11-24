@@ -96,6 +96,13 @@ type Config struct {
 	// ScriptTimeoutMS is the per-call wall clock budget in milliseconds. Zero means the
 	// default; negative means no deadline, which exists for the tests and not for operators.
 	ScriptTimeoutMS int
+	// PushURL is the web front end's /push/notify endpoint. Empty means notifications are
+	// off, which is the default: a bouncer has no business knowing a front end exists unless
+	// the deployment says so.
+	PushURL string
+	// PushToken authorises the call. Without one the endpoint refuses everything, because an
+	// open send endpoint is a way to buzz the user's phone from anywhere.
+	PushToken string
 	// ScriptHookedLines enables the on_line hook. Off by default because it runs script code
 	// on every incoming line, which is the one hook that can make the daemon slow.
 	ScriptHookedLines bool
@@ -325,6 +332,10 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.TLSKey, err = parseString(value)
 	case "server_name":
 		c.ServerName, err = parseString(value)
+	case "push_url":
+		c.PushURL, err = parseString(value)
+	case "push_token":
+		c.PushToken, err = parseString(value)
 	case "script_dir":
 		c.ScriptDir, err = parseString(value)
 	case "script_steps":

@@ -158,6 +158,13 @@ func run() int {
 		maxClients = 64
 	}
 	hub := facade.NewHub(maxClients)
+	// Notifications are off unless an endpoint is configured: the bouncer has no business
+	// knowing a web front end exists unless the deployment says so.
+	pushNotify = newNotifier(cfg.PushURL, cfg.PushToken)
+	if pushNotify != nil {
+		logger.Info("push notifications enabled", "endpoint", cfg.PushURL)
+	}
+
 	// Scripting is off unless a directory is configured: a daemon that loads code from disk
 	// by default is a daemon whose deployment changes what the process does by writing a file.
 	scripts := newScripting(cfg.ScriptDir, cfg.ScriptSteps, scriptTimeout(cfg.ScriptTimeoutMS), func(msg string) {
@@ -204,6 +211,9 @@ func run() int {
 
 	mgr := newNetmgr(cfg, srv, logger, reg, bindState, ctx)
 	for i := range cfg.Networks {
+		if ownNick == "" {
+			ownNick = cfg.Networks[i].Nick
+		}
 		if err := mgr.Start(cfg.Networks[i]); err != nil {
 			logger.Error("network start failed", "network", cfg.Networks[i].Name, "err", err)
 			mgr.StopAll()
@@ -400,6 +410,17 @@ func run() int {
 // network manager for an optional feature would touch every call site for no benefit.
 var lineHook *scripting
 
+// pushNotify posts mentions to the web front end. It is package-level for the same reason
+// lineHook is: dispatchRouted is package-level and threading an optional dependency through
+// every call site costs more than the variable does.
+var pushNotify *notifier
+
+// ownNick is the nick this daemon registers with on the first network, for the mention check.
+// It is set at startup from the configuration rather than read from the connection, because a
+// notification must not depend on an upstream being up: a bouncer that is reconnecting is
+// exactly when nobody is watching and a mention is worth a buzz.
+var ownNick string
+
 // scriptHookedLines is whether on_line runs at all. The hook is off by default: it runs script
 // code on every incoming line, which is the one hook that can make the daemon slow, and a
 // feature that costs something per line should be something the operator turned on.
@@ -451,6 +472,16 @@ func dispatchRoutedFrom(srv *facade.Server, netName string, windows []string, li
 		return
 	}
 	srv.BroadcastWindowsFrom(netName, windows, 0, line, time.Now().UnixNano(), source)
+	// A mention with nobody attached is the one case a notification exists for. Checked after
+	// the broadcast so an attached client sees the line before the phone buzzes, and the send
+	// happens on the notifier's own goroutine, so a slow push service cannot delay a line.
+	//
+	// No status-window check is needed here: the nonStatus guard above already returned for a
+	// line whose only window is status, so every window reaching this point is a real one.
+	// A second check would be a line no test could make fail.
+	if pushNotify != nil && source == nil && srv.Attached() == 0 && len(windows) > 0 {
+		pushNotify.onMention(netName, windows[0], string(line), ownNick, false)
+	}
 }
 
 // dispatchEntries is dispatchRouted for a caller that has the parsed entries

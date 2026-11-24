@@ -36,6 +36,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/iakat/salotto/internal/push"
 	"github.com/iakat/salotto/internal/ui"
 )
 
@@ -51,6 +52,9 @@ func run() int {
 	nick := flag.String("nick", "salotto", "nick to register with the bouncer")
 	window := flag.String("window", "", "initial window (default: the nick's own window)")
 	tuiPath := flag.String("tui", "", "path to the salotto-tui binary (default: beside this binary)")
+	vapidPath := flag.String("vapid", "", "path to the VAPID key file; enables push notifications")
+	pushSubject := flag.String("vapid-subject", "mailto:admin@localhost", "contact for the push service")
+	subsPath := flag.String("push-subscriptions", "", "path to the subscription store")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -104,8 +108,44 @@ func run() int {
 		return cmd
 	}
 
+	// Push is opt-in: no key path means no key is generated, no subscription store is opened,
+	// and the /push endpoints answer "not configured". Generating a key by default would put
+	// a private key on disk for a deployment that never asked for notifications.
+	var pushSrv *push.Server
+	if *vapidPath != "" {
+		vapid, err := push.LoadVAPID(*vapidPath, *pushSubject)
+		if err != nil {
+			slog.Error("cannot load the push key", "err", err)
+			return 1
+		}
+		storePath := *subsPath
+		if storePath == "" {
+			storePath = filepath.Join(filepath.Dir(*vapidPath), "push-subscriptions.json")
+		}
+		store, err := push.OpenStore(storePath)
+		if err != nil {
+			slog.Error("cannot open the subscription store", "err", err)
+			return 1
+		}
+		pushSrv = push.NewServer(vapid, store)
+		slog.Info("push enabled", "key", vapid.PublicKey(), "subscriptions", store.Len())
+	}
+
+	term := ui.NewTermServer(cmdFor)
+	handler := ui.TermHandler(term)
+	if pushSrv != nil {
+		// One mux, so /push and the terminal are one origin. A service worker registered from
+		// this page can only control this origin, which is exactly the scope it needs.
+		mux := http.NewServeMux()
+		// One prefix, because the push package owns every /push path and splitting them
+		// across four registrations only adds places for a path to be forgotten.
+		mux.Handle("/push/", pushSrv.Handler())
+		mux.Handle("/", handler)
+		handler = mux
+	}
+
 	srv := &http.Server{
-		Handler:           ui.TermHandler(ui.NewTermServer(cmdFor)),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
