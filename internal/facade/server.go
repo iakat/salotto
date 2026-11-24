@@ -619,7 +619,13 @@ type client struct {
 	nick string
 	user string
 
-	caps           uint32
+	caps uint32
+	// label is the @label tag of the line currently being handled, if the client
+	// negotiated labeled-response. Every line the handler writes back carries it, which
+	// is the whole point of the capability: the client matches answers to questions.
+	// Cleared after the handler returns so a later unsolicited line is not tagged with a
+	// label that belongs to a question nobody is asking any more.
+	label          string
 	capNegotiating bool
 	capEnded       bool
 	registered     bool
@@ -696,6 +702,18 @@ func (c *client) readLoop() {
 }
 
 func (c *client) handle(line, rest []byte) bool {
+	// labeled-response: the label belongs to this one command and to every line its answer
+	// produces. Set here rather than in the reader so a recursive dispatch (a
+	// "PRIVMSG *status <cmd>" rewritten into a bare verb) keeps the label it arrived with.
+	if c.labeledResponse() {
+		if tags, _ := ircline.Tags(line); tags != nil {
+			if v := ircline.TagValue(tags, []byte("label")); len(v) > 0 {
+				saved := c.label
+				c.label = string(v)
+				defer func() { c.label = saved }()
+			}
+		}
+	}
 	// "PRIVMSG *status <command>" is how ZNC is driven from a client that does not know
 	// bouncer commands are bare verbs - which is every client that offers a "/msg" box.
 	// The whole message is rewritten into the command it names and dispatched again, so
@@ -753,6 +771,8 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleDisableChan(rest, false)
 	case ircline.IsVerb(rest, "SETBUFFER"):
 		return c.handleSetBuffer(rest)
+	case ircline.IsVerb(rest, "CHATHISTORY"):
+		return c.handleChatHistory(rest)
 	case ircline.IsVerb(rest, "HELP"):
 		return c.handleHelp(rest)
 	case ircline.IsVerb(rest, "LISTCHANS"):
@@ -988,6 +1008,12 @@ func (c *client) handleCapReq(args []byte) bool {
 		c.sub.SetIdentity(c.nick, c.extendedJoin())
 	}
 	return c.send(":", c.srv.cfg.ServerName, " CAP * ACK :", string(ack[:ackN]))
+}
+
+// labeledResponse reports whether the client negotiated labeled-response.
+func (c *client) labeledResponse() bool {
+	idx := capIndex([]byte("labeled-response"))
+	return idx >= 0 && c.caps&(1<<uint(idx)) != 0
 }
 
 func (c *client) extendedJoin() bool {
@@ -1304,6 +1330,15 @@ func (c *client) notConnected() bool {
 
 func (c *client) send(parts ...string) bool {
 	b := c.scratch[:0]
+	// labeled-response: the label rides on every line the labelled command produces. It is
+	// prepended here rather than at each call site because one forgotten site is a reply the
+	// client cannot match to anything, which is precisely the bug the capability exists to
+	// prevent.
+	if c.label != "" {
+		b = append(b, '@', 'l', 'a', 'b', 'e', 'l', '=')
+		b = append(b, c.label...)
+		b = append(b, ' ')
+	}
 	for _, p := range parts {
 		b = append(b, p...)
 	}
@@ -1314,6 +1349,11 @@ func (c *client) send(parts ...string) bool {
 
 func (c *client) sendBytes(prefix []string, tail []byte) bool {
 	b := c.scratch[:0]
+	if c.label != "" {
+		b = append(b, '@', 'l', 'a', 'b', 'e', 'l', '=')
+		b = append(b, c.label...)
+		b = append(b, ' ')
+	}
 	for _, p := range prefix {
 		b = append(b, p...)
 	}

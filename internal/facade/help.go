@@ -43,6 +43,7 @@ var statusCommands = []commandDoc{
 	{"DISCONNECT", "", "drop the upstream connection"},
 	{"ENABLECHAN", "<#chan>", "keep a window again"},
 	{"HELP", "[command]", "this list, or what one command does"},
+	{"CHATHISTORY", "LATEST|BEFORE <target> <ts> <n>", "buffered history for a window, as an IRCv3 batch"},
 	{"LISTCHANS", "", "every window with its status"},
 	{"LISTCLIENTS", "", "the clients attached to this bouncer"},
 	{"LISTNETWORKS", "", "the configured networks"},
