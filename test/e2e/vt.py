@@ -21,6 +21,12 @@ class Term:
     def __init__(self, cols=100, rows=30):
         self.cols, self.rows = cols, rows
         self.grid = [[" "] * cols for _ in range(rows)]
+        # fg is the foreground colour of each cell, in parallel with grid. It exists because
+        # this emulator used to say "colour is not a feature this measures", and that is how
+        # three separate colour checks passed while the screen was grey: a frame contains
+        # escape codes whatever colour it draws. A cell that was never written keeps None.
+        self.fg = [[None] * cols for _ in range(rows)]
+        self.cur_fg = None
         self.x = self.y = 0
         self.saved = (0, 0)
         self.buf = b""
@@ -94,12 +100,15 @@ class Term:
                     self.x = 0
                     self.newline()
                 self.grid[self.y][self.x] = ch
+                self.fg[self.y][self.x] = self.cur_fg
                 self.x += 1
 
     def newline(self):
         if self.y + 1 >= self.rows:
             self.grid.pop(0)
             self.grid.append([" "] * self.cols)
+            self.fg.pop(0)
+            self.fg.append([None] * self.cols)
         else:
             self.y += 1
 
@@ -111,6 +120,7 @@ class Term:
             modes = {int(p) for p in params[1:].split(";") if p.isdigit()}
             if modes & {1049, 1047, 47}:
                 self.grid = [[" "] * self.cols for _ in range(self.rows)]
+                self.fg = [[None] * self.cols for _ in range(self.rows)]
                 self.x = self.y = 0
             return
         args = [int(p) if p else 0 for p in params.replace(":", ";").split(";")] if params else []
@@ -155,7 +165,7 @@ class Term:
                 self.grid = [[" "] * self.cols for _ in range(self.rows)]
                 self.x = self.y = 0
         elif final == "m":
-            pass  # colour is not a feature this measures
+            self.sgr(args)
         elif final == "L":
             for _ in range(max(1, n)):
                 self.grid.insert(self.y, [" "] * self.cols)
@@ -168,6 +178,33 @@ class Term:
             row = self.grid[self.y]
             for i in range(self.x, min(self.cols, self.x + max(1, n))):
                 row[i] = " "
+
+    def sgr(self, args):
+        """Apply a Select Graphic Rendition. Only foreground colour is tracked: it is the one
+        attribute the UI uses to mean something (an error, a mention, a nick), and the rest
+        would be a graphics engine nobody asked for."""
+        args = args or [0]
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == 0 or a == 39:
+                self.cur_fg = None
+            elif a == 38 and i + 2 < len(args) and args[i + 1] == 5:
+                self.cur_fg = args[i + 2]
+                i += 2
+            elif 30 <= a <= 37:
+                self.cur_fg = a - 30
+            elif 90 <= a <= 97:
+                self.cur_fg = a - 90 + 8
+            i += 1
+
+    def row_colours(self, row):
+        """The distinct foreground colours on a screen row, ignoring blank cells."""
+        out = set()
+        for i, ch in enumerate(self.grid[row]):
+            if ch.strip():
+                out.add(self.fg[row][i])
+        return out
 
     def esc(self, ch):
         if ch == "7":

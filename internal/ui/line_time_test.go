@@ -214,3 +214,28 @@ func TestAnErrorIsDrawnInItsOwnColour(t *testing.T) {
 		t.Fatalf("a plain status line was drawn as an error: %q", s)
 	}
 }
+
+// TestATaggedRefusalIsStillARefusal uses the exact line a real upstream sent, tags and all.
+//
+// The earlier mention-parsing bug was found because every fixture was untagged and the code
+// expected untagged input: a fixture that encodes the same assumption as the code cannot catch
+// that assumption. So this one is copied verbatim from the live capture.
+func TestATaggedRefusalIsStillARefusal(t *testing.T) {
+	tr := newTestTransport(t)
+	tr.handle([]byte("@time=2026-11-24T06:08:08.680Z :irc.ch-test.katia.sh 401 alice salotto-probe-no-such-nick-zz9 :No such nick"))
+	line, ok := nextIncoming(t, tr)
+	if !ok {
+		t.Fatal("nothing came out of the transport")
+	}
+	if line.Kind != LineError {
+		t.Fatalf("a tagged 401 was classified as %v, not as an error", line.Kind)
+	}
+	if !strings.Contains(line.Text, "No such nick") {
+		t.Fatalf("the reason was lost: %q", line.Text)
+	}
+	// The timestamp has to survive too: a refusal shown at the wrong time is a refusal
+	// sorted into the wrong place in a long replay.
+	if line.Time.IsZero() {
+		t.Fatal("the refusal lost its server-time")
+	}
+}

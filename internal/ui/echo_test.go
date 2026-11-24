@@ -526,3 +526,24 @@ func TestMsgStatusReachesTheBouncerAsACommand(t *testing.T) {
 		}
 	}
 }
+
+// TestSlashMsgInStatusGoesOutAsACommand pins a live bug: "/msg <nick> <text>" typed at the
+// status window was sent as chat.
+//
+// The screen said so plainly - "<me> /msg salotto-probe-no-such-nick-zz9 hello" - so the slash
+// had reached the model and the transport still turned the line into a PRIVMSG. The bouncer
+// therefore had nothing to refuse, no 401 came back, and the error path looked broken. The
+// transport has a branch for /msg; this asserts on the wire, because that is the only place
+// the two spellings differ.
+func TestSlashMsgInStatusGoesOutAsACommand(t *testing.T) {
+	tr := newTestTransport(t)
+	tr.SetActive("status")
+	if got := tr.Command("/msg somebody hello there"); got != "PRIVMSG somebody :hello there" {
+		t.Fatalf("status window /msg became %q", got)
+	}
+	// And in a channel it must be the same: /msg is addressed, not contextual.
+	tr.SetActive("#chan")
+	if got := tr.Command("/msg somebody hello there"); got != "PRIVMSG somebody :hello there" {
+		t.Fatalf("channel window /msg became %q", got)
+	}
+}
