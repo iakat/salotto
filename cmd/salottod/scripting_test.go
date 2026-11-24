@@ -298,3 +298,68 @@ func TestTheReloaderSeesThroughASymlink(t *testing.T) {
 	}
 	t.Fatal("the reload timer never picked up the new version")
 }
+
+// TestAHookErrorIsVisibleToTheOperator is the third scripting guarantee, and it was the one that
+// was broken in production.
+//
+// A script that raises an error on every seventh line is contained correctly - the daemon keeps
+// serving, the line is not lost - and the error went nowhere: noteHookError incremented a
+// counter that no command printed, so SCRIPTLOG said "no script output yet" while the hook was
+// failing on every seventh line. "No silent failure" has to mean visible, not counted.
+func TestAHookErrorIsVisibleToTheOperator(t *testing.T) {
+	dir := t.TempDir()
+	body := "def on_line(network, line):\n    fail(\"deliberate\")\n"
+	if err := os.WriteFile(filepath.Join(dir, "bad.star"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sc := newScripting(dir, 0, 0, nil)
+	if sc == nil {
+		t.Fatal("no scripting")
+	}
+	defer sc.Stop()
+
+	sc.Engine().RunAllHooks("on_line", starlark.String("net"), starlark.String("line"))
+
+	logs := sc.ScriptLog()
+	if len(logs) == 0 {
+		t.Fatal("a failing hook produced nothing an operator can see")
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "deliberate") {
+		t.Fatalf("the report does not carry the script's own message, so an operator cannot tell what failed: %v", logs)
+	}
+}
+
+// TestAScriptCannotCrashTheDaemon raises a Go-level panic from inside a builtin, which is the
+// failure a Starlark error is not: a bug in the host, not in the script. The recover has to be
+// above the builtin call, and it has to leave the daemon able to run the next line.
+func TestAScriptCannotCrashTheDaemon(t *testing.T) {
+	dir := t.TempDir()
+	// explode is a builtin that panics the way a buggy host function would.
+	body := "def on_line(network, line):\n    explode()\n"
+	if err := os.WriteFile(filepath.Join(dir, "boom.star"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sc := newScripting(dir, 0, 0, nil)
+	if sc == nil {
+		t.Fatal("no scripting")
+	}
+	defer sc.Stop()
+	sc.Engine().Predeclare("explode", starlark.NewBuiltin("explode", func(_ *starlark.Thread, _ *starlark.Builtin, _ starlark.Tuple, _ []starlark.Tuple) (starlark.Value, error) {
+		panic("a bug in the host, not in the script")
+	}))
+	// Predeclare then reload: a builtin added after the load is an unresolved name, so the
+	// script is sitting in its error state and the hook is never reached. Without this the test
+	// passes for the wrong reason - a script that did not compile also cannot crash anything.
+	sc.Engine().Reload()
+
+	// The call must return rather than take the process down. A test binary that panics here
+	// fails loudly, which is the point.
+	sc.Engine().RunAllHooks("on_line", starlark.String("net"), starlark.String("line"))
+
+	// And the daemon is still usable: a second call also returns.
+	sc.Engine().RunAllHooks("on_line", starlark.String("net"), starlark.String("another line"))
+
+	if logs := strings.Join(sc.ScriptLog(), "\n"); !strings.Contains(logs, "hook error") {
+		t.Fatalf("a host panic was contained but not reported: %v", logs)
+	}
+}

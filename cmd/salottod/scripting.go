@@ -232,6 +232,16 @@ func (s *scripting) noteHookError(err error) {
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.errs++
-	s.mu.Unlock()
+	// Recorded in the same ring scripts log into, and rate limited by the ring's own bound.
+	// A counter nobody can read is the same as no report at all: found live, where a script
+	// raised an error on every seventh line, the daemon correctly refused to die, and
+	// SCRIPTLOG said "no script output yet". The guarantee this violates is the third one -
+	// a bad script must not fail silently - and the fix is that the failure has somewhere to
+	// appear, not a louder counter.
+	s.lines = append(s.lines, "hook error: "+err.Error())
+	if len(s.lines) > 200 {
+		s.lines = s.lines[len(s.lines)-200:]
+	}
 }
