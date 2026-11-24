@@ -118,10 +118,15 @@ Both behaviours are `/fset` settings (`group_by_server`, `buffer_numbers`),
 defaulting to on; `group_by_server=off` is the flat arrival-order list, drawn by
 the same renderer.
 
-The limit worth knowing: window *identity* is still the name, so two networks'
-`status` are one window. The grouping makes that collision visible instead of
-silent, and QUEUE.md §2.1.1 stays open until the key carries the network through
-`/go`, the unread maps and the settings screen too.
+Window *identity* carries the network: `windowKey(network, name)` is `"network/name"` when the
+network is known and the bare name when it is not, and every map the model keeps about a window
+is keyed by it. So two networks' `status` are two windows, with two numbers and two scrollbacks
+(QUEUE.md §2.1.1). The key is internal: the title row, the sidebar, the buffer list and search
+hits render `winName`, and `CHATHISTORY` sends the bare name because the bouncer resolves the
+network itself. A window whose network is learnt late is rekeyed by `migrateKey`, which moves
+every map at once and keeps the buffer number the user has already learnt. When two networks
+hold the same name the buffer list prints `status (libera)`, and that spelling is a valid `/go`
+target, so the list never names a window nobody can type back in.
 
 ## What is deliberately not here yet
 

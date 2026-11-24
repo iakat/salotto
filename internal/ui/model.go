@@ -258,11 +258,18 @@ type Model struct {
 	//
 	// A window with no entry is the fallback case - a client talking to a plain IRCd, which
 	// has no networks to name - and it is drawn, just not grouped.
+	//
+	// Keyed by window key, not by name: two networks can both hold "status", and a map keyed
+	// by name can only remember the last one. That is what made one network's status window
+	// unreachable while the sidebar showed a single row for both.
 	netOf map[string]string
 
 	// bufferNo is the weechat-style number of each window. The number is identity, not
 	// position: it is assigned the first time the model sees the window and never changes,
 	// so a user who has learnt that #salotto is 3 keeps 3 when other buffers open and close.
+	//
+	// Keyed by window key, so two networks' status windows get two numbers rather than
+	// sharing one - a shared number is a /b that lands somewhere the user did not ask for.
 	bufferNo map[string]int
 
 	input   []rune
@@ -292,6 +299,116 @@ type Model struct {
 	// never claim a link the transport has not got.
 	connected bool
 	status    string
+}
+
+// windowKey is the identity of a window inside the model.
+//
+// It is "network/name" when the network is known and the bare name when it is not. The
+// separator is a "/" because an IRC channel name cannot contain one, and a query or "status"
+// cannot either, so no window name collides with the scheme. A client of a plain IRCd stays on
+// bare names for every window, which is exactly the behaviour it had before networks existed.
+//
+// Why the network is part of identity at all: the bouncer keys windows by (network, name) and
+// sends each network's registration replay in its own batch, so two networks genuinely have
+// two windows called "status". Keying the client by name alone merged them - whichever replay
+// arrived last won, and errors and MOTDs from the other network were delivered by the bouncer
+// and dropped on the floor here. That is a data-loss bug, not a display preference
+// (QUEUE.md 2.1.1).
+func windowKey(network, name string) string {
+	if network == "" || name == "" {
+		return name
+	}
+	return network + "/" + name
+}
+
+// keyWindow splits a window key back into its network and name, "" for a bare-name key.
+//
+// The name is everything after the first "/" rather than after the last: a window name may
+// contain a "/" and only the network half is guaranteed not to.
+func keyWindow(key string) (network, name string) {
+	if i := strings.Index(key, "/"); i >= 0 {
+		return key[:i], key[i+1:]
+	}
+	return "", key
+}
+
+// winName is the display name of a window key: the name without its network.
+//
+// Everything the user reads goes through this, so two rows can both say "status" under two
+// headings instead of claiming to be "libera/status", which no IRC client has ever shown.
+func winName(key string) string {
+	_, name := keyWindow(key)
+	return name
+}
+
+// keyFor resolves a window name to the key the model stores it under.
+//
+// A name that is already a stored key is returned unchanged, so a click, a /go or a web
+// request that passed a key through does not get it prefixed twice. Otherwise the network is
+// looked up by name; when that is ambiguous or unknown the bare name is the answer, which is
+// what keeps an untagged client - whose keys are all bare names - working unchanged.
+func (m Model) keyFor(name string) string {
+	if name == "" {
+		return ""
+	}
+	if _, seen := m.windows[name]; seen {
+		return name
+	}
+	// "status (libera)" is the form the buffer list and search hits show when two networks
+	// hold the same name, and it has to be a valid /go target: a jump target the user cannot
+	// type back in is a dead end. Parsed here, next to the bare-name lookup, so every entry
+	// point accepts the same two spellings.
+	if base, net, ok := splitQualifiedName(name); ok {
+		if key := windowKey(net, base); key == name {
+			return name
+		}
+		if _, live := m.windows[windowKey(net, base)]; live {
+			return windowKey(net, base)
+		}
+	}
+	if net := m.netOfName(name); net != "" {
+		return windowKey(net, name)
+	}
+	return name
+}
+
+// splitQualifiedName parses the "name (network)" form the buffer list and search hits print.
+// It requires the parenthesised suffix at the very end and a non-empty network, so an ordinary
+// window name containing brackets is left alone.
+func splitQualifiedName(name string) (base, network string, ok bool) {
+	if !strings.HasSuffix(name, ")") {
+		return "", "", false
+	}
+	i := strings.LastIndex(name, " (")
+	if i <= 0 {
+		return "", "", false
+	}
+	base = name[:i]
+	network = name[i+2 : len(name)-1]
+	if base == "" || network == "" {
+		return "", "", false
+	}
+	return base, network, true
+}
+
+// netOfName finds the network a bare window name belongs to, refusing to guess between two.
+// A bare "status" with two networks on it is ambiguous, and picking one is how a /go lands in
+// the wrong server's window.
+func (m Model) netOfName(name string) string {
+	found, count := "", 0
+	for key, net := range m.netOf {
+		if winName(key) != name {
+			continue
+		}
+		if net != found {
+			found = net
+			count++
+		}
+	}
+	if count == 1 {
+		return found
+	}
+	return ""
 }
 
 // New returns a model showing one window. window is the initial window name
@@ -409,6 +526,10 @@ func (m Model) Init() tea.Cmd { return nil }
 // Active returns the window currently shown.
 func (m Model) Active() string { return m.active }
 
+// ActiveName is the active window's display name, without its network. The title row and
+// anything a user reads uses this: "libera/status" is how the model tells two windows apart,
+// not a name any IRC client has ever shown.
+
 // SetActive switches to a named window, remembering it in the order list so a
 // window can be selected before any line has arrived in it. A web request knows
 // a window name rather than a keystroke, and without this the browser could only
@@ -417,6 +538,10 @@ func (m Model) SetActive(name string) Model {
 	if name == "" {
 		return m
 	}
+	// Resolved to a key: a web request, a click and a /go all name a window the way a user
+	// does, and which server it is on is the model's knowledge. A name that is already a key
+	// passes through unchanged.
+	name = m.keyFor(name)
 	if _, seen := m.windows[name]; !seen {
 		m.windows[name] = nil
 		m.order = append(m.order, name)
@@ -440,6 +565,12 @@ func (m Model) SetActive(name string) Model {
 // an earlier line said. Forgetting would move a channel back to the ungrouped section as
 // soon as an untagged line arrived, which is a sidebar that reshuffles while it is being
 // read.
+//
+// When the network is learned for the first time the window's key changes from the bare name
+// to "network/name", and every map that was holding state under the bare name has to move
+// with it. That is done here, once, rather than at each of the six maps' call sites: a
+// half-moved window is a conversation with the right lines and the wrong nicklist, which is
+// worse than either.
 func (m *Model) noteNetwork(window, network string) {
 	if window == "" || network == "" {
 		return
@@ -447,7 +578,132 @@ func (m *Model) noteNetwork(window, network string) {
 	if m.netOf == nil {
 		m.netOf = make(map[string]string, 4)
 	}
-	m.netOf[window] = network
+	// Already qualified: just record (or correct) the network.
+	if net, name := keyWindow(window); net != "" {
+		m.netOf[window] = network
+		_ = name
+		return
+	}
+	key := windowKey(network, window)
+	if key == window {
+		m.netOf[window] = network
+		return
+	}
+	if _, qualified := m.windows[key]; !qualified {
+		m.migrateKey(window, key)
+	}
+	m.netOf[key] = network
+}
+
+// migrateKey moves everything the model holds about a window from a bare name to its
+// network-qualified key.
+//
+// It is the one place window identity is rewritten, because the alternative is six copies of
+// the same move and one of them will be forgotten. The windows map is the authority: if the
+// old key is not there, there is nothing to move.
+func (m *Model) migrateKey(from, to string) {
+	if from == to {
+		return
+	}
+	if m.windows == nil {
+		m.windows = make(map[string][]Line, 4)
+	}
+	if lines, ok := m.windows[from]; ok {
+		if _, exists := m.windows[to]; !exists {
+			m.windows[to] = lines
+			for i := range m.windows[to] {
+				m.windows[to][i].Window = to
+			}
+		} else {
+			m.windows[to] = append(m.windows[to], lines...)
+		}
+		delete(m.windows, from)
+	}
+	for i, name := range m.order {
+		if name == from {
+			m.order[i] = to
+		}
+	}
+	moveStringInt(m.unread, from, to)
+	moveStringBool(m.mention, from, to)
+	moveStringString(m.topics, from, to)
+	moveStringString(m.modes, from, to)
+	moveNicks(m.nicks, from, to)
+	// bufferNo follows the window: the user has already learnt a number for it, and
+	// renumbering on reconnect would defeat the whole point of a stable number.
+	if n, ok := m.bufferNo[from]; ok {
+		delete(m.bufferNo, from)
+		if _, taken := m.bufferNo[to]; !taken {
+			m.bufferNo[to] = n
+		}
+	}
+	if m.active == from {
+		m.active = to
+	}
+	// netOf's own bare entry is a placeholder until the network is known; the caller writes
+	// the qualified one.
+	if net, ok := m.netOf[from]; ok {
+		delete(m.netOf, from)
+		if _, taken := m.netOf[to]; !taken {
+			m.netOf[to] = net
+		}
+	}
+}
+
+func moveStringInt(m map[string]int, from, to string) {
+	if m == nil {
+		return
+	}
+	v, ok := m[from]
+	if !ok {
+		return
+	}
+	delete(m, from)
+	if _, taken := m[to]; !taken {
+		m[to] = v
+	}
+}
+
+func moveStringBool(m map[string]bool, from, to string) {
+	if m == nil {
+		return
+	}
+	v, ok := m[from]
+	if !ok {
+		return
+	}
+	delete(m, from)
+	if _, taken := m[to]; !taken {
+		m[to] = v
+	}
+}
+
+func moveStringString(m map[string]string, from, to string) {
+	if m == nil {
+		return
+	}
+	v, ok := m[from]
+	if !ok {
+		return
+	}
+	delete(m, from)
+	if _, taken := m[to]; !taken {
+		m[to] = v
+	}
+}
+
+func moveNicks(m map[string][]Nick, from, to string) {
+	if m == nil {
+		return
+	}
+	v, ok := m[from]
+	if !ok {
+		return
+	}
+	delete(m, from)
+	if _, taken := m[to]; !taken {
+		m[to] = v
+	}
 }
 
 // Input returns the current input line, for a driver that echoes it elsewhere.
@@ -520,30 +776,36 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		if m.modes == nil {
 			m.modes = make(map[string]string, 4)
 		}
-		m.modes[msg.Window] = msg.Modes
+		// Resolved through keyFor so a mode string lands on the same window the conversation
+		// does: the transport knows the channel name, and which server it is on is the model's
+		// knowledge, learned from the tag on the lines around it.
+		m.modes[m.keyFor(msg.Window)] = msg.Modes
 		return m, nil
 
 	case Topic:
 		if m.topics == nil {
 			m.topics = make(map[string]string, 4)
 		}
-		m.topics[msg.Window] = msg.Text
+		m.topics[m.keyFor(msg.Window)] = msg.Text
 		return m, nil
 
 	case Nicklist:
 		if m.nicks == nil {
 			m.nicks = make(map[string][]Nick, 4)
 		}
+		// Membership is often the first thing a quiet channel sends, so this is where the
+		// network is most likely to be learned first - and it has to be learned before the
+		// key is resolved, or the member list is filed under the bare name while the
+		// conversation that follows is filed under the qualified one.
+		m.noteNetwork(msg.Window, msg.Network)
+		key := m.keyFor(msg.Window)
 		// Replace, never merge: the transport sends the complete list at 366, so a
 		// merge would keep people who left.
 		if len(msg.Nicks) == 0 {
-			delete(m.nicks, msg.Window)
+			delete(m.nicks, key)
 		} else {
-			m.nicks[msg.Window] = msg.Nicks
+			m.nicks[key] = msg.Nicks
 		}
-		// Membership is often the first thing a quiet channel sends, so this is where the
-		// network is most likely to be learned first.
-		m.noteNetwork(msg.Window, msg.Network)
 		return m, nil
 
 	case Incoming:
@@ -557,6 +819,14 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 			noteWindow = m.active
 		}
 		m.noteNetwork(noteWindow, line.Network)
+		// noteNetwork may have rekeyed the window from its bare name to "network/name" when
+		// this is the first line to name its server. Everything below compares against window
+		// keys, so the line has to carry the key and not the name the transport sent.
+		if line.Network != "" {
+			line.Window = windowKey(line.Network, winName(line.Window))
+		} else {
+			line.Window = m.keyFor(line.Window)
+		}
 		// Our own line coming back from the bouncer confirms the pending echo instead of
 		// being drawn beside it. A bouncer echoes the sender - that is how a second
 		// client sees the same conversation - so anything else shows every message twice.
@@ -1024,7 +1294,11 @@ func (m *Model) historyRequest() tea.Cmd {
 		return nil
 	}
 	m.historyAsked = true
-	win := m.active
+	// The bare name, because the wire has no notion of the model's keys: CHATHISTORY names a
+	// window and the bouncer resolves the network itself. A request carrying "libera/status"
+	// would ask for a window nobody has, and the failure is an empty batch - which reads as
+	// "there is no history" rather than as a bug.
+	win := winName(m.active)
 	cursor := oldest.Time
 	return func() tea.Msg { return HistoryWanted{Window: win, Before: cursor} }
 }
@@ -1080,11 +1354,18 @@ func (m Model) switchBuffer(arg string) Model {
 func (m Model) bufferList() string {
 	type entry struct {
 		n    int
-		name string
+		text string
 	}
 	entries := make([]entry, 0, len(m.windows))
-	for name := range m.windows {
-		entries = append(entries, entry{m.bufferNo[name], name})
+	for key := range m.windows {
+		// The name, not the key; but when two networks hold the same name the list has to
+		// say which is which, or /b 2 and /b 5 both read "status" and the user has no way to
+		// tell which server they are choosing.
+		text := winName(key)
+		if net, _ := keyWindow(key); net != "" && m.duplicateName(key) {
+			text = text + " (" + net + ")"
+		}
+		entries = append(entries, entry{m.bufferNo[key], text})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].n < entries[j].n })
 	var b strings.Builder
@@ -1093,9 +1374,22 @@ func (m Model) bufferList() string {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		fmt.Fprintf(&b, "%d %s", e.n, e.name)
+		fmt.Fprintf(&b, "%d %s", e.n, e.text)
 	}
 	return b.String()
+}
+
+// duplicateName reports whether more than one window carries this window's display name.
+// Two networks' "status" is the case: the numbers are the only thing telling them apart in
+// the buffer list, and a list that says "1 status, 2 status" is not an answer to "/b".
+func (m Model) duplicateName(key string) bool {
+	name := winName(key)
+	for other := range m.windows {
+		if other != key && winName(other) == name {
+			return true
+		}
+	}
+	return false
 }
 
 // goCommand parses "/go <pattern>". The argument is everything after the verb, spaces and
@@ -1130,9 +1424,24 @@ func (m Model) matchWindow(pattern string) (string, bool) {
 	if pattern == "" {
 		return "", false
 	}
+	// The buffer list and search hits print "name (network)" when two servers hold the same
+	// name, so that exact spelling has to resolve here - otherwise the list names windows
+	// nobody can type back in. Checked before the fuzzy pass because "(network)" would
+	// otherwise be scored as part of the name and lose.
+	if base, net, ok := splitQualifiedName(pattern); ok {
+		if key := windowKey(net, base); key != pattern {
+			if _, live := m.windows[key]; live {
+				return key, true
+			}
+		}
+	}
 	lower := strings.ToLower(pattern)
 	best, bestScore := "", -1
-	for _, name := range m.order {
+	for _, key := range m.order {
+		// Matching is against the display name, never the key: the user types "salotto", not
+		// "libera/#salotto", and letting the network prefix into the match would make "/go
+		// lib" jump to whichever window happens to be on that server first.
+		name := winName(key)
 		nameLower := strings.ToLower(name)
 		score := fuzzyScore(strings.TrimPrefix(nameLower, "#"), lower)
 		// The name with its "#" included is also tried, so "/go #sal" and "/go sal" are the
@@ -1146,7 +1455,7 @@ func (m Model) matchWindow(pattern string) (string, bool) {
 			score = 1 << 20
 		}
 		if score > bestScore {
-			best, bestScore = name, score
+			best, bestScore = key, score
 		}
 	}
 	return best, bestScore >= 0
@@ -1452,9 +1761,23 @@ func (m Model) confirmPending(line Line) bool {
 
 // append adds a line to its window and makes that window known. Auto-scroll
 // stays pinned to the bottom unless the user scrolled up.
+//
+// The line's Window is resolved to a window key here, which is the single place a window is
+// created: a line names its window by bare name and carries its network, and identity is the
+// pair. Doing the resolution once, at the door, is what keeps every map below agreeing about
+// which window this is - the failure mode of resolving in each of them is a line filed under
+// "status" and a nicklist filed under "libera/status", which draws as an empty channel with
+// members in it.
 func (m *Model) append(l Line) {
 	if l.Window == "" {
 		l.Window = m.active
+	}
+	// A line that knows its network is stored under the qualified key; one that does not
+	// inherits whatever the model already knows about that window name.
+	if l.Network != "" {
+		l.Window = windowKey(l.Network, winName(l.Window))
+	} else {
+		l.Window = m.keyFor(l.Window)
 	}
 	if _, seen := m.windows[l.Window]; !seen {
 		m.order = append(m.order, l.Window)
@@ -1747,7 +2070,7 @@ func (m Model) View() string {
 	// it. Modes first: they are short and survive truncation where a long topic does
 	// not.
 	b.WriteString(borderStyle.Render("╭─ "))
-	b.WriteString(titleStyle.Render(m.active))
+	b.WriteString(titleStyle.Render(winName(m.active)))
 	if m.scroll > 0 {
 		b.WriteString(systemStyle.Render(fmt.Sprintf(" (scroll %d)", m.scroll)))
 	}
@@ -1919,12 +2242,16 @@ func (m Model) groupedSidebarRows() []sidebarRow {
 	// would be in the flat list.
 	groups := make(map[string][]string, 4)
 	var loose []string
-	for _, name := range m.order {
-		if net := m.netOf[name]; net != "" {
-			groups[net] = append(groups[net], name)
+	for _, key := range m.order {
+		// The network comes from the key when it has one, so two networks' "status" windows
+		// are two rows under two headings. Falling back to netOf covers a window that was
+		// rekeyed before this map was filled.
+		net := m.networkOf(key)
+		if net != "" {
+			groups[net] = append(groups[net], key)
 			continue
 		}
-		loose = append(loose, name)
+		loose = append(loose, key)
 	}
 	if len(groups) == 0 {
 		// Nothing to group by - a plain IRCd, or a bouncer that does not tag its lines. The
@@ -1960,24 +2287,38 @@ func (m Model) groupedSidebarRows() []sidebarRow {
 	return rows
 }
 
+// networkOf reports which network a window key is on, "" when it is not known.
+//
+// The key carries it once the network is learnt, so the map is only a fallback for a window
+// that was created before its server was named. Reading the key first is what makes grouping
+// work for two windows with the same name: netOf[bare] could only ever remember one of them.
+func (m Model) networkOf(key string) string {
+	if net, _ := keyWindow(key); net != "" {
+		return net
+	}
+	return m.netOf[key]
+}
+
 // windowRow builds one window's row: its number and name, and its unread badge. The badge
 // logic is the same on both layouts because it is not about grouping - a mention beats a
 // count, and a count is only worth drawing when it is not zero.
-func (m Model) windowRow(name string) sidebarRow {
-	text := name
+func (m Model) windowRow(key string) sidebarRow {
+	// The row shows the name, never the key: "libera/status" is an implementation detail and
+	// two rows saying "status" under two headings is exactly what the grouping is for.
+	text := winName(key)
 	if m.settings.BufferNumbers {
-		if n := m.bufferNo[name]; n > 0 {
-			text = strconv.Itoa(n) + " " + name
+		if n := m.bufferNo[key]; n > 0 {
+			text = strconv.Itoa(n) + " " + text
 		}
 	}
 	badge := ""
 	switch {
-	case m.mention[name]:
+	case m.mention[key]:
 		badge = "@"
-	case m.unread[name] > 0:
-		badge = strconv.Itoa(m.unread[name])
+	case m.unread[key] > 0:
+		badge = strconv.Itoa(m.unread[key])
 	}
-	return sidebarRow{window: name, text: text, badge: badge}
+	return sidebarRow{window: key, text: text, badge: badge}
 }
 
 // windowColumn renders the window list: the active one marked, and a mention or an
@@ -1999,7 +2340,7 @@ func (m Model) windowColumn(width, n int) []string {
 			break
 		}
 	}
-	activeNet := m.netOf[m.active]
+	activeNet := m.networkOf(m.active)
 	out := make([]string, 0, len(rows))
 	for _, row := range rows {
 		if row.heading {
@@ -2492,8 +2833,12 @@ func (m Model) NoteMention(window string) Model {
 	if m.mention == nil {
 		m.mention = make(map[string]bool)
 	}
-	if window != m.active {
-		m.mention[window] = true
+	// Resolved, because the caller may name the window the way the wire does ("status") while
+	// the model stores it under its key - and a mention filed under the wrong key is a window
+	// that never shows its @.
+	key := m.keyFor(window)
+	if key != m.active {
+		m.mention[key] = true
 	}
 	return m
 }
@@ -2518,11 +2863,18 @@ func (m Model) Search(query string) []SearchResult {
 		return nil
 	}
 	var out []SearchResult
-	for _, window := range m.order {
-		for _, line := range m.windows[window] {
+	for _, key := range m.order {
+		for _, line := range m.windows[key] {
 			if strings.Contains(strings.ToLower(line.Text), query) ||
 				strings.Contains(strings.ToLower(line.Nick), query) {
-				out = append(out, SearchResult{Window: window, Line: line})
+				// The display name, because the row is a jump target: "/go <what is written
+				// here>" has to reach the window the hit came from, and a bare "status" with
+				// two networks on it could not.
+				name := winName(key)
+				if net, _ := keyWindow(key); net != "" && m.duplicateName(key) {
+					name = name + " (" + net + ")"
+				}
+				out = append(out, SearchResult{Window: name, Line: line})
 			}
 		}
 	}
@@ -2584,8 +2936,9 @@ func (m Model) searchIntoWindow(query string) Model {
 // Nicklist returns the members of the active window, or of a named one. An empty
 // result means "not a channel" - a query window has no membership.
 func (m Model) Nicklist(window string) []Nick {
-	out := make([]Nick, len(m.nicks[window]))
-	copy(out, m.nicks[window])
+	key := m.keyFor(window)
+	out := make([]Nick, len(m.nicks[key]))
+	copy(out, m.nicks[key])
 	return out
 }
 
@@ -2601,11 +2954,11 @@ func (m Model) NickCounts() map[string]int {
 
 // Topic returns the current topic of a window, "" if it has none or we have not
 // been told.
-func (m Model) Topic(window string) string { return m.topics[window] }
+func (m Model) Topic(window string) string { return m.topics[m.keyFor(window)] }
 
 // Modes returns a window's channel mode string ("+nt"), "" if not a channel or not
 // known.
-func (m Model) Modes(window string) string { return m.modes[window] }
+func (m Model) Modes(window string) string { return m.modes[m.keyFor(window)] }
 
 // previewText renders a card as one line: the site, the title, and the URL only when
 // the title does not already name it. One line because a terminal's unit of display is a
@@ -2631,7 +2984,7 @@ func previewText(title, site, rawURL string) string {
 // is the message the user is looking at, and fetching links out of a month of
 // scrollback would turn reading old channels into a burst of traffic to strangers.
 func (m Model) Links(window string, max int) []string {
-	lines := m.windows[window]
+	lines := m.windows[m.keyFor(window)]
 	const lookBack = 40
 	seen := make(map[string]bool, max)
 	out := make([]string, 0, max)

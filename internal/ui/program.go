@@ -245,10 +245,19 @@ func (p *Program) requestHistory(want HistoryWanted) {
 	// not Go's default: a space instead of "T" would be a timestamp the server rejects, and a
 	// rejected CHATHISTORY is silence rather than an error the user can see.
 	cursor := want.Before.UTC().Format("2006-01-02T15:04:05.000000Z")
-	p.tr.Send("CHATHISTORY BEFORE " + want.Window + " timestamp=" + cursor + " 100")
+	// The bare window name, not the model's internal key: CHATHISTORY takes a window name and
+	// resolves the network itself, and "libera/#c" is not a window any bouncer has. Sending
+	// the name also means a request for one network's #c can be answered by whichever network
+	// holds it, which is the same "a read is free to look" rule the bouncer already follows.
+	p.tr.Send("CHATHISTORY BEFORE " + winName(want.Window) + " timestamp=" + cursor + " 100")
 }
 
 // WindowName is the active window, so a driver can tell where the user is.
+//
+// It returns the model's key, which is "network/name" once the window's server is known. That
+// is deliberate: a driver that wants to switch back has to be able to name the window
+// unambiguously, and two networks' "status" cannot be told apart by name. Anything that puts a
+// window in front of a user goes through winName first.
 func (p *Program) WindowName() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -276,7 +285,9 @@ func (p *Program) SyncActive() {
 	if p.tr == nil {
 		return
 	}
-	p.tr.SetActive(p.WindowName())
+	// The transport sees the bare window name. It speaks IRC, which has no idea what a
+	// "network/name" key is - the bouncer resolves a channel across its networks itself.
+	p.tr.SetActive(winName(p.WindowName()))
 }
 
 // View renders the current model.

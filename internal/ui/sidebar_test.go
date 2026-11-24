@@ -112,7 +112,7 @@ func TestBufferNumbersCanBeTurnedOff(t *testing.T) {
 	}
 	// And /b still works: the number is identity, and turning off the label must not turn off
 	// the thing the label was showing.
-	if after := typeLine(m, "/b 3"); after.active != "#other" {
+	if after := typeLine(m, "/b 3"); winName(after.active) != "#other" {
 		t.Fatalf("/b 3 landed on %q with the numbers hidden from the sidebar", after.active)
 	}
 }
@@ -125,7 +125,7 @@ func TestBufferNumbersCanBeTurnedOff(t *testing.T) {
 // guards against.
 func TestABufferKeepsItsNumber(t *testing.T) {
 	m := sidebarFixture(t)
-	before := m.bufferNo["#salotto"]
+	before := m.bufferNo[m.keyFor("#salotto")]
 	if before == 0 {
 		t.Fatal("#salotto has no buffer number")
 	}
@@ -133,7 +133,7 @@ func TestABufferKeepsItsNumber(t *testing.T) {
 	for _, name := range []string{"#later-one", "#later-two"} {
 		m, _ = m.Step(Incoming(Line{Window: name, Network: "libera", Nick: "x", Text: "hi", Kind: LineMessage}))
 	}
-	if after := m.bufferNo["#salotto"]; after != before {
+	if after := m.bufferNo[m.keyFor("#salotto")]; after != before {
 		t.Fatalf("#salotto was number %d and became %d when other windows arrived", before, after)
 	}
 
@@ -180,16 +180,16 @@ func TestSlashBSwitchesByNumber(t *testing.T) {
 	m := sidebarFixture(t)
 	m = m.SetActive("status")
 
-	if after := typeLine(m, "/b 3"); after.active != "#other" {
+	if after := typeLine(m, "/b 3"); winName(after.active) != "#other" {
 		t.Fatalf("/b 3 landed on %q, want #other", after.active)
 	}
 	m = typeLine(m, "/buffer 2")
-	if m.active != "#salotto" {
+	if winName(m.active) != "#salotto" {
 		t.Fatalf("/buffer 2 landed on %q, want #salotto", m.active)
 	}
 	// A number nobody holds is refused by name: a silent no-op reads as a broken key.
 	after := typeLine(m, "/b 99")
-	if after.active != "#salotto" {
+	if winName(after.active) != "#salotto" {
 		t.Fatalf("/b 99 switched to %q", after.active)
 	}
 	if reason := systemText(after); !strings.Contains(reason, "no buffer 99") {
@@ -206,16 +206,16 @@ func TestSlashBSwitchesByNumber(t *testing.T) {
 // what a stable number is for.
 func TestABufferNumberIsNotReusedAfterClose(t *testing.T) {
 	m := sidebarFixture(t)
-	closed := m.bufferNo["#other"]
+	closed := m.bufferNo[m.keyFor("#other")]
 	m = m.SetActive("#other")
 	m = typeLine(m, "/close")
 
 	m, _ = m.Step(Incoming(Line{Window: "#fresh", Network: "freenode", Text: "x", Kind: LineMessage}))
-	if got := m.bufferNo["#fresh"]; got == closed {
+	if got := m.bufferNo[m.keyFor("#fresh")]; got == closed {
 		t.Fatalf("#fresh took %d, the number of the window that just closed", closed)
 	}
 	// And the retired number does not reopen the closed window.
-	if after := typeLine(m, "/b "+strconv.Itoa(closed)); after.active == "#other" {
+	if after := typeLine(m, "/b "+strconv.Itoa(closed)); winName(after.active) == "#other" {
 		t.Fatalf("/b %d reopened a closed window", closed)
 	}
 }
@@ -373,9 +373,9 @@ func TestClickingAHeadingSelectsNothing(t *testing.T) {
 		switch {
 		case row.heading && row.text == "freenode":
 			headingRow = i
-		case row.window == "#salotto":
+		case winName(row.window) == "#salotto":
 			salottoRow = i
-		case row.window == "#other":
+		case winName(row.window) == "#other":
 			otherRow = i
 		}
 	}
@@ -388,10 +388,10 @@ func TestClickingAHeadingSelectsNothing(t *testing.T) {
 	if got := m.WindowAt(3, screen(headingRow)); got != "" {
 		t.Fatalf("a click on the %q heading selected %q", "freenode", got)
 	}
-	if got := m.WindowAt(3, screen(salottoRow)); got != "#salotto" {
+	if got := m.WindowAt(3, screen(salottoRow)); winName(got) != "#salotto" {
 		t.Fatalf("a click on the #salotto row selected %q", got)
 	}
-	if got := m.WindowAt(3, screen(otherRow)); got != "#other" {
+	if got := m.WindowAt(3, screen(otherRow)); winName(got) != "#other" {
 		t.Fatalf("a click on the #other row selected %q", got)
 	}
 }
@@ -462,7 +462,7 @@ func TestALineInTheActiveWindowStillNamesItsNetwork(t *testing.T) {
 	m, _ = m.Step(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m, _ = m.Step(Incoming(Line{Network: "libera", Text: "connected", Kind: LineSystem}))
 
-	if got := m.netOf["status"]; got != "libera" {
+	if got := m.networkOf(m.keyFor("status")); got != "libera" {
 		t.Fatalf("a line with no window left status on network %q, want libera", got)
 	}
 	rows := m.sidebarRows(m.layout().contentRows)
@@ -478,13 +478,13 @@ func TestALineInTheActiveWindowStillNamesItsNetwork(t *testing.T) {
 func TestAnUntaggedLineDoesNotUngroupAWindow(t *testing.T) {
 	m := sidebarFixture(t)
 	m, _ = m.Step(Incoming(Line{Window: "#salotto", Text: "no tag on this one", Nick: "alice", Kind: LineMessage}))
-	if got := m.netOf["#salotto"]; got != "libera" {
+	if got := m.networkOf(m.keyFor("#salotto")); got != "libera" {
 		t.Fatalf("an untagged line changed #salotto's network to %q", got)
 	}
 	// And it is still drawn under libera rather than in the ungrouped block at the end.
 	rows := m.sidebarRows(m.layout().contentRows)
 	for i, row := range rows {
-		if row.window != "#salotto" {
+		if winName(row.window) != "#salotto" {
 			continue
 		}
 		if i == 0 || !rows[i-1].heading || rows[i-1].text != "libera" {

@@ -564,53 +564,54 @@ pieces separately and let each re-establish the enclosing style (see `nickStyled
 colour has to assert the colour is still in effect *after* the last reset, not that a sequence
 appears somewhere in the line.
 
-### 2.1.1 Two networks, one channel name: the window namespace — **this is live, and it costs data**
+### 2.1.1 Two networks, one channel name: the window namespace — **fixed**
 
 **Every network has a window called `status`.** The bouncer keys windows by `(network, name)`
 and sends each network's registration replay in its own batch (`ch-test-status-replay`,
-`freebnc-status-replay`). The client keys windows by name alone, so both replays land in one
-window, and which one you see is whichever arrived last.
+`freebnc-status-replay`). The client keyed windows by name alone, so both replays landed in one
+window and whichever arrived last won.
 
-Measured on the live two-network deployment:
+Measured on the live two-network deployment before the fix:
 
-- Alice's status window shows **freebnc's** 001-005 replay; `ch-test` appears in it nowhere.
-- A `401 No such nick` from ch-test **is** in the bouncer's `ch-test-status-replay` ring and **is**
-  delivered live to a raw client. It is not on the TUI's screen.
+- Alice's status window showed **freebnc's** 001-005 replay; `ch-test` appeared in it nowhere.
+- A `401 No such nick` from ch-test **was** in the bouncer's `ch-test-status-replay` ring and
+  **was** delivered live to a raw client. It was not on the TUI's screen.
 
-So this is not the cosmetic limitation an earlier revision of this entry described (I first
-wrote it up as a live collision, then "corrected" it to unreachable because no *channel* name was
-shared - the correction was wrong, because `status` is always shared). The user-visible effect is
-that on a two-network deployment **one network's status window is unreachable**, and errors,
-MOTDs and bouncer replies that arrive there are invisible. That is a data-visibility bug, not a
-display preference.
+That was a data-visibility bug, not a display preference: one network's status window was
+unreachable, so errors, MOTDs and bouncer replies arriving there were invisible.
 
-The fix is a qualifier on window identity through the sidebar, `/go`, unread/mention keys, click
-hit-testing and the settings screen's "current window" - the same thing this entry said before.
-What changed is that it can now be exercised by a test with no unusual config: two networks,
-register, assert two status windows exist and each holds its own network's 002.
+**The fix is a window key that carries the network.** `windowKey(network, name)` returns
+`"network/name"` when the network is known and the bare name when it is not, so a client of a
+plain IRCd keeps exactly the naming it always had. `keyWindow` splits it back and `winName`
+gives the display name. Every map the model keeps about a window - `windows`, `order`,
+`unread`, `mention`, `topics`, `modes`, `nicks`, `bufferNo`, `netOf` - is keyed by
+that, so two networks' `status` are two windows with two buffer numbers and two scrollbacks.
 
-**Update: the client can now tell which network a window is on, and window identity is still
-by name.** The qualifier this entry asked for existed nowhere on the wire: `appendLiveLine`
-wrote only `time=`, so a live PRIVMSG carried no network at all, and the batch id that replay
-happens to carry is not available for a live line or for a client that attaches mid-batch. Every
-line the bouncer produces now carries `@salotto.network=<net>` - live and replayed, escaped
-because a network name is free text from a config file, omitted when empty rather than written as
-`""` (an empty tag groups windows under a heading named nothing), and not duplicated when a
-relayed line already has one. The client parses it, keeps a window-to-network map fed by lines
-and by 353 membership, and the sidebar groups and orders by it. That is why the consequence above
-is now *visible* rather than silent: a deployment with two networks draws two headings, and a
-window whose server has not spoken yet lands in the ungrouped block instead of being guessed at.
+Three details are load-bearing:
 
-What is still open is the actual defect: `Model` keys `lines`, `unread`, `mention`, `topics`,
-`nicks` and `bufferNo` by window name, so two networks' `status` are still one window and one
-network's replay still overwrites the other's. Grouping makes the collision legible - two
-`status` rows cannot both be drawn, so the user can see the namespace is short - but it does not
-recover the missing lines. Closing this means a window key that carries the network through
-`/go`, the unread and mention maps, click hit-testing and the settings screen's "current
-window", which is a wider change than the sidebar and was deliberately not folded into it.
+- **Migration, not assumption.** A window often exists before its server is named: the client
+  attaches, a bare `status` window takes an untagged line, and only then does a tagged line
+  reveal the network. `noteNetwork` rekeys the window through `migrateKey`, which moves every
+  map at once, because a half-moved window is a conversation with the right lines and the
+  wrong nicklist. The buffer number moves with it - the user has already learnt it.
+- **The key never reaches the user or the wire.** The title row, the sidebar rows, the buffer
+  list and search hits show `winName`. `CHATHISTORY` gets the bare name, because the bouncer
+  resolves the network itself and a request for `libera/status` would return an empty batch,
+  which reads as "no history" rather than as a bug. The same goes for the transport's
+  `SetActive`.
+- **Ambiguity is refused, not guessed.** When two networks hold `status`, a bare `status` no
+  longer names one window, and `netOfName` returns "" rather than picking one. The buffer list
+  and search hits print `status (libera)` only when a name is duplicated, and that printed form
+  is a valid `/go` target so the list never names a window nobody can type back in.
 
-Until then the deployment is single-network-correct only; alice's two networks are exactly the
-configuration that shows it.
+The tests are on the lines, not the sidebar: a sidebar that draws two rows over merged
+scrollback is a display fix on a data-loss bug, which is the mistake an earlier revision of
+this entry made. `TestTwoNetworksKeepSeparateWindowsOfTheSameName` asserts each window holds its
+own line and not the other's, mid-migration identity keeps its number and scrollback, the
+printed `name (network)` form round-trips through `/go`, and a single-network client grows no
+parentheses. Twelve mutations were confirmed red, including the four that survived a first
+pass: ambiguous-name guessing, the title leaking the key, the sidebar row leaking the key, and
+`CHATHISTORY` carrying the key.
 
 ### 2.2 The three things we do differently from The Lounge, by design
 
