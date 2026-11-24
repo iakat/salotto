@@ -549,6 +549,21 @@ only place a JS toolchain appears, and it is a build artifact — no runtime JS
 dependency in the served app beyond what we ship. That is the opposite of The
 Lounge's 23 runtime deps in the server.
 
+### 2.1.0 Mute and highlight: what the ANSI reset costs
+
+W8's mute and highlight rules are in and verified, but the live proof took three attempts for a
+reason worth keeping: a lipgloss render ends with an ANSI reset, so colouring the nick by
+splicing the rendered string into an already-styled line ends that line's style at the nick.
+Every message body was drawn in the terminal default, and a mention highlight set on the line was
+wiped by the nick that precedes the text. The model was right in every unit test; the frame
+"contained escape codes" in every assertion; only reading cell colours out of a real terminal
+showed it.
+
+Rule for this codebase: **never splice a rendered fragment into a rendered string.** Render the
+pieces separately and let each re-establish the enclosing style (see `nickStyled`). A test for a
+colour has to assert the colour is still in effect *after* the last reset, not that a sequence
+appears somewhere in the line.
+
 ### 2.1.1 Two networks, one channel name: the window namespace
 
 Found live while testing highlights: alice joins `#salotto` on both of her networks, and the
