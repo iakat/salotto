@@ -206,6 +206,99 @@ type PrefsPush struct {
 	Token string
 }
 
+// Reconnecting is the message a transport sends when it has started another attempt.
+//
+// The model shows it as a status line the first time and then keeps quiet: a bouncer that is
+// down for a minute produces half a dozen attempts, and six identical notices in the status
+// window is noise that pushes the reason out of sight.
+type Reconnecting struct{}
+
+// Registered is the message a transport sends on 001: this connection is up.
+//
+// It exists so the model can turn "offline" back into "connected" and close the replay window
+// the bouncer's ring is delivered inside. Before it, a client that reconnected stayed marked
+// disconnected forever, because nothing else ever set that flag back.
+type Registered struct{}
+
+// ReplayFinished reports that the bouncer has sent everything it held: the end of the
+// registration burst, which is 376 (end of MOTD) on this bouncer because it sends its ring
+// before the MOTD ends.
+//
+// After it, duplicate suppression stops. Keeping it on would compare every live line against
+// the buffer, and the first person to repeat a sentence someone said a minute ago would have
+// their line silently dropped - the exact class of bug this package exists to avoid.
+type ReplayFinished struct{}
+
+// ReconnectFailed reports an attempt that could not even open a socket.
+//
+// It is separate from Reconnecting because the two mean different things to a user: "trying
+// again" needs no action, "connection refused" is the one that says the bouncer may not be
+// running at all.
+type ReconnectFailed struct {
+	Attempt int
+	Err     error
+}
+
+// replayKey identifies a line for the purpose of deciding whether a replayed copy of it is
+// already in the window.
+//
+// The timestamp is deliberately NOT part of it. It cannot be: a live line's time tag is stamped
+// when the bouncer fans it out, and a replayed line's comes out of the ring where it was stamped
+// when it was buffered - two calls to the clock, milliseconds apart. Measured against the real
+// daemon, the same message carried 17.242 live and 17.241 replayed. Comparing timestamps would
+// therefore fail for every single line, and the replay would double the scrollback exactly as it
+// did before this code existed.
+//
+// What is left is what a reader would call "the same line written twice": the same person, the
+// same words, the same kind of line, in the same window.
+type replayKey struct {
+	window string
+	nick   string
+	text   string
+	kind   LineKind
+}
+
+// replaySeenWindow is how many trailing lines of a window a replayed line is looked for in.
+//
+// Not the whole buffer, because the ring is bounded: a replay cannot be longer than the ring, so
+// a duplicate is always near the end of what the client holds. Searching the tail keeps the work
+// per replayed line constant instead of making a long reconnect quadratic.
+const replaySeenWindow = 512
+
+// replayDuplicate reports whether this replayed line is a copy of one already held, and counts
+// the decision.
+//
+// It is a multiset reconciliation, not a "have I seen this" set. If the window holds two "ok"
+// from alice and the replay delivers three, the third is drawn - because alice really did say it
+// three times and the client lost one while it was away. A plain set would silently eat it, and
+// a replay that drops a message the user never saw is worse than one that repeats a message they
+// did.
+func (m *Model) replayDuplicate(window string, l Line) bool {
+	lines := m.windows[window]
+	key := replayKey{window: window, nick: l.Nick, text: l.Text, kind: l.Kind}
+
+	// How many copies of this line the window already holds, considering only the tail a replay
+	// can possibly reach.
+	held := 0
+	for i := len(lines) - 1; i >= 0 && i >= len(lines)-replaySeenWindow; i-- {
+		have := lines[i]
+		if have.Nick == l.Nick && have.Text == l.Text && have.Kind == l.Kind {
+			held++
+		}
+	}
+	if held == 0 {
+		return false
+	}
+	// Copies this replay has already delivered. The first `held` of them are the ones that were
+	// already on screen; anything past that count is new information.
+	seen := m.replaySeen[key]
+	if seen >= held {
+		return false
+	}
+	m.replaySeen[key] = seen + 1
+	return true
+}
+
 // Disconnected is the message a transport sends once, when its stream ends: the bouncer went
 // away, the network failed, or somebody closed the link.
 //
@@ -249,6 +342,21 @@ type Model struct {
 
 	// completion is where Tab is in its cycle.
 	completion completionState
+
+	// reconnectShown is whether the current outage has already been announced, so a transport
+	// retrying every few seconds does not fill the status window with one notice per attempt.
+	reconnectShown bool
+	// reconnectAt is when the last failed attempt was reported, for the same reason: an outage
+	// of a minute is a handful of attempts and only the first needs saying.
+	reconnectAt time.Time
+	// replaying is true while the bouncer is replaying its ring after a reconnect. Only then
+	// are duplicate lines suppressed: a live line is new by definition, and dropping one would
+	// be the silent loss this whole package refuses.
+	replaying bool
+	// replaySeen counts, per line identity, how many copies the current replay has delivered.
+	// It is how a multiset reconciliation stays honest when the same line legitimately appears
+	// more than once - see replayDuplicate.
+	replaySeen map[replayKey]int
 
 	// historyAsked is set once a request for older history is outstanding, so holding the
 	// PgUp key does not send one CHATHISTORY per repeat to an empty log.
@@ -765,10 +873,55 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 	// that is otherwise numbered - and a window with no number cannot be reached with /b.
 	m.ensureBuffers()
 	switch msg := msg.(type) {
+	case Registered:
+		// The link is up again. The flag is set here and not on the first line received,
+		// because a line can arrive before 001 on some servers and the honest moment is the
+		// one the protocol defines as "you are registered".
+		m.connected = true
+		m.status = ""
+		return m, nil
+
+	case ReplayFinished:
+		m.replaying = false
+		return m, nil
+
+	case Reconnecting:
+		// After a disconnect the transport retries on its own; say so once, in place of the
+		// disconnect notice, so the user knows the line was not dropped for good.
+		//
+		// The replay window opens here and closes when the bouncer says it is done replaying
+		// (376, end of MOTD, which the bouncer sends after its replay): everything the server
+		// says on registration is either the ring it is re-showing us or genuine news, and the
+		// duplicate check is what tells them apart.
+		m.replaying = true
+		m.replaySeen = make(map[replayKey]int)
+		if !m.reconnectShown {
+			m.reconnectShown = true
+			m.append(Line{Window: "status", Text: "reconnecting...", Kind: LineSystem, Time: time.Now()})
+		}
+		return m, nil
+
+	case ReconnectFailed:
+		// One notice for the first failure and one per further attempt at most once a minute:
+		// a bouncer that is down produces an attempt every few seconds, and a status window
+		// that scrolls with identical lines hides the reason it is there for.
+		if !m.reconnectAt.IsZero() && time.Since(m.reconnectAt) < time.Minute {
+			return m, nil
+		}
+		m.reconnectAt = time.Now()
+		reason := "connection failed"
+		if msg.Err != nil {
+			reason += ": " + msg.Err.Error()
+		}
+		m.append(Line{Window: "status", Text: reason + " (retrying)", Kind: LineError, Time: time.Now()})
+		return m, nil
+
 	case Disconnected:
-		// The stream is over. Saying so in the status window is the point: a screen that
-		// keeps drawing a live connection is worse than one that admits it is alone, because
-		// the user keeps typing into it.
+		// The stream is over, for now. Saying so in the status window is the point: a screen
+		// that keeps drawing a live connection is worse than one that admits it is alone,
+		// because the user keeps typing into it. The transport retries behind this, so the
+		// notice says "ended" rather than "closed" - there is another attempt coming.
+		m.reconnectShown = false
 		m.connected = false
 		reason := "the bouncer connection ended"
 		if msg.Reason != nil {
@@ -875,6 +1028,12 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 			line.Window = windowKey(line.Network, winName(line.Window))
 		} else {
 			line.Window = m.keyFor(line.Window)
+		}
+		// A reconnect makes the bouncer replay its ring, and the client already holds those
+		// lines. Dropping the ones it already has is what keeps a reconnect from doubling the
+		// scrollback - see replayDuplicate for why the comparison is exact and bounded.
+		if m.replaying && m.replayDuplicate(line.Window, line) {
+			return m, nil
 		}
 		// Our own line coming back from the bouncer confirms the pending echo instead of
 		// being drawn beside it. A bouncer echoes the sender - that is how a second

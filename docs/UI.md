@@ -128,6 +128,49 @@ every map at once and keeps the buffer number the user has already learnt. When 
 hold the same name the buffer list prints `status (libera)`, and that spelling is a valid `/go`
 target, so the list never names a window nobody can type back in.
 
+## Reconnecting without doubling the scrollback
+
+The transport owns the retry loop, not the drivers. Three front ends, one of them spawning a
+process per browser tab, would each have to write the same backoff and get the same details
+right; `Transport.run` does it once: 1 s doubling to 30 s, stopped only by an explicit `Close`,
+which is QUEUE Part 3 item 12's rule ("the only stop is an explicit user action"). `Dial` still
+fails to the caller on the first attempt, so a wrong address stays distinguishable from a
+bouncer that restarted.
+
+`Msgs()` therefore means *this client is finished*, not *this attempt failed*. A closed channel
+is what the pump and the drivers already understood; a reconnect they never hear about is a
+reconnect they cannot break.
+
+The reconnect repeats the handshake from the credentials kept at the first `Register`, and the
+model hears three things: `Disconnected` (the reason), `Reconnecting` (once per outage, because
+a transport retrying every two seconds would otherwise fill the status window with one notice
+per attempt), and `ReconnectFailed` (once a minute - a refused socket is the message that
+suggests the bouncer is not running at all, and it needs saying without becoming noise).
+
+The part that is easy to get wrong is the replay. A bouncer replays its whole ring on
+registration, so a naive reconnect re-receives everything the client already holds and the
+scrollback grows by the size of the ring on every reconnect - measured: 3 lines in, 3 replayed,
+6 on screen.
+
+The honest fix is a per-line sequence number. The daemon already computes one per window
+(`winring.Set.Append`) and does not put it on the wire yet, so until it does the client
+reconciles the replay against the tail of the window. Two properties are load-bearing:
+
+- **The timestamp is not part of a line's identity.** A live line's `time` tag is stamped when
+  the bouncer fans it out; a replayed line's comes out of the ring where it was stamped when
+  buffered. Two clock reads. Measured against the real daemon: `17.242` live, `17.241` replayed,
+  *same message*. A time-based comparison fails for every line, and it fails invisibly in unit
+  tests whose fixture reuses one timestamp - a live probe is what found it.
+- **It is a multiset, not a set.** If the window holds two `ok` from alice and the replay
+  delivers three, the third is drawn, because alice did say it three times and the client lost
+  one while it was away. A plain set silently eats a message the user never saw, which is worse
+  than repeating one they did.
+
+Suppression is on only between the reconnect and the end of the registration burst (376), never
+on live traffic: a live line is new by definition, and dropping one is exactly the silent loss
+this package refuses. The duplicate check searches only the last 512 lines of a window, which is
+bounded work per line and still correct, because a replay cannot be longer than the ring.
+
 ## What is deliberately not here yet
 
 - **No WebSocket.** W1 replaces the request-per-page part; the render half in

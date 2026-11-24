@@ -43,8 +43,10 @@ func deadLink(t *testing.T) *Transport {
 	return tr
 }
 
-// drainUntilClosed reads the transport until its stream ends, returning the messages.
-func drainUntilClosed(t *testing.T, tr *Transport) []tea.Msg {
+// drainUntilDisconnected reads until the transport reports a drop, then stops. It does not
+// wait for the channel to close: the transport retries after a drop, so a closed channel now
+// means "the client was closed", not "the connection failed".
+func drainUntilDisconnected(t *testing.T, tr *Transport) []tea.Msg {
 	t.Helper()
 	var got []tea.Msg
 	deadline := time.After(5 * time.Second)
@@ -55,8 +57,11 @@ func drainUntilClosed(t *testing.T, tr *Transport) []tea.Msg {
 				return got
 			}
 			got = append(got, msg)
+			if _, isDisc := msg.(Disconnected); isDisc {
+				return got
+			}
 		case <-deadline:
-			t.Fatalf("the stream neither delivered nor closed after %d message(s)", len(got))
+			t.Fatalf("no disconnect reported after %d message(s)", len(got))
 		}
 	}
 }
@@ -64,7 +69,7 @@ func drainUntilClosed(t *testing.T, tr *Transport) []tea.Msg {
 // TestADroppedConnectionSendsDisconnected.
 func TestADroppedConnectionSendsDisconnected(t *testing.T) {
 	tr := deadLink(t)
-	got := drainUntilClosed(t, tr)
+	got := drainUntilDisconnected(t, tr)
 
 	var disc *Disconnected
 	for _, msg := range got {
@@ -223,9 +228,7 @@ func TestSendingOnADeadConnectionDoesNotPanic(t *testing.T) {
 	}
 	ln.Close()
 
-	// Drain whatever the reader reported, so the assertion below is about Send.
-	drainUntilClosed(t, tr)
-
+	// After Close the transport is stopped for good, which is the state a line is refused in.
 	tr.Send("PRIVMSG #test :hello")
 
 	// No assertion on the stream: it is closed, so reading it returns the zero value forever

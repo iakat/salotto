@@ -90,12 +90,20 @@ func TestTopicWithoutAnArgumentMeansTheActiveChannel(t *testing.T) {
 // nextIncoming reads the next model message, if it is an Incoming.
 func nextIncoming(t *testing.T, tr *Transport) (Incoming, bool) {
 	t.Helper()
-	select {
-	case msg := <-tr.Msgs():
-		inc, ok := msg.(Incoming)
-		return inc, ok
-	default:
-		return Incoming{}, false
+	// Skip the transport's own control messages (Registered, ReplayFinished, ...): the
+	// question every caller asks is "what line came out of this", and a registration
+	// notice is not a line in a window. Callers that care about the control messages read
+	// the channel themselves.
+	for {
+		select {
+		case msg := <-tr.Msgs():
+			if inc, ok := msg.(Incoming); ok {
+				return inc, true
+			}
+			continue
+		default:
+			return Incoming{}, false
+		}
 	}
 }
 

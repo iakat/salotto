@@ -31,24 +31,30 @@ func newFakeBouncer(t *testing.T) *fakeBouncer {
 	}
 	fb := &fakeBouncer{
 		ln:   ln,
-		conn: make(chan net.Conn, 1),
+		conn: make(chan net.Conn, 4),
 		sent: make(chan string, 32),
 	}
+	// Accept in a loop, not once: a client that reconnects opens a second connection, and a
+	// listener that stopped accepting would make the reconnect look like a failure.
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		fb.conn <- conn
-		br := bufio.NewReader(conn)
 		for {
-			line, err := br.ReadString('\n')
-			if line != "" {
-				fb.sent <- strings.TrimRight(line, "\r\n")
-			}
+			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			fb.conn <- conn
+			go func(conn net.Conn) {
+				br := bufio.NewReader(conn)
+				for {
+					line, err := br.ReadString('\n')
+					if line != "" {
+						fb.sent <- strings.TrimRight(line, "\r\n")
+					}
+					if err != nil {
+						return
+					}
+				}
+			}(conn)
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
@@ -72,11 +78,42 @@ func (fb *fakeBouncer) client(t *testing.T) net.Conn {
 	}
 }
 
+// nextClient waits for a connection this helper has not handed out before, whatever was
+// cached. A reconnect test needs the new one, not the dead one.
+func (fb *fakeBouncer) nextClient(t *testing.T) net.Conn {
+	t.Helper()
+	select {
+	case conn := <-fb.conn:
+		fb.cached = conn
+		return conn
+	case <-time.After(5 * time.Second):
+		t.Fatal("no further connection was accepted")
+		return nil
+	}
+}
+
 func (fb *fakeBouncer) inject(t *testing.T, line string) {
 	t.Helper()
 	conn := fb.client(t)
 	if _, err := conn.Write([]byte(line + "\r\n")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// handshake reads lines until one is part of registration, which is what a test about
+// credentials is asking for. CAP negotiation comes first and is not the subject.
+func (fb *fakeBouncer) handshake(t *testing.T) string {
+	t.Helper()
+	for {
+		select {
+		case line := <-fb.sent:
+			if strings.HasPrefix(line, "PASS ") || strings.HasPrefix(line, "NICK ") {
+				return line
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the handshake never arrived")
+			return ""
+		}
 	}
 }
 
@@ -287,29 +324,70 @@ func TestTransportFeedsTheModel(t *testing.T) {
 
 // TestTransportClosesOnDisconnect: the message channel must close so a Program
 // can exit rather than hang on a dead link.
-func TestTransportClosesOnDisconnect(t *testing.T) {
+// TestTransportReconnectsInsteadOfDying.
+//
+// This used to assert the opposite: that the message channel closed when the peer hung up,
+// with an error recorded. That behaviour was the bug QUEUE Part 3 item 12 names - the client
+// died with the bouncer, so every bouncer restart meant restarting every client by hand.
+// The channel now stays open across attempts and closes only when the client is closed, so
+// the pump, the drivers and the model learn about a reconnect without writing retry logic of
+// their own.
+func TestTransportReconnectsInsteadOfDying(t *testing.T) {
 	fb := newFakeBouncer(t)
 	tr, err := Dial(fb.ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Wait for the accept, then drop the connection from the far side.
+	defer tr.Close()
+
 	fb.inject(t, ":alice!a@h PRIVMSG #x :hi")
 	collectIncoming(t, tr, 1)
 	_ = fb.client(t).Close()
+
+	// A disconnect is reported, and then a reconnect happens on the same listener.
+	deadline := time.After(5 * time.Second)
+	sawDisconnect, sawReconnect := false, false
+	for !(sawDisconnect && sawReconnect) {
+		select {
+		case msg, ok := <-tr.Msgs():
+			if !ok {
+				t.Fatalf("the stream closed on a disconnect; the client is supposed to retry (disconnect=%v reconnect=%v)", sawDisconnect, sawReconnect)
+			}
+			switch msg.(type) {
+			case Disconnected:
+				sawDisconnect = true
+			case Reconnecting:
+				sawReconnect = true
+			}
+		case <-deadline:
+			t.Fatalf("no reconnect after 5s (disconnect=%v reconnect=%v)", sawDisconnect, sawReconnect)
+		}
+	}
+
+	// And the new connection works: a line on it reaches the model.
+	nc := fb.nextClient(t)
+	_, _ = nc.Write([]byte(":alice!a@h PRIVMSG #x :after the reconnect\r\n"))
+	collectIncoming(t, tr, 1)
+}
+
+// TestClosingTheClientStopsTheRetrying: the only thing that ends the loop is our own Close.
+func TestClosingTheClientStopsTheRetrying(t *testing.T) {
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tr.Close()
 
 	deadline := time.After(3 * time.Second)
 	for {
 		select {
 		case _, ok := <-tr.Msgs():
 			if !ok {
-				if tr.Err() == nil {
-					t.Fatal("closed without recording an error")
-				}
-				return
+				return // closed: correct
 			}
 		case <-deadline:
-			t.Fatal("message channel never closed after the peer hung up")
+			t.Fatal("the stream never closed after Close was called")
 		}
 	}
 }

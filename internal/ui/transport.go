@@ -66,8 +66,19 @@ type Transport struct {
 	// bouncer's settings. Replayed upstream numerics include 001 too, so a bare
 	// verb test would ask once per replayed registration line and, on an empty
 	// bouncer, seed the same settings repeatedly. It is touched only by the
-	// read loop.
+	// read loop, and reset by every new connection: a reconnect needs the blob
+	// too, and it may have changed while we were away.
 	prefsAsked bool
+
+	// addr and the credentials are kept so a dropped connection can be rebuilt
+	// without the driver: the transport dials, registers and replays on its own,
+	// and the model is told what happened. A client that dies with the bouncer is
+	// a client the user has to restart by hand after every restart - QUEUE Part 3
+	// item 12 is the same complaint aimed at the daemon, and the client had it
+	// too.
+	addr string
+	nick string
+	pass string
 
 	outq chan string
 	msgs chan tea.Msg
@@ -81,11 +92,13 @@ type Transport struct {
 func Dial(addr string) (*Transport, error) {
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
+		// The first dial fails loudly and to the caller, which is what makes
+		// "the address is wrong" distinguishable from "the bouncer went away".
+		// A later failure is the second case and is retried.
 		return nil, err
 	}
 	t := &Transport{
-		conn:    conn,
-		br:      bufio.NewReaderSize(conn, 64*1024),
+		addr:    addr,
 		windows: make(map[string]bool),
 		own:     make(map[string]bool),
 		netOf:   make(map[string]string),
@@ -97,9 +110,28 @@ func Dial(addr string) (*Transport, error) {
 		msgs:    make(chan tea.Msg, 256),
 		done:    make(chan struct{}),
 	}
-	go t.readLoop()
+	t.install(conn)
+	go t.run()
 	go t.writeLoop()
 	return t, nil
+}
+
+// install makes conn the connection this transport talks through.
+func (t *Transport) install(conn net.Conn) {
+	br := bufio.NewReaderSize(conn, 64*1024)
+	t.mu.Lock()
+	t.conn, t.br = conn, br
+	// A new connection has not been asked for the settings yet.
+	t.prefsAsked = false
+	t.mu.Unlock()
+}
+
+// connNow returns the current connection and reader. Both are swapped by a
+// reconnect, so every use goes through here rather than reading the fields.
+func (t *Transport) connNow() (net.Conn, *bufio.Reader) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.conn, t.br
 }
 
 // Msgs is the channel a driver forwards to Update. It closes when the
@@ -123,6 +155,9 @@ func (t *Transport) Register(nick, pass string) {
 	// such echo looks like a message from a stranger. The 001 handler adds whatever nick
 	// the server actually gave us (it may be the altnick), so this is the first entry in a
 	// set, not the answer.
+	t.mu.Lock()
+	t.nick, t.pass = nick, pass
+	t.mu.Unlock()
 	t.noteSelf(nick)
 	if pass != "" {
 		t.Send("PASS " + pass)
@@ -319,35 +354,138 @@ func (t *Transport) writeLoop() {
 			if !ok {
 				return
 			}
-			if _, err := t.conn.Write([]byte(line + "\r\n")); err != nil {
-				t.fail(err)
-				return
+			// The connection is swapped by a reconnect, so it is read under the lock each
+			// time rather than captured: a writer holding the old one would report a failure
+			// for a line that a fresh connection could have carried.
+			conn, _ := t.connNow()
+			if conn == nil {
+				continue
+			}
+			if _, err := conn.Write([]byte(line + "\r\n")); err != nil {
+				// A write failure must not end the writer: the reader notices the same dead
+				// socket and run() reconnects, and a writer that had returned would leave the
+				// new connection with no way to send anything. The line is reported instead,
+				// because the user typed it and "it vanished" is the one outcome not allowed.
+				t.push(Incoming(Line{
+					Window: "status",
+					Text:   "not sent: " + err.Error(),
+					Kind:   LineError,
+				}))
+				continue
 			}
 		}
 	}
 }
 
-func (t *Transport) readLoop() {
+// run reads the connection, and reconnects when it goes away.
+//
+// The loop is here rather than in the driver because every driver would have to
+// write it: three front ends, one of them spawning a process per browser tab.
+// The first dial is Dial's business and fails to the caller - that is how "wrong
+// address" stays distinguishable from "the bouncer restarted". Everything after
+// it is retried forever, with backoff, until Close or Stop is called: QUEUE Part
+// 3 item 12 is explicit that the only stop is an explicit user action.
+//
+// The stream stays open across reconnects. A closed Msgs channel means "this
+// client is finished", not "this attempt failed", so the pump and the drivers do
+// not have to know a reconnect happened at all.
+func (t *Transport) run() {
 	defer close(t.msgs)
+	for attempt := 0; ; attempt++ {
+		err := t.readOnce()
+		if err == nil {
+			return // Close was called: done is closed and no retry is wanted.
+		}
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+		t.push(Disconnected{Reason: err})
+		// One second, doubling, capped: the same shape the daemon uses upstream
+		// (internal/upstream's BackoffMin/Max), because two reconnects of the same
+		// program behaving differently is a bug report about the wrong one.
+		wait := reconnectDelay(attempt)
+		select {
+		case <-t.done:
+			return
+		case <-time.After(wait):
+		}
+		conn, derr := net.DialTimeout("tcp", t.addr, 10*time.Second)
+		if derr != nil {
+			// Still away. Loop: attempt advances, so the delay grows.
+			t.push(ReconnectFailed{Attempt: attempt + 1, Err: derr})
+			continue
+		}
+		t.install(conn)
+		t.reRegister()
+	}
+}
+
+// readOnce reads one connection to its end, returning the error that ended it,
+// or nil when the transport was closed.
+func (t *Transport) readOnce() error {
+	_, br := t.connNow()
 	for {
-		line, err := t.br.ReadBytes('\n')
+		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			t.handle(line)
 		}
 		if err != nil {
-			// Tell the model before closing the channel. A close is the pump's signal to stop
-			// and carries nothing else: without a message here the screen keeps its last frame,
-			// still saying connected, and the user types into a connection that is not there.
-			//
-			// No net.ErrClosed test here: Close calls fail() before it closes the socket, so
-			// done is already shut by the time this error is read, and push() drops anything
-			// sent after that. One guard is enough, and the one that also stops a panic is the
-			// one worth keeping.
-			t.push(Disconnected{Reason: err})
-			t.fail(err)
-			return
+			if t.stopped() {
+				return nil
+			}
+			return err
 		}
 	}
+}
+
+// stopped reports whether Close or Stop has been called, which is the signal
+// that a dead connection should not be retried.
+func (t *Transport) stopped() bool {
+	select {
+	case <-t.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// reRegister repeats the handshake on a fresh connection.
+//
+// It is Register with one addition: the bouncer replays its whole ring on
+// registration, and the client already holds those lines. Without a marker the
+// same three messages arrive twice and the scrollback grows by the size of the
+// ring on every reconnect, which is the bug that makes people turn reconnect off.
+func (t *Transport) reRegister() {
+	// Announced before the nick check: a transport that never registered still
+	// reconnected, and the model needs to know the link is back even when there is no
+	// handshake to repeat.
+	t.push(Reconnecting{})
+	t.mu.Lock()
+	nick, pass := t.nick, t.pass
+	t.mu.Unlock()
+	if nick == "" {
+		// Register was never called: a transport that only reads has nothing to say on a
+		// new connection either, and sending NICK with an empty name would be worse than
+		// staying quiet.
+		return
+	}
+	t.Register(nick, pass)
+}
+
+// reconnectDelay is the wait before attempt number n (0-based).
+func reconnectDelay(attempt int) time.Duration {
+	const base = time.Second
+	const cap = 30 * time.Second
+	d := base
+	for i := 0; i < attempt && d < cap; i++ {
+		d *= 2
+	}
+	if d > cap {
+		d = cap
+	}
+	return d
 }
 
 // lineTime reads the server-time tag, the IRCv3 tag a server or bouncer uses to say when
@@ -726,6 +864,16 @@ func (t *Transport) handle(raw []byte) {
 	// PREF (this client is the seed). Silence was considered and rejected: it
 	// would need a timer to tell "no settings" from "not answered yet", and a
 	// timer in the registration path is a race with the first settings change.
+	if verb == "001" {
+		t.push(Registered{})
+	}
+	// 376 ends the registration burst, and this bouncer replays its ring before it - so the
+	// replay window the model opened on Reconnecting has to close here rather than on a timer.
+	// A timer would either cut a slow replay short (dropping lines as "seen" that are not) or
+	// keep the window open into live traffic (dropping the first repeated sentence).
+	if verb == "376" {
+		t.push(ReplayFinished{})
+	}
 	if verb == "001" && !t.prefsAsked {
 		t.prefsAsked = true
 		t.Send("PREF GET")
@@ -1194,8 +1342,12 @@ func (t *Transport) fail(err error) {
 	}
 }
 
-// Close ends the transport.
+// Close ends the transport for good: no reconnect is attempted after it.
 func (t *Transport) Close() error {
 	t.fail(net.ErrClosed)
-	return t.conn.Close()
+	conn, _ := t.connNow()
+	if conn == nil {
+		return nil
+	}
+	return conn.Close()
 }
