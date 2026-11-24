@@ -187,7 +187,10 @@ func (t *Transport) Command(text string) string {
 			// than in a private buffer with the bouncer in it.
 			target, msg, _ := strings.Cut(rest, " ")
 			if target != "" && msg != "" {
-				if isStatusTarget(target) {
+				// The admin namespace is a bare command too: the bouncer recognises
+				// "PRIVMSG *controlplane <cmd>", but sending the command directly is what
+				// makes the answer land in the window the operator is looking at.
+				if isStatusTarget(target) || isControlplaneTarget(target) {
 					return msg
 				}
 				return "PRIVMSG " + target + " :" + msg
@@ -228,6 +231,13 @@ func (t *Transport) Command(text string) string {
 // literally called "status" typing /msg status help means the same thing.
 func isStatusTarget(target string) bool {
 	return target == "*status" || target == "status"
+}
+
+// isControlplaneTarget is the admin namespace, which is a separate command surface on the
+// bouncer: *status is the client talking about itself, *controlplane is the operator talking
+// about the process.
+func isControlplaneTarget(target string) bool {
+	return target == "*controlplane" || target == "controlplane"
 }
 
 func (t *Transport) writeLoop() {

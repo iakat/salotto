@@ -250,6 +250,16 @@ type Server struct {
 	// away is ZNC's simple_away: away on detach, back on attach.
 	away *away
 
+	// started is when the server began serving, for the admin uptime line. It is a value on
+	// the server rather than a package-level variable so a test server has its own clock.
+	started time.Time
+
+	// logRing keeps the last few log lines for the admin surface. Bounded on purpose: an
+	// admin command that can return an unbounded slice is a way to allocate the operator's
+	// memory from the wire.
+	logMu   sync.Mutex
+	logRing []string
+
 	linePool sync.Pool
 }
 
@@ -344,7 +354,31 @@ func New(cfg Config) (*Server, error) {
 }
 
 // Serve accepts clients until the listener is closed.
+// logRingCap bounds the admin log buffer. Small on purpose: it exists so an operator can see
+// the last few things the daemon said from the client they already have open, not to be a log
+// store - the daemon writes a real log file for that.
+const logRingCap = 200
+
+// noteLog records one line for the admin surface. It is called by the daemon's log handler,
+// so the ring is fed by the same events the log file sees rather than by a second set of
+// logging calls that would inevitably miss some.
+func (s *Server) noteLog(line string) {
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+	if len(s.logRing) == logRingCap {
+		copy(s.logRing, s.logRing[1:])
+		s.logRing = s.logRing[:logRingCap-1]
+	}
+	s.logRing = append(s.logRing, line)
+}
+
+// NoteLog is the exported form, for the daemon's log handler.
+func (s *Server) NoteLog(line string) { s.noteLog(line) }
+
 func (s *Server) Serve(l net.Listener) error {
+	if s.started.IsZero() {
+		s.started = time.Now()
+	}
 	if s.cfg.TLS {
 		cert, err := tls.LoadX509KeyPair(s.cfg.CertFile, s.cfg.KeyFile)
 		if err != nil {
@@ -496,6 +530,30 @@ func (s *Server) networkName() string {
 // Attached returns the number of clients currently attached to the hub.
 func (s *Server) Attached() int { return s.hub.Len() }
 
+// startTime is when the server started, for the admin uptime line. A zero value - a Server
+// built by a test and never started - reports the current time, so uptime is zero rather than
+// fifty years.
+func (s *Server) startTime() time.Time {
+	if s.started.IsZero() {
+		return time.Now()
+	}
+	return s.started
+}
+
+// RecentLog returns the last n log lines. It exists for the admin surface; the ring is
+// bounded, so this cannot return more than the ring holds.
+func (s *Server) RecentLog(n int) []string {
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+	if n <= 0 || n > len(s.logRing) {
+		n = len(s.logRing)
+	}
+	_ = n
+	out := make([]string, n)
+	copy(out, s.logRing[len(s.logRing)-n:])
+	return out
+}
+
 // networkEntry returns the entry for a network, or nil.
 func (s *Server) networkEntry(name string) *networkEntry {
 	for _, ne := range s.netSnapshot() {
@@ -637,6 +695,11 @@ func (c *client) handle(line, rest []byte) bool {
 	if target, text, ok := statusPrivmsg(rest); ok {
 		_ = target
 		return c.handle([]byte(text), []byte(text))
+	}
+	// The admin namespace. Separate from *status by construction, so the access check that
+	// does not exist yet has exactly one place to go.
+	if text, ok := controlplanePrivmsg(rest); ok {
+		return c.handleControlplane([]byte(text))
 	}
 	switch {
 	case ircline.IsVerb(rest, "CAP"):

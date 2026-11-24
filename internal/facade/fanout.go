@@ -311,6 +311,15 @@ func (h *Hub) BroadcastFromSkip(line []byte, upstreamNick string, skip func(*Sub
 }
 
 // Len returns the number of attached subscribers.
+// Nickname reports the nick this subscriber registered with, for the admin client list. It is
+// a lock-guarded read: the field is written by the registration path on the client's own
+// goroutine, and the admin command reads it from another.
+func (s *Subscriber) Nickname() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nick
+}
+
 func (h *Hub) Len() int {
 	h.mu.Lock()
 	n := h.n
