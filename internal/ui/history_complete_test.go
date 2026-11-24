@@ -104,6 +104,49 @@ func TestScrollingMovedOffTheArrowKeys(t *testing.T) {
 	}
 }
 
+// TestTheTopOfTheBufferStillShowsTheOldestLine - scrolling to the very top must not empty the
+// screen past the oldest line.
+//
+// This is the bug katia reported in five words: "you can scroll up so far the chat goes empty".
+// The old clamp was len(lines), and bodyLines renders the buffer ending at len(lines)-scroll, so
+// scrolling by exactly the buffer length rendered nothing at all. The assertion is on the rendered
+// view, because the defect was invisible in the offset: scroll == len(lines) looked perfectly
+// reasonable and drew a blank box.
+func TestTheTopOfTheBufferStillShowsTheOldestLine(t *testing.T) {
+	m := New("status")
+	m, _ = m.Step(tea.WindowSizeMsg{Width: 60, Height: 12})
+	for i := 0; i < 5; i++ {
+		m, _ = m.Step(Incoming{Window: "status", Nick: "srv", Text: "oldest line here", Kind: LineSystem})
+	}
+	// Scroll far past the top, hard, the way a held-down page key would.
+	for i := 0; i < 50; i++ {
+		m, _ = m.Step(tea.KeyMsg{Type: tea.KeyPgUp})
+	}
+	view := Plain(m.View())
+	if !strings.Contains(view, "oldest line here") {
+		t.Fatalf("at maximum scroll the oldest line is not on screen; the view is blank:\n%s", view)
+	}
+	if m.scroll >= len(m.windows["status"]) {
+		t.Fatalf("scroll = %d, which is at or past the %d-line buffer", m.scroll, len(m.windows["status"]))
+	}
+}
+
+// TestTheWheelCannotScrollIntoEmptiness - the same bound for the mouse path, which has its own
+// entry point and would otherwise keep its own bound.
+func TestTheWheelCannotScrollIntoEmptiness(t *testing.T) {
+	m := New("status")
+	m, _ = m.Step(tea.WindowSizeMsg{Width: 60, Height: 12})
+	for i := 0; i < 5; i++ {
+		m, _ = m.Step(Incoming{Window: "status", Nick: "srv", Text: "a line", Kind: LineSystem})
+	}
+	for i := 0; i < 50; i++ {
+		m = m.scrollBy(3)
+	}
+	if !strings.Contains(Plain(m.View()), "a line") {
+		t.Fatalf("the wheel scrolled past the buffer: scroll=%d lines=%d", m.scroll, len(m.windows["status"]))
+	}
+}
+
 // TestTabCompletesACommand - "/go" from "/g".
 func TestTabCompletesACommand(t *testing.T) {
 	m := New("status")
@@ -219,6 +262,42 @@ func TestTabWithNoCandidatesIsHarmless(t *testing.T) {
 	m = pressKey(m, tea.KeyTab)
 	if string(m.input) != before {
 		t.Fatalf("Tab with no candidates changed %q to %q", before, m.input)
+	}
+}
+
+// TestHelpListsEveryCommandItOffers - the completion list and the help text must describe the same
+// client. A help entry for a command that does not exist is worse than no help, and the way that
+// happens is a hand-written list drifting from the dispatch.
+func TestHelpListsEveryCommandItOffers(t *testing.T) {
+	m := historyFixture(t)
+	m = typeLine(m, "/help")
+	body := systemText(m)
+	for _, c := range modelCommands {
+		if !strings.Contains(body, c) {
+			t.Fatalf("help does not mention %q, which the client implements and Tab offers:\n%s", c, body)
+		}
+	}
+	if !strings.Contains(body, "tab = complete") {
+		t.Fatalf("help does not mention tab completion:\n%s", body)
+	}
+}
+
+// TestEveryModelCommandIsHandledByTheModel - each name Tab offers as a client command must be
+// resolved in the model, not passed to the wire.
+//
+// The naive version of this test checked for an "unknown command" reply, and it was vacuous: the
+// client has no such reply, so a command it does not implement is simply forwarded upstream. What
+// is checkable is the property that matters - a client command produces no wire command at all.
+// /go, /search, /fset and the rest are answerable only here, because the window list and the
+// scrollback live here; forwarding them would be asking the bouncer a question about this screen.
+func TestEveryModelCommandIsHandledByTheModel(t *testing.T) {
+	for _, c := range modelCommands {
+		m := historyFixture(t)
+		if cmd := typeLineCmd(m, c); cmd != nil {
+			if _, sent := cmd().(Sent); sent {
+				t.Fatalf("%q was sent to the wire; it is a client command", c)
+			}
+		}
 	}
 }
 

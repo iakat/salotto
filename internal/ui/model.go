@@ -463,6 +463,9 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// An alias is expanded before anything is parsed, so "/j #x" and "/join #x" are the
 		// same command with one implementation rather than two.
 		text = m.settings.expand(text, 0)
+		if _, _, ok := slash(text, "help"); ok {
+			return m.helpIntoWindow(), nil
+		}
 		if name, rest, ok := slash(text, "fset", "set"); ok {
 			return m.handleFset(name, rest), nil
 		}
@@ -529,19 +532,10 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.historyNext(), nil
 
 	case tea.KeyPgUp:
-		if m.scroll < len(m.windows[m.active]) {
-			m.scroll += m.settings.ScrollStep
-		}
-		return m, nil
+		return m.scrollBy(m.settings.ScrollStep), nil
 
 	case tea.KeyPgDown:
-		if m.scroll > 0 {
-			m.scroll -= m.settings.ScrollStep
-		}
-		if m.scroll < 0 {
-			m.scroll = 0
-		}
-		return m, nil
+		return m.scrollBy(-m.settings.ScrollStep), nil
 
 	case tea.KeyTab:
 		return m.complete(), nil
@@ -678,12 +672,26 @@ func (m Model) completesNicks(prefix string) bool {
 	return false
 }
 
+// helpIntoWindow lists the commands this client resolves itself, plus the wire commands it passes
+// through. It is derived from those two lists rather than written out, because a help text that is
+// maintained by hand is a help text that is wrong - and the wrongness is invisible until a user
+// tries the command it describes.
+func (m Model) helpIntoWindow() Model {
+	m.append(Line{Window: m.active, Nick: "salotto", Kind: LineSystem,
+		Text: "client commands: " + strings.Join(modelCommands, " ")})
+	m.append(Line{Window: m.active, Nick: "salotto", Kind: LineSystem,
+		Text: "sent to the bouncer: " + strings.Join(wireCommands, " ")})
+	m.append(Line{Window: m.active, Nick: "salotto", Kind: LineSystem,
+		Text: "keys: up/down = sent history, tab = complete, PgUp/PgDn = scroll, ctrl-n = next window"})
+	return m
+}
+
 // modelCommands are the commands this client resolves itself. They are listed here rather than
 // derived from the dispatch because the dispatch is a chain of ifs, not a table, and inventing a
 // table for the benefit of Tab would mean two lists to keep in step - the failure mode the /fset
 // screen already had once.
 var modelCommands = []string{
-	"/alias", "/close", "/fset", "/find", "/go", "/help", "/query", "/search", "/settings",
+	"/alias", "/close", "/fset", "/find", "/go", "/help", "/search", "/settings",
 }
 
 // wireCommands are passed through to the bouncer with the leading slash stripped. They are listed
@@ -691,7 +699,7 @@ var modelCommands = []string{
 var wireCommands = []string{
 	"/adminlog", "/away", "/back", "/cap", "/chathistory", "/deop", "/devoice", "/invite",
 	"/join", "/kick", "/list", "/me", "/mode", "/msg", "/nick", "/notice", "/op", "/part",
-	"/quit", "/topic", "/voice", "/who", "/whois",
+	"/query", "/quit", "/topic", "/voice", "/who", "/whois",
 }
 
 func contains(xs []string, s string) bool {
@@ -810,10 +818,28 @@ func (m Model) historyNext() Model {
 // user cannot get out of without scrolling back by exactly the same amount.
 func (m Model) scrollBy(n int) Model {
 	m.scroll += n
+	return m.clampScroll()
+}
+
+// clampScroll holds the scroll offset between the bottom and the oldest line still worth showing.
+//
+// The upper bound used to be len(lines), which is one line too far: bodyLines renders the buffer
+// ending at len(lines)-scroll, so scrolling by exactly the buffer length leaves end=0 and the whole
+// conversation area blank. Measured live as "you can scroll up so far the chat goes empty" - a
+// viewport that can scroll to nothing is not a viewport reading the top, it is a bug that looks
+// like missing history.
+//
+// The bound is therefore len(lines)-1: scrolling stops with the oldest line at the top of the
+// screen, which is what "as far back as it goes" means.
+func (m Model) clampScroll() Model {
 	if m.scroll < 0 {
 		m.scroll = 0
 	}
-	if top := len(m.windows[m.active]); m.scroll > top {
+	top := len(m.windows[m.active]) - 1
+	if top < 0 {
+		top = 0
+	}
+	if m.scroll > top {
 		m.scroll = top
 	}
 	return m
