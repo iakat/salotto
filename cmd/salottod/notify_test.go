@@ -476,3 +476,52 @@ func TestASuccessfulSendIsAlsoReported(t *testing.T) {
 	defer mu.Unlock()
 	t.Fatalf("a successful send said nothing: %v", notes)
 }
+
+// TestATaggedLineIsStillAMention is the bug the live deployment exposed: every line from a
+// tag-capable upstream starts with @time=..., so parseMention's insistence on a leading ":"
+// meant the notifier had never fired on any real network. The unit tests passed because every
+// fixture in them was untagged - the fixtures encoded the same assumption as the code, which is
+// the one way a test cannot catch a mistake.
+func TestATaggedLineIsStillAMention(t *testing.T) {
+	hits := make(chan struct{}, 4)
+	pushes := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case hits <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer pushes.Close()
+
+	saved, savedNick := pushNotify, ownNick
+	defer func() { pushNotify, ownNick = saved, savedNick }()
+	pushNotify, ownNick = newNotifier(pushes.URL, ""), "salotto"
+
+	bouncer := bareServer(t)
+	// The shape the real upstream sends: tags first, then the prefix.
+	dispatchRouted(bouncer, "freebnc", []string{"#salotto"},
+		[]byte("@time=2026-11-24T03:58:44.382Z;msgid=nw4gpu88j97vesqr3dmfvzaf2i :bob!~bob@host PRIVMSG #salotto :salotto: are you there?"))
+
+	select {
+	case <-hits:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a tagged mention produced no notification, so the notifier is blind on any network that sends tags")
+	}
+}
+
+// TestTheTaggedLineIsParsedToo: the same bug at the parser, asserted directly. A dispatch test
+// can pass through the notifier and still be silent if a later guard drops it.
+func TestTheTaggedLineIsParsedToo(t *testing.T) {
+	nick, text := parseMention("@time=2026-11-24T03:58:44Z :bob!~bob@host PRIVMSG #salotto :salotto: hello")
+	if nick != "bob" {
+		t.Fatalf("nick = %q, want bob", nick)
+	}
+	if text != "salotto: hello" {
+		t.Fatalf("text = %q", text)
+	}
+	// And an untagged line still parses, because a server that does not send tags is not wrong.
+	nick, text = parseMention(":bob!~bob@host PRIVMSG #salotto :salotto: hello")
+	if nick != "bob" || text != "salotto: hello" {
+		t.Fatalf("untagged line parsed as nick=%q text=%q", nick, text)
+	}
+}

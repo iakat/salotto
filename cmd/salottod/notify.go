@@ -158,6 +158,18 @@ func utf8Start(b byte) bool { return b&0xC0 != 0x80 }
 // notification with a window name and no text, which is still true, rather than a skipped
 // notification or a panic in the dispatch path.
 func parseMention(line string) (nick, text string) {
+	// IRCv3 message tags come first when they are present: "@time=...;msgid=... :nick!u@h
+	// PRIVMSG #chan :text". Every line from a tag-capable upstream has them, so a parser that
+	// insists on a leading ":" sees no mention on any network that speaks message-tags - which
+	// is most of them, and was all of them here. Found live: the notifier had never once
+	// fired, and the unit tests passed because their fixtures were untagged.
+	if strings.HasPrefix(line, "@") {
+		space := strings.IndexByte(line, ' ')
+		if space < 0 {
+			return "", ""
+		}
+		line = line[space+1:]
+	}
 	// :nick!user@host PRIVMSG #chan :text
 	if !strings.HasPrefix(line, ":") {
 		return "", ""
