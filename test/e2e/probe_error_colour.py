@@ -41,6 +41,10 @@ def main():
         # whatever window happens to be active reads a screen the answer is not on, and that
         # looks exactly like the feature being broken.
         ws.type_line("/go status")
+        # Count the distinct upstreams whose registration replay lands in this one window.
+        # Every network has a window called "status", so if the client keys windows by name
+        # the two replays merge here - which is the 2.1.1 collision, and "status" is reachable
+        # even when no channel name is shared.
         end = time.time() + 12
         while time.time() < end:
             ws.read(min(end, time.time() + 2))
@@ -88,6 +92,18 @@ def main():
                 print("  FAIL the refusal never reached this client at all")
             else:
                 print("  FAIL the refusal arrived but is not drawn")
+            # Which network's status is this? Both networks have a window called
+            # "status", and the client keys windows by name, so this shows one of them.
+            print("  --- whose status is on screen:")
+            whole = "\n".join(ws.term.lines())
+            print("    ch-test mentioned in this window:", "ch-test" in whole)
+            print("    freebnc mentioned in this window:", "freebnc" in whole)
+            hosts = [l.strip()[:80] for l in ws.term.lines() if "Your host is" in l]
+            sidebar = ws.term.lines()[1:4]
+            print("    sidebar:", " | ".join(x.strip()[:34] for x in sidebar if x.strip()))
+            print("    hosts named in this window:", len(hosts))
+            for h in hosts:
+                print("     ", h)
             print("  --- the whole screen:")
             for i, l in enumerate(ws.term.lines()):
                 print(f"   {i}: {l[:96]}")

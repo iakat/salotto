@@ -564,26 +564,33 @@ pieces separately and let each re-establish the enclosing style (see `nickStyled
 colour has to assert the colour is still in effect *after* the last reset, not that a sequence
 appears somewhere in the line.
 
-### 2.1.1 Two networks, one channel name: the window namespace
+### 2.1.1 Two networks, one channel name: the window namespace — **this is live, and it costs data**
 
-A latent limitation, found while testing highlights and then **measured rather than assumed**.
+**Every network has a window called `status`.** The bouncer keys windows by `(network, name)`
+and sends each network's registration replay in its own batch (`ch-test-status-replay`,
+`freebnc-status-replay`). The client keys windows by name alone, so both replays land in one
+window, and which one you see is whichever arrived last.
 
-The bouncer keys windows by `(network, name)`, so two networks may each have a `#salotto`. The
-client's model keys windows by name alone. If a deployment ever has the same channel name on two
-networks, the two windows collapse into one and a line from the network the client is not
-attached to looks merely quiet.
+Measured on the live two-network deployment:
 
-Measured on the live two-network deployment: it does not happen, because nothing creates the
-duplicate. `#salotto` exists only on freebnc, and `targetNetwork` sends the JOIN there, so the
-other network never gets a `#salotto` and the replay carries three distinct batches
-(`ch-test-status`, `freebnc-status`, `freebnc-#salotto`) with no collision. The earlier claim in
-this file that the client "shows one window for two channels" described a state that was never
-live - what was actually wrong that round was the attach and the ANSI reset, both now fixed.
+- Alice's status window shows **freebnc's** 001-005 replay; `ch-test` appears in it nowhere.
+- A `401 No such nick` from ch-test **is** in the bouncer's `ch-test-status-replay` ring and **is**
+  delivered live to a raw client. It is not on the TUI's screen.
 
-So: the limitation is real but unreachable today, and the honest fix when it becomes reachable is
-a qualifier on window identity through the sidebar, `/go`, unread/mention keys and click
-hit-testing - not a renderer patch. Not doing it now, because a namespace change nothing can
-exercise is a change no test can hold, and half of it is worse than none.
+So this is not the cosmetic limitation an earlier revision of this entry described (I first
+wrote it up as a live collision, then "corrected" it to unreachable because no *channel* name was
+shared - the correction was wrong, because `status` is always shared). The user-visible effect is
+that on a two-network deployment **one network's status window is unreachable**, and errors,
+MOTDs and bouncer replies that arrive there are invisible. That is a data-visibility bug, not a
+display preference.
+
+The fix is a qualifier on window identity through the sidebar, `/go`, unread/mention keys, click
+hit-testing and the settings screen's "current window" - the same thing this entry said before.
+What changed is that it can now be exercised by a test with no unusual config: two networks,
+register, assert two status windows exist and each holds its own network's 002.
+
+Until then the deployment is single-network-correct only; alice's two networks are exactly the
+configuration that shows it.
 
 ### 2.2 The three things we do differently from The Lounge, by design
 
