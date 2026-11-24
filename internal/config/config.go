@@ -87,6 +87,18 @@ type Config struct {
 	Networks    []Network
 	// MaxBufferLines caps SETBUFFER, ZNC's GetMaxBufferSize.
 	MaxBufferLines int
+	// ScriptDir is the directory scanned for *.star scripts. Empty means scripting is off,
+	// which is the default: a daemon that loads code from a directory by default is a daemon
+	// whose deployment writes a file to change what the process does.
+	ScriptDir string
+	// ScriptSteps is the per-call interpreter step budget. Zero means the default.
+	ScriptSteps uint64
+	// ScriptTimeoutMS is the per-call wall clock budget in milliseconds. Zero means the
+	// default; negative means no deadline, which exists for the tests and not for operators.
+	ScriptTimeoutMS int
+	// ScriptHookedLines enables the on_line hook. Off by default because it runs script code
+	// on every incoming line, which is the one hook that can make the daemon slow.
+	ScriptHookedLines bool
 
 	// StripControls mirrors ZNC's stripcontrols module: message text is written
 	// to the logs without IRC colours and control bytes. Off by default, as the
@@ -100,6 +112,8 @@ func Default() *Config {
 	return &Config{
 		Listen:          "127.0.0.1:6667",
 		ServerName:      "salotto",
+		ScriptDir:       "",
+		ScriptSteps:     0,
 		StatsListen:     "127.0.0.1:6668",
 		LogQueue:        4096,
 		RingSegments:    8,
@@ -311,6 +325,14 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.TLSKey, err = parseString(value)
 	case "server_name":
 		c.ServerName, err = parseString(value)
+	case "script_dir":
+		c.ScriptDir, err = parseString(value)
+	case "script_steps":
+		c.ScriptSteps, err = parseScriptSteps(value)
+	case "script_timeout_ms":
+		c.ScriptTimeoutMS, err = parseInt(value)
+	case "script_hooked_lines":
+		c.ScriptHookedLines, err = parseBool(value)
 	case "stats_listen":
 		c.StatsListen, err = parseString(value)
 	case "log_dir":
@@ -527,6 +549,17 @@ func readQuoted(s string) (value, rest string, err error) {
 		}
 	}
 	return "", "", errors.New("unterminated quoted string")
+}
+
+// parseScriptSteps is parseUint for one key. It is separate because a step budget of zero is
+// meaningful (use the default) and a negative one is not, so the type is uint64 and the error
+// has to be a real one rather than a silent clamp.
+func parseScriptSteps(value string) (uint64, error) {
+	n, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("script_steps: %w", err)
+	}
+	return n, nil
 }
 
 func parseBool(value string) (bool, error) {

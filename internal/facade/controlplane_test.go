@@ -142,3 +142,68 @@ func TestConfigNeverPrintsSecrets(t *testing.T) {
 		t.Fatalf("CONFIG printed a credential: %q", out)
 	}
 }
+
+// fakeScripts is a scripting engine as far as the admin surface can tell.
+type fakeScripts struct {
+	list   []string
+	reload int
+	log    []string
+}
+
+func (f *fakeScripts) ScriptList() []string { return f.list }
+func (f *fakeScripts) ScriptReload() int    { return f.reload }
+func (f *fakeScripts) ScriptLog() []string  { return f.log }
+
+// TestScriptingOffIsSaidPlainly: "no scripts" and "scripting is off" are different states, and
+// an operator looking for scripts needs to know which one they are in.
+func TestScriptingOffIsSaidPlainly(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	out := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane SCRIPTS")), "\n")
+	if !strings.Contains(out, "script_dir") {
+		t.Fatalf("with scripting off SCRIPTS said %q", out)
+	}
+}
+
+// TestScriptErrorsAreListed: an operator whose edit broke a file has to see it from the client
+// they already have open, not from a log they have to go and find.
+func TestScriptErrorsAreListed(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	s.scripts = &fakeScripts{list: []string{"good.star ok", "bad.star ERROR line 2"}}
+	s.sdir = "/var/lib/salotto/scripts"
+
+	out := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane SCRIPTS")), "\n")
+	if !strings.Contains(out, "bad.star") || !strings.Contains(out, "ERROR") {
+		t.Fatalf("a broken script was not reported: %q", out)
+	}
+}
+
+// TestReloadCanBeAskedFor: the timer is the hot part, this is the impatient part.
+func TestReloadCanBeAskedFor(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	s.scripts = &fakeScripts{reload: 3}
+	out := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane SCRIPTRELOAD")), "\n")
+	if !strings.Contains(out, "3") {
+		t.Fatalf("SCRIPTRELOAD said %q", out)
+	}
+}
+
+// TestAPanicDuringReloadIsReportedRatherThanFatal: -1 is the engine's "I panicked and caught
+// it" answer, and the surface has to distinguish it from "zero scripts".
+func TestAPanicDuringReloadIsReportedRatherThanFatal(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	s.scripts = &fakeScripts{reload: -1}
+	out := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane SCRIPTRELOAD")), "\n")
+	if !strings.Contains(out, "panicked") {
+		t.Fatalf("a caught panic was reported as %q", out)
+	}
+}
+
+// TestScriptLogIsReadable: a script's log() has to go somewhere the operator can see.
+func TestScriptLogIsReadable(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	s.scripts = &fakeScripts{log: []string{"mention #1", "mention #2"}}
+	out := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane SCRIPTLOG")), "\n")
+	if !strings.Contains(out, "mention #2") {
+		t.Fatalf("SCRIPTLOG said %q", out)
+	}
+}

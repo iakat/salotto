@@ -56,6 +56,11 @@ type Config struct {
 	// MaxBufferLines is the largest buffer SETBUFFER will accept, which is
 	// ZNC's GetMaxBufferSize. Zero means the default.
 	MaxBufferLines int
+	// Scripts is the scripting engine, if any. Nil means scripting is off, which is the
+	// default and the safe state: no code is loaded from disk unless the operator asked.
+	Scripts Scripts
+	// ScriptDir is the directory the engine reads, for the admin output.
+	ScriptDir string
 	// UserName is the name TRAFFIC prints for the single local user. ZNC's
 	// TRAFFIC is admin-only and takes the name from the user map; this daemon
 	// has one user, so the name is configuration.
@@ -253,6 +258,8 @@ type Server struct {
 	// started is when the server began serving, for the admin uptime line. It is a value on
 	// the server rather than a package-level variable so a test server has its own clock.
 	started time.Time
+	scripts Scripts
+	sdir    string
 
 	// logRing keeps the last few log lines for the admin surface. Bounded on purpose: an
 	// admin command that can return an unbounded slice is a way to allocate the operator's
@@ -317,6 +324,8 @@ func New(cfg Config) (*Server, error) {
 		windows:      newWindowState(),
 		fingerprints: NewFingerprints(),
 		created:      time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 MST"),
+		scripts:      cfg.Scripts,
+		sdir:         cfg.ScriptDir,
 	}
 	// One away policy for the process: every network is the same user, so an
 	// AWAY fans out over all of them exactly as simple_away's PutIRC does per

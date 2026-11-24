@@ -158,6 +158,20 @@ func run() int {
 		maxClients = 64
 	}
 	hub := facade.NewHub(maxClients)
+	// Scripting is off unless a directory is configured: a daemon that loads code from disk
+	// by default is a daemon whose deployment changes what the process does by writing a file.
+	scripts := newScripting(cfg.ScriptDir, cfg.ScriptSteps, scriptTimeout(cfg.ScriptTimeoutMS), func(msg string) {
+		logger.Info(msg)
+	})
+	lineHook = scripts
+	scriptHookedLines = cfg.ScriptHookedLines
+	if scripts != nil {
+		// Reloading is only useful if something calls it; the timer is what makes
+		// "hot-loaded without restarting" true rather than a documented intention.
+		scripts.StartHotReload(2*time.Second, func(n int) {
+			logger.Info("scripting: reloaded after a change", "scripts", n)
+		})
+	}
 	awayEnabled, awayReason, awayWaitSeconds := cfg.AwayEnabled()
 	srv, err := facade.New(facade.Config{
 		ServerName:  cfg.ServerName,
@@ -177,6 +191,8 @@ func run() int {
 		AwayReason:     awayReason,
 		AwayWait:       time.Duration(awayWaitSeconds) * time.Second,
 		MaxBufferLines: cfg.MaxBufferLines,
+		Scripts:        scripts,
+		ScriptDir:      cfg.ScriptDir,
 	})
 	if err != nil {
 		logger.Error("facade config invalid", "err", err)
@@ -379,8 +395,40 @@ func run() int {
 // A line whose only window is status is the status stream; a line with a
 // channel or query window goes through BroadcastWindows. The caller owns
 // windows and must not keep using it after the call.
+// lineHook is the scripting engine, if one is configured. It is a package-level variable
+// because dispatchRouted is already package-level and threading a parameter through the entire
+// network manager for an optional feature would touch every call site for no benefit.
+var lineHook *scripting
+
+// scriptHookedLines is whether on_line runs at all. The hook is off by default: it runs script
+// code on every incoming line, which is the one hook that can make the daemon slow, and a
+// feature that costs something per line should be something the operator turned on.
+var scriptHookedLines bool
+
+// scriptTimeout turns the config's milliseconds into a duration, keeping the meaning of the
+// three cases distinct: zero means the default, negative means no deadline.
+func scriptTimeout(ms int) time.Duration {
+	if ms == 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// runLineHook gives every script a look at an incoming line.
+//
+// The hook cannot change what happens: it gets values, and its return value is discarded. That
+// is deliberate for now - a scripting layer whose first version can rewrite traffic is a
+// scripting layer whose first bug rewrites traffic.
+func runLineHook(netName string, line []byte) {
+	if lineHook == nil || !scriptHookedLines {
+		return
+	}
+	lineHook.onLine(netName, string(line))
+}
+
 func dispatchRouted(srv *facade.Server, netName string, windows []string, line []byte) {
 	dispatchRoutedFrom(srv, netName, windows, line, nil)
+	runLineHook(netName, line)
 }
 
 // dispatchRoutedFrom is dispatchRouted for a line a client sent. source is that

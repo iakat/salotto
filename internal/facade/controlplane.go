@@ -37,6 +37,9 @@ var controlplaneCommands = []commandDoc{
 	{"JOINUSER", "<user> <#chan>", "refused: salotto is single-user"},
 	{"NETWORKS", "", "the runtime networks and their connection state"},
 	{"RUNTIME", "", "goroutines, heap and uptime"},
+	{"SCRIPTS", "", "the loaded scripts, their hooks and their errors"},
+	{"SCRIPTLOG", "", "the last lines the scripts logged"},
+	{"SCRIPTRELOAD", "", "re-read the script directory without restarting"},
 	{"SHUTDOWN", "[reason]", "stop the daemon"},
 	{"TRAFFICCTL", "", "the traffic counters, resetting them"},
 	{"USERS", "", "the users of this bouncer"},
@@ -87,6 +90,12 @@ func (c *client) handleControlplane(rest []byte) bool {
 		return c.handleTraffic()
 	case "JOINUSER":
 		return c.status("JOINUSER refused: salotto is single-user; a client of this bouncer *is* the user")
+	case "SCRIPTS":
+		return c.cpScripts()
+	case "SCRIPTLOG":
+		return c.cpScriptLog()
+	case "SCRIPTRELOAD":
+		return c.cpScriptReload()
 	case "SHUTDOWN":
 		// Deliberately not implemented here. A shutdown command on an unauthenticated
 		// surface is a denial of service with a friendly name, and the honest state of that
@@ -227,4 +236,73 @@ func (c *client) controlplaneLogs(arg string) bool {
 		}
 	}
 	return true
+}
+
+// Scripts is what the admin surface needs from the scripting engine. It is an interface so
+// this package does not import the Starlark interpreter, and so the tests can hand it a table
+// instead of a script directory.
+type Scripts interface {
+	// ScriptList returns one line per loaded script: name, hook count, or the load error.
+	ScriptList() []string
+	// ScriptReload re-reads the directory and returns how many scripts are loaded.
+	ScriptReload() int
+	// ScriptLog returns the last lines scripts logged.
+	ScriptLog() []string
+}
+
+// cpScripts answers SCRIPTS. A script with a load error is listed with the error rather than
+// omitted: an operator whose edit broke the file needs to see that, and a list that silently
+// drops what will not compile looks identical to a list of everything that works.
+func (c *client) cpScripts() bool {
+	if c.srv.scripts == nil {
+		return c.status("no scripts: scripting is off (set script_dir)")
+	}
+	rows := c.srv.scripts.ScriptList()
+	if len(rows) == 0 {
+		return c.status("no scripts loaded from " + c.srv.scriptDirLabel())
+	}
+	for _, row := range rows {
+		if !c.status("  " + row) {
+			return false
+		}
+	}
+	return c.status("end of scripts")
+}
+
+// cpScriptReload answers SCRIPTRELOAD: the hot reload, from the client.
+func (c *client) cpScriptReload() bool {
+	if c.srv.scripts == nil {
+		return c.status("no scripts: scripting is off (set script_dir)")
+	}
+	n := c.srv.scripts.ScriptReload()
+	if n < 0 {
+		return c.status("reload failed: the script engine panicked, and that is exactly why it is contained")
+	}
+	return c.status(fmt.Sprintf("reloaded %d script(s)", n))
+}
+
+// cpScriptLog answers SCRIPTLOG.
+func (c *client) cpScriptLog() bool {
+	if c.srv.scripts == nil {
+		return c.status("no scripts: scripting is off (set script_dir)")
+	}
+	lines := c.srv.scripts.ScriptLog()
+	if len(lines) == 0 {
+		return c.status("no script output yet")
+	}
+	for _, line := range lines {
+		if !c.status("  " + line) {
+			return false
+		}
+	}
+	return c.status(fmt.Sprintf("end of script log (%d line(s))", len(lines)))
+}
+
+// scriptDirLabel names the directory in the admin output. It is a method so the label lives
+// next to the code that prints it.
+func (s *Server) scriptDirLabel() string {
+	if s.sdir == "" {
+		return "nowhere"
+	}
+	return s.sdir
 }
