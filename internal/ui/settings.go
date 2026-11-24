@@ -290,10 +290,16 @@ func (s Settings) aliasList() []string {
 	return out
 }
 
-// decodeSettings applies one JSON document over the defaults. The file and the
-// bouncer's opaque blob share this rule on purpose: a setting added by a newer
-// client must not make an older client's file unreadable, and a blob from an
-// older client must keep the defaults for the keys it does not have.
+// decodeSettings is where a settings document becomes a Settings, from the file and from the
+// bouncer's PREF blob alike, and both callers go through here on purpose: a client that
+// decoded the wire one way and the file another would have two answers to "what are my
+// settings", and the divergence would show up as a value that survives a restart but not a
+// reconnect.
+//
+// Decoding over the defaults is what makes an older document usable: a client that predates a
+// key keeps the default for it instead of zeroing it, so a setting added by a newer client
+// cannot make an older client's file unreadable and an older blob cannot silently clear a
+// newer client's keys.
 func decodeSettings(data []byte) Settings {
 	s := DefaultSettings()
 	if err := json.Unmarshal(data, &s); err != nil {
