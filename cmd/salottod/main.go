@@ -209,6 +209,7 @@ func run() int {
 		MaxBufferLines: cfg.MaxBufferLines,
 		Scripts:        scripts,
 		ScriptDir:      cfg.ScriptDir,
+		LogDir:         cfg.LogDir,
 	})
 	if err != nil {
 		logger.Error("facade config invalid", "err", err)

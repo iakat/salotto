@@ -2,9 +2,11 @@ package facade
 
 import (
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/iakat/salotto/internal/ircline"
+	"github.com/iakat/salotto/internal/logfile"
 )
 
 // chathistory implements the part of IRCv3 CHATHISTORY a bouncer can honestly promise.
@@ -88,6 +90,19 @@ func (c *client) handleChatHistory(rest []byte) bool {
 		}
 	}
 	if ne == nil {
+		// The window is not in any ring. Before refusing, ask whether it exists on disk: after a
+		// restart every window is in this state, because the ring is memory and the logs are the
+		// only thing that survived. A 421 here reads as "this bouncer does not know that window",
+		// which is a lie about what was recorded and is exactly why scrollback appeared to stop
+		// at the restart.
+		if c.srv.cfg.LogDir != "" {
+			// An empty network means "whichever network has it": logfile.Query already reads
+			// every network directory when it is not told one, which is the same "a read is
+			// free to look" rule the ring lookup uses.
+			if c.historyFromLogs("", window, sub, before, limit) {
+				return true
+			}
+		}
 		return c.numeric421("CHATHISTORY")
 	}
 
@@ -112,6 +127,39 @@ func (c *client) handleChatHistory(rest []byte) bool {
 		}
 		return true
 	})
+
+	// If the ring had nothing older than the cursor, the answer lives in the logs.
+	//
+	// This is the difference between "this bouncer has no history" and "this bouncer restarted".
+	// The ring is memory and it dies with the process; the logs are the only history that
+	// survives, so a BEFORE query whose cursor is older than the ring's oldest line is a
+	// question the disk can answer and the ring cannot. Serving the empty batch instead would
+	// tell the client its scrollback ended at the restart, which is a lie about what was recorded.
+	if c.srv.cfg.LogDir != "" {
+		oldest := int64(0)
+		if len(all) > 0 {
+			oldest = all[0].ts
+		}
+		var fallback bool
+		// BEFORE: the cursor is older than everything we hold. AFTER: nothing here is newer,
+		// so the ring cannot answer that either.
+		switch {
+		case sub == "BEFORE":
+			// Older than everything the ring holds: only the disk can answer.
+			fallback = len(all) == 0 || before < oldest
+		case sub == "AFTER":
+			// Newer than the ring's newest: the ring cannot answer that either.
+			fallback = true
+		case sub == "LATEST":
+			// "The newest N" on a ring that holds nothing is the same question as BEFORE now.
+			fallback = len(all) == 0
+		}
+		if fallback {
+			if c.historyFromLogs(ne.name, window, sub, before, limit) {
+				return true
+			}
+		}
+	}
 
 	// Apply the cursor, then keep the last `limit`.
 	selected := all[:0]
@@ -146,6 +194,102 @@ func (c *client) handleChatHistory(rest []byte) bool {
 		un = next
 		buf := appendReplayLine(nil, sl.line, id, sl.ts)
 		if !c.sub.WriteFrom(buf, forLine) {
+			return false
+		}
+	}
+	return c.send(":", c.srv.cfg.ServerName, " BATCH -", id)
+}
+
+// historyFromLogs answers a CHATHISTORY window from the on-disk conversation logs.
+//
+// The logs are line-oriented text written by internal/logfile, and logfile.Query already knows how
+// to read them - including the date index - so this reuses it rather than teaching the bouncer a
+// second format. What it adds is the translation: a hit is "date time network window body", which
+// is a sentence for a human, and a CHATHISTORY batch needs the line as it would appear on the wire.
+//
+// The batch is the same shape as the ring's, with the same id, because a client must not be able
+// to tell which half of the bouncer answered - the ring and the logs are both "history", and a
+// second wire form would make the client care about a distinction that is ours.
+func (c *client) historyFromLogs(network, window, sub string, cursor int64, limit int) bool {
+	// The cursor is a nanosecond stamp; the log query wants dates. Ask for a window wide enough
+	// to hold `limit` lines before it, then trim: a day either side is cheap and the trim below
+	// is exact, whereas guessing the right number of days is not.
+	until := time.Unix(0, cursor).UTC()
+	if cursor == 0 {
+		until = time.Now().UTC()
+	}
+	since := until.AddDate(0, 0, -30)
+	hits, err := logfile.Query(c.srv.cfg.LogDir, network, window, "",
+		since.Format("2006-01-02"), until.Format("2006-01-02"), limit, "desc")
+	if err != nil || len(hits) == 0 {
+		return false
+	}
+
+	// Query returns newest first; a batch reads oldest first, like the ring's.
+	lines := make([][]byte, 0, len(hits))
+	times := make([]int64, 0, len(hits))
+	for i := len(hits) - 1; i >= 0; i-- {
+		h := hits[i]
+		// The log line carries no timezone, so it is read on the same clock that wrote it: the
+		// process's local time. That is only sound because the writer and this reader are the
+		// same daemon on the same host - and it is why the deployment runs in UTC, where "local"
+		// and the server-time tags the client compares against are the same clock. A log file
+		// copied between timezones would be an hour out, which is a real limitation of a format
+		// that records a time without saying which time it is.
+		ts, err := time.ParseInLocation("2006-01-02 15:04:05", h.Date+" "+h.Time, time.Local)
+		if err != nil {
+			continue
+		}
+		n := ts.UnixNano()
+		if sub == "BEFORE" && n >= cursor {
+			continue
+		}
+		if sub == "AFTER" && n <= cursor {
+			continue
+		}
+		// The log body is "nick<TAB>text" or a system line; rebuild the wire form from it. The
+		// body is written for a reader, not a parser, so it is re-emitted as a NOTICE-shaped
+		// line from the log rather than pretending to be the original PRIVMSG: inventing a
+		// sender that the log did not record would be worse than saying where it came from.
+		// The log body is the rendered line, "[HH:MM:SS] <nick> text" or "[HH:MM:SS] *** action",
+		// which is a format for a reader. Rebuild a wire line from it: a "<nick>" prefix becomes
+		// a PRIVMSG from that nick, and everything else becomes a NOTICE from the bouncer. The
+		// sender is never invented - a line whose nick the log did not record is attributed to
+		// the bouncer, because guessing who said something is worse than saying where it came
+		// from.
+		body := h.Body
+		if i := strings.Index(body, "] "); i >= 0 && strings.HasPrefix(body, "[") {
+			body = body[i+2:]
+		}
+		var wire []byte
+		if strings.HasPrefix(body, "<") {
+			if end := strings.Index(body, ">"); end > 1 {
+				nick := body[1:end]
+				text := strings.TrimPrefix(body[end+1:], " ")
+				wire = []byte(":" + nick + " PRIVMSG " + window + " :" + text)
+			}
+		}
+		if wire == nil {
+			wire = []byte(":salotto!salotto@salotto NOTICE " + window + " :" + body)
+		}
+		lines = append(lines, wire)
+		times = append(times, n)
+	}
+	if len(lines) == 0 {
+		return false
+	}
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+		times = times[len(times)-limit:]
+	}
+
+	id := "chathistory-" + window
+	if !c.send(":", c.srv.cfg.ServerName, " BATCH +", id, " chathistory ", window) {
+		return false
+	}
+	for i, line := range lines {
+		buf := appendReplayLine(nil, line, id, times[i])
+		if !c.sub.WriteFrom(buf, window) {
 			return false
 		}
 	}

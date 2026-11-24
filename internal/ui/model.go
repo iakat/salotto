@@ -173,6 +173,20 @@ type ChannelModes struct {
 // Sent is the message a transport sends when the user submitted a line.
 type Sent struct{ Text string }
 
+// HistoryWanted is the message asking the transport for older lines than the client holds.
+//
+// It is a message rather than a direct call because the model does not own a socket: the same
+// model drives a local pty and a browser session, and history is fetched from the bouncer in both.
+// The transport turns it into a CHATHISTORY BEFORE for the cursor, which is the only form of
+// "older than this" the protocol has.
+type HistoryWanted struct {
+	Window string
+	// Before is the timestamp of the oldest line the client holds for this window. It is the
+	// cursor: asking for what is older than nothing is asking for the newest, which is not what
+	// a scroll to the top means.
+	Before time.Time
+}
+
 // Model is the whole UI. It is a tea.Model and nothing more: three drivers
 // instantiate it, none of them subclass it.
 type Model struct {
@@ -189,6 +203,10 @@ type Model struct {
 
 	// completion is where Tab is in its cycle.
 	completion completionState
+
+	// historyAsked is set once a request for older history is outstanding, so holding the
+	// PgUp key does not send one CHATHISTORY per repeat to an empty log.
+	historyAsked bool
 
 	windows map[string][]Line
 	active  string
@@ -532,7 +550,8 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.historyNext(), nil
 
 	case tea.KeyPgUp:
-		return m.scrollBy(m.settings.ScrollStep), nil
+		m = m.scrollBy(m.settings.ScrollStep)
+		return m, m.historyRequest()
 
 	case tea.KeyPgDown:
 		return m.scrollBy(-m.settings.ScrollStep), nil
@@ -818,7 +837,40 @@ func (m Model) historyNext() Model {
 // user cannot get out of without scrolling back by exactly the same amount.
 func (m Model) scrollBy(n int) Model {
 	m.scroll += n
-	return m.clampScroll()
+	m = m.clampScroll()
+	// Leaving the top re-arms the request, so scrolling back down and up again asks again -
+	// which is right, because by then the previous answer may have arrived and been appended,
+	// moving the top further back. Staying at the top does not re-arm, so holding the key does
+	// not send a request per repeat.
+	if !m.atTop() {
+		m.historyAsked = false
+	}
+	return m
+}
+
+// atTop reports whether the view is scrolled as far back as this client can go.
+func (m Model) atTop() bool {
+	lines := len(m.windows[m.active])
+	return lines > 0 && m.scroll >= lines-1
+}
+
+// historyRequest is the command that asks for older lines, or nil when there is nothing to ask
+// for. It is split out from scrollBy so a test can see the request without a transport.
+func (m *Model) historyRequest() tea.Cmd {
+	if !m.atTop() || m.historyAsked {
+		return nil
+	}
+	lines := m.windows[m.active]
+	oldest := lines[0]
+	// A line with no timestamp cannot be a cursor. A replayed line always has one; a line drawn
+	// before the clock was known does not, and asking "before zero" is asking for everything.
+	if oldest.Time.IsZero() {
+		return nil
+	}
+	m.historyAsked = true
+	win := m.active
+	cursor := oldest.Time
+	return func() tea.Msg { return HistoryWanted{Window: win, Before: cursor} }
 }
 
 // clampScroll holds the scroll offset between the bottom and the oldest line still worth showing.

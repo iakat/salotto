@@ -3,6 +3,7 @@ package ui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -144,6 +145,88 @@ func TestTheWheelCannotScrollIntoEmptiness(t *testing.T) {
 	}
 	if !strings.Contains(Plain(m.View()), "a line") {
 		t.Fatalf("the wheel scrolled past the buffer: scroll=%d lines=%d", m.scroll, len(m.windows["status"]))
+	}
+}
+
+// TestScrollingToTheTopAsksForOlderHistory - reaching the top of the buffer is the moment the
+// client asks for more, because it is the moment the user is asking for more by continuing to
+// scroll.
+func TestScrollingToTheTopAsksForOlderHistory(t *testing.T) {
+	m := New("status")
+	m, _ = m.Step(tea.WindowSizeMsg{Width: 60, Height: 12})
+	for i := 0; i < 5; i++ {
+		m, _ = m.Step(Incoming{Window: "status", Nick: "srv", Text: "line", Kind: LineMessage,
+			Time: time.Date(2026, 11, 24, 8, 0, i, 0, time.UTC)})
+	}
+	// Capture the first request, not the last: the request fires once on arrival at the top and
+	// is then suppressed, so a loop that keeps the final command sees nil and reports a feature
+	// as missing. The first version of this test did exactly that.
+	var cmd tea.Cmd
+	for i := 0; i < 50 && cmd == nil; i++ {
+		var c tea.Cmd
+		m, c = m.Step(tea.KeyMsg{Type: tea.KeyPgUp})
+		if c != nil {
+			if _, ok := c().(HistoryWanted); ok {
+				cmd = c
+			}
+		}
+	}
+	if cmd == nil {
+		t.Fatal("reaching the top asked for no history")
+	}
+	want, ok := cmd().(HistoryWanted)
+	if !ok {
+		t.Fatalf("the command resolved to %T, not HistoryWanted", cmd())
+	}
+	if want.Window != "status" {
+		t.Fatalf("asked for window %q, want status", want.Window)
+	}
+	// The cursor must be the oldest line held, not now and not zero: "older than this" is only
+	// meaningful relative to what the client already has.
+	if !want.Before.Equal(time.Date(2026, 11, 24, 8, 0, 0, 0, time.UTC)) {
+		t.Fatalf("cursor = %v, want the oldest line's timestamp", want.Before)
+	}
+}
+
+// TestTheHistoryRequestIsNotRepeatedWhileAtTheTop - holding the key must not send a request per
+// repeat; one arrival at the top is one question.
+func TestTheHistoryRequestIsNotRepeatedWhileAtTheTop(t *testing.T) {
+	m := New("status")
+	m, _ = m.Step(tea.WindowSizeMsg{Width: 60, Height: 12})
+	for i := 0; i < 5; i++ {
+		m, _ = m.Step(Incoming{Window: "status", Text: "line", Time: time.Date(2026, 11, 24, 8, 0, i, 0, time.UTC)})
+	}
+	for i := 0; i < 50; i++ {
+		m, _ = m.Step(tea.KeyMsg{Type: tea.KeyPgUp})
+	}
+	// Already at the top and already asked: further presses must not ask again.
+	for i := 0; i < 10; i++ {
+		var cmd tea.Cmd
+		m, cmd = m.Step(tea.KeyMsg{Type: tea.KeyPgUp})
+		if cmd != nil {
+			if _, ok := cmd().(HistoryWanted); ok {
+				t.Fatalf("press %d after arriving asked again", i)
+			}
+		}
+	}
+}
+
+// TestNoHistoryRequestWithoutATimestamp - a line with no time cannot be a cursor, so the client
+// must not ask with a zero time. Asking "before zero" is asking for everything.
+func TestNoHistoryRequestWithoutATimestamp(t *testing.T) {
+	m := New("status")
+	m, _ = m.Step(tea.WindowSizeMsg{Width: 60, Height: 12})
+	for i := 0; i < 5; i++ {
+		m, _ = m.Step(Incoming{Window: "status", Text: "line"})
+	}
+	var cmd tea.Cmd
+	for i := 0; i < 50; i++ {
+		m, cmd = m.Step(tea.KeyMsg{Type: tea.KeyPgUp})
+	}
+	if cmd != nil {
+		if _, ok := cmd().(HistoryWanted); ok {
+			t.Fatal("asked for history with no timestamp to be before")
+		}
 	}
 }
 

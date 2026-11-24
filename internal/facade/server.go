@@ -70,6 +70,17 @@ type Config struct {
 	// TRAFFIC is admin-only and takes the name from the user map; this daemon
 	// has one user, so the name is configuration.
 	UserName string
+	// LogDir is where conversation logs are written, and therefore where older
+	// history can be read back from. Empty means logging is off and the ring is
+	// the only history there is.
+	//
+	// The ring is memory: it is as deep as the operator configured and it dies
+	// with the process. Logs are the only history that survives a restart, so a
+	// CHATHISTORY that stops at the ring's oldest line is answering "what do you
+	// still have in RAM" when the client asked "what happened before". Reading
+	// them here is what makes scrollback as deep as the logs rather than as deep
+	// as the last restart.
+	LogDir string
 }
 
 // BindHosts is the bind-host state the wire commands mutate. Resolution is

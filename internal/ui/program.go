@@ -169,6 +169,14 @@ func (p *Program) step(msg tea.Msg, resolve, sync bool) tea.Cmd {
 		p.submit(sent.Text)
 	}
 
+	// A request for older history is resolved here for the same reason a Sent is: the model has
+	// no socket. The transport knows how to say "older than this" on this wire, and CHATHISTORY
+	// is the only form of it the protocol offers - so the model asks for history and the
+	// transport decides how to ask.
+	if want, ok := msg.(HistoryWanted); ok {
+		p.requestHistory(want)
+	}
+
 	p.mu.Lock()
 	next, cmd := p.model.Step(msg)
 	p.model = next
@@ -217,6 +225,27 @@ func (p *Program) submit(text string) {
 		return
 	}
 	p.tr.Send(line)
+}
+
+// requestHistory asks the bouncer for lines older than the cursor.
+//
+// CHATHISTORY BEFORE takes an ISO8601 timestamp, and the cursor is already one: the client's own
+// oldest line in that window, which came from a server-time tag and is therefore the same clock
+// the bouncer stamped the logs with. That is what makes paging work - the cursor is not "about
+// when I arrived", it is a timestamp the server itself produced.
+//
+// The limit is a page, not everything: a client that asks for ten years of history in one reply
+// makes the bouncer read every log file before it can answer. Paging is the same request repeated
+// as the user scrolls, which is how much history they actually wanted.
+func (p *Program) requestHistory(want HistoryWanted) {
+	if p.tr == nil || want.Window == "" || want.Before.IsZero() {
+		return
+	}
+	// UTC with the exact nanosecond form the bouncer parses. The wire form is the protocol's,
+	// not Go's default: a space instead of "T" would be a timestamp the server rejects, and a
+	// rejected CHATHISTORY is silence rather than an error the user can see.
+	cursor := want.Before.UTC().Format("2006-01-02T15:04:05.000000Z")
+	p.tr.Send("CHATHISTORY BEFORE " + want.Window + " timestamp=" + cursor + " 100")
 }
 
 // WindowName is the active window, so a driver can tell where the user is.
