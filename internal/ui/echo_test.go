@@ -482,3 +482,47 @@ func TestABareStatusLineReachesTheWire(t *testing.T) {
 		}
 	}
 }
+
+// TestMsgStatusReachesTheBouncerAsACommand is the spelling every client's /msg box produces.
+//
+// "/msg *status help" is how a person asks a bouncer what it can do, and if the client
+// forwards it verbatim as "PRIVMSG *status :help" the user sees their own line echoed and no
+// answer. The bouncer accepts the PRIVMSG form too, so both ends work - but the client test
+// is on the WIRE, because the local echo looks identical either way.
+func TestMsgStatusReachesTheBouncerAsACommand(t *testing.T) {
+	Configure()
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	p := NewProgram("status", tr)
+	p.Step(tea.WindowSizeMsg{Width: 100, Height: 30})
+	line := "/msg *status help"
+	for _, ru := range line {
+		if ru == ' ' {
+			p.Step(tea.KeyMsg{Type: tea.KeySpace})
+			continue
+		}
+		p.Step(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ru}})
+	}
+	p.Step(tea.KeyMsg{Type: tea.KeyEnter})
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case got := <-fb.sent:
+			if strings.Contains(got, "NICK") || strings.Contains(got, "USER") || strings.Contains(got, "CAP") {
+				continue
+			}
+			if got != "help" {
+				t.Fatalf("sent %q, want the bouncer command as typed", got)
+			}
+			return
+		case <-deadline:
+			t.Fatal("/msg *status help never left the client")
+		}
+	}
+}

@@ -180,9 +180,16 @@ func (t *Transport) Command(text string) string {
 		return "PRIVMSG " + window + " :\x01ACTION " + rest + "\x01"
 	case "JOIN", "PART", "QUIT", "NICK", "WHOIS", "MSG", "NOTICE", "AWAY", "TOPIC":
 		if upper == "MSG" {
-			// "/msg nick text" is a PRIVMSG, not a bouncer command.
+			// "/msg *status help" is the spelling every IRC client's /msg box produces, and
+			// it must reach the bouncer's own command table. The facade accepts the
+			// PRIVMSG form too, but sending it as a bare command here is what makes the
+			// *status window show the answer in the window the user is looking at rather
+			// than in a private buffer with the bouncer in it.
 			target, msg, _ := strings.Cut(rest, " ")
 			if target != "" && msg != "" {
+				if isStatusTarget(target) {
+					return msg
+				}
 				return "PRIVMSG " + target + " :" + msg
 			}
 			return "PRIVMSG " + rest + " :"
@@ -195,6 +202,13 @@ func (t *Transport) Command(text string) string {
 	// just noise on the wire (and makes the line compare unequal to what a test
 	// or a log expects).
 	return strings.TrimRight(strings.ToUpper(verb)+" "+rest, " ")
+}
+
+// isStatusTarget reports whether a /msg target means the bouncer itself. "*status" is ZNC's
+// spelling and "status" is the name of the window salotto opens; a client whose window is
+// literally called "status" typing /msg status help means the same thing.
+func isStatusTarget(target string) bool {
+	return target == "*status" || target == "status"
 }
 
 func (t *Transport) writeLoop() {
@@ -228,6 +242,25 @@ func (t *Transport) readLoop() {
 	}
 }
 
+// lineTime reads the server-time tag, the IRCv3 tag a server or bouncer uses to say when
+// something happened. It returns the zero time when the tag is absent or unparseable, and
+// the caller substitutes the clock: the tag is the only honest source for a replayed line,
+// and its absence means "now" rather than "unknown".
+func lineTime(tags []byte) time.Time {
+	if len(tags) == 0 {
+		return time.Time{}
+	}
+	v := ircline.TagValue(tags, []byte("time"))
+	if len(v) == 0 {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, string(v))
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
 // handle maps one wire line to a model message. The routing rule is the same one
 // the daemon uses: a channel or query line belongs to the window it names, and
 // anything else is status. Lines the bouncer generates about itself (NOTICEs,
@@ -237,7 +270,20 @@ func (t *Transport) handle(raw []byte) {
 	if line == "" {
 		return
 	}
-	_, rest := ircline.Tags([]byte(line))
+	tags, rest := ircline.Tags([]byte(line))
+
+	// The timestamp comes from the server-time tag when there is one. A bouncer replay is
+	// the case that matters: it delivers what happened hours or days ago, and a line shown
+	// with the time it was replayed would put a whole night of conversation at the minute
+	// the client reconnected. Servers that do not send the tag fall back to the clock,
+	// which is right for a live line and wrong only for a server that is lying.
+	stamp := lineTime(tags)
+	push := func(l Line) {
+		if l.Time.IsZero() {
+			l.Time = stamp
+		}
+		t.push(Incoming(l))
+	}
 
 	prefix, rest := ircline.Prefix(rest)
 	from := ircline.Nick(prefix)
@@ -248,7 +294,7 @@ func (t *Transport) handle(raw []byte) {
 	// ZNC's *status answers everything this way.
 	if verb == "NOTICE" && (from == "status" || from == "") {
 		_, text, _ := strings.Cut(params, " :")
-		t.push(Incoming(Line{Window: "status", Text: text, Kind: LineNotice}))
+		push(Line{Window: "status", Text: text, Kind: LineNotice})
 		return
 	}
 
@@ -279,7 +325,7 @@ func (t *Transport) handle(raw []byte) {
 		if kind != LineNotice && t.mentionsUs(from, text) {
 			line.Mention = true
 		}
-		t.push(Incoming(line))
+		push(line)
 		return
 
 	case "JOIN":
@@ -299,31 +345,31 @@ func (t *Transport) handle(raw []byte) {
 			// says who came. But a stranger joining a channel we are not in is not
 			// our conversation, and opening nothing for it is the right answer.
 			if !t.knowsChannel(channel) {
-				t.push(Incoming(Line{
+				push(Line{
 					Window: "status",
 					Text:   strings.TrimSpace(from + " " + verb + " " + params),
 					Kind:   LineSystem,
-				}))
+				})
 				return
 			}
 			t.addMember(channel, from)
 			t.publishMembers(channel)
-			t.push(Incoming(Line{
+			push(Line{
 				Window: channel,
 				Nick:   from,
 				Text:   "joined",
 				Kind:   LineJoin,
-			}))
+			})
 			return
 		}
 		if channel != "" && t.isSelf(from) {
 			t.note(channel)
-			t.push(Incoming(Line{
+			push(Line{
 				Window: channel,
 				Nick:   from,
 				Text:   "joined " + channel,
 				Kind:   LineSelfJoin,
-			}))
+			})
 			// 324 only arrives when asked, unlike 332 which the server volunteers
 			// on JOIN. Without this the header shows a topic and no modes, which
 			// looks like a channel with no modes rather than one we never asked
@@ -331,11 +377,11 @@ func (t *Transport) handle(raw []byte) {
 			t.Send("MODE " + channel)
 			return
 		}
-		t.push(Incoming(Line{
+		push(Line{
 			Window: "status",
 			Text:   strings.TrimSpace(from + " " + verb + " " + params),
 			Kind:   LineSystem,
-		}))
+		})
 		return
 
 	case "NICK":
@@ -354,11 +400,11 @@ func (t *Transport) handle(raw []byte) {
 		if to != "" && from != "" {
 			t.renameEverywhere(from, to)
 		}
-		t.push(Incoming(Line{
+		push(Line{
 			Window: "status",
 			Text:   strings.TrimSpace(from + " " + verb + " " + params),
 			Kind:   LineSystem,
-		}))
+		})
 		return
 
 	case "KICK":
@@ -373,19 +419,19 @@ func (t *Transport) handle(raw []byte) {
 			if len(fields) >= 3 {
 				reason = " (" + strings.TrimPrefix(strings.Join(fields[2:], " "), ":") + ")"
 			}
-			t.push(Incoming(Line{
+			push(Line{
 				Window: channel,
 				Nick:   from,
 				Text:   "kicked " + fields[1] + reason,
 				Kind:   LineKick,
-			}))
+			})
 			return
 		}
-		t.push(Incoming(Line{
+		push(Line{
 			Window: "status",
 			Text:   strings.TrimSpace(from + " " + verb + " " + params),
 			Kind:   LineSystem,
-		}))
+		})
 		return
 
 	case "PART":
@@ -399,20 +445,20 @@ func (t *Transport) handle(raw []byte) {
 			for _, channel := range strings.Split(fields[0], ",") {
 				t.removeMember(channel, from)
 				t.publishMembers(channel)
-				t.push(Incoming(Line{
+				push(Line{
 					Window: channel,
 					Nick:   from,
 					Text:   "left" + reason,
 					Kind:   LinePart,
-				}))
+				})
 			}
 			return
 		}
-		t.push(Incoming(Line{
+		push(Line{
 			Window: "status",
 			Text:   strings.TrimSpace(from + " " + verb + " " + params),
 			Kind:   LineSystem,
-		}))
+		})
 		return
 
 	case "QUIT":
@@ -426,19 +472,19 @@ func (t *Transport) handle(raw []byte) {
 			if reason != "" {
 				text = "quit (" + reason + ")"
 			}
-			t.push(Incoming(Line{
+			push(Line{
 				Window: channel,
 				Nick:   from,
 				Text:   text,
 				Kind:   LineQuit,
-			}))
+			})
 		}
 		t.removeEverywhere(from)
-		t.push(Incoming(Line{
+		push(Line{
 			Window: "status",
 			Text:   strings.TrimSpace(from + " " + verb + " " + params),
 			Kind:   LineSystem,
-		}))
+		})
 		return
 
 	case "TOPIC":
@@ -450,19 +496,19 @@ func (t *Transport) handle(raw []byte) {
 			channel := fields[0]
 			topic := strings.TrimPrefix(fields[1], ":")
 			t.setTopic(channel, topic)
-			t.push(Incoming(Line{
+			push(Line{
 				Window: channel,
 				Nick:   from,
 				Text:   "set the topic: " + topic,
 				Kind:   LineSystem,
-			}))
+			})
 			return
 		}
-		t.push(Incoming(Line{
+		push(Line{
 			Window: "status",
 			Text:   strings.TrimSpace(from + " " + verb + " " + params),
 			Kind:   LineSystem,
-		}))
+		})
 		return
 
 	case "MODE":
@@ -549,11 +595,11 @@ func (t *Transport) handle(raw []byte) {
 
 	// Numerics and anything else are status. 001 also tells us our own nick,
 	// which the model shows in the status bar.
-	t.push(Incoming(Line{
+	push(Line{
 		Window: "status",
 		Text:   strings.TrimSpace(verb + " " + params),
 		Kind:   LineSystem,
-	}))
+	})
 }
 
 // windowFor decides which window a message belongs to. A message addressed to us

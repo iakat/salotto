@@ -1,10 +1,14 @@
 package ui_test
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -437,5 +441,173 @@ func TestTheProtocolHasNoScreenDescription(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"data":"eA=="`) {
 		t.Fatalf("bytes are not base64 on the wire: %s", b)
+	}
+}
+
+// TestTypedLinesReachTheBouncerThroughTheBridge is the whole front end in one assertion.
+//
+// Every other test of this bridge checks one layer: the PTY gets bytes, the child starts,
+// resize arrives as a WindowSizeMsg. None of them asked whether a line a person typed in
+// the browser arrives at the bouncer - and that is the only thing the product does. The
+// local echo is not evidence: the model draws what it was told to send whether or not a
+// socket is involved.
+//
+// So this builds both real binaries, points the web front end at a recording listener,
+// opens a real websocket, types "/join #typed" a key at a time the way xterm sends it,
+// and requires JOIN #typed to arrive at the listener.
+func TestTypedLinesReachTheBouncerThroughTheBridge(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go binary not available")
+	}
+	dir := t.TempDir()
+	web := filepath.Join(dir, "salotto-web")
+	tui := filepath.Join(dir, "salotto-tui")
+	for _, b := range []struct{ out, pkg string }{
+		{web, "github.com/iakat/salotto/cmd/salotto-web"},
+		{tui, "github.com/iakat/salotto/cmd/salotto-tui"},
+	} {
+		build := exec.Command("go", "build", "-o", b.out, b.pkg)
+		build.Env = append(build.Environ(), "CGO_ENABLED=0")
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v\n%s", b.pkg, err, out)
+		}
+	}
+
+	// A listener that speaks just enough IRC to keep the client registered, and records
+	// every line it is given. It keeps accepting, because the front end opens one
+	// connection to probe the bouncer before it serves anything.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	lines := make(chan string, 64)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				sc := bufio.NewScanner(c)
+				for sc.Scan() {
+					line := sc.Text()
+					select {
+					case lines <- line:
+					default:
+					}
+					if strings.HasPrefix(line, "USER") {
+						_, _ = c.Write([]byte(":srv 001 alice :welcome\r\n"))
+					}
+				}
+			}(c)
+		}
+	}()
+
+	// A free port for the front end, taken and released so nothing else can steal it.
+	pl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := pl.Addr().String()
+	_ = pl.Close()
+
+	cmd := exec.Command(web, "-addr", addr, "-bouncer", ln.Addr().String(), "-nick", "alice", "-tui", tui)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	// Wait for the front end to listen, rather than sleeping a guessed number of seconds.
+	var conn *websocket.Conn
+	url := "ws://" + addr + "/ws?cols=90&rows=24"
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		var resp *http.Response
+		conn, resp, err = websocket.DefaultDialer.Dial(url, nil)
+		if err == nil {
+			break
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("dial the front end: %v", err)
+	}
+	defer conn.Close()
+
+	// Type only once the child has drawn something.
+	//
+	// bubbletea puts the terminal into raw mode with TCSAFLUSH, which discards whatever
+	// is pending in the line discipline. Bytes written before that are thrown away - so a
+	// probe (or a person) that types too early loses the input silently, and a test that
+	// sleeps a guessed number of seconds is a test that will one day sleep too little.
+	// The first frame the program draws is the honest signal that it is listening.
+	// The output frame is JSON with the bytes base64'd, so looking for the nick in the raw
+	// message would never match: the payload has to be decoded first. A test that waits for
+	// a string that cannot appear fails after its timeout and blames the code.
+	firstFrame := make(chan struct{})
+	go func() {
+		signalled := false
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var m struct {
+				Type string `json:"type"`
+				Data []byte `json:"data"`
+			}
+			if json.Unmarshal(raw, &m) != nil || m.Type != "output" {
+				continue
+			}
+			if !signalled && bytes.Contains(m.Data, []byte("alice")) {
+				signalled = true
+				close(firstFrame)
+			}
+		}
+	}()
+	select {
+	case <-firstFrame:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the child never drew a frame")
+	}
+
+	type input struct {
+		Type string `json:"type"`
+		Data []byte `json:"data"`
+	}
+	typeIn := func(b byte) {
+		if err := conn.WriteJSON(input{Type: "input", Data: []byte{b}}); err != nil {
+			t.Fatalf("write input: %v", err)
+		}
+	}
+	for _, ru := range "/join #typed" {
+		typeIn(byte(ru))
+	}
+	typeIn('\r')
+
+	// The bouncer connection is not necessarily the FIRST one: the front end probes the
+	// address at startup, and that probe is a bare TCP connection that sends nothing.
+	// Registration lines from the real child are what tell them apart, so read until the
+	// join shows up and only fail when the clock runs out.
+	timeout := time.After(15 * time.Second)
+	for {
+		select {
+		case line := <-lines:
+			t.Logf("bouncer got: %q", line)
+			if line == "JOIN #typed" {
+				return
+			}
+		case <-timeout:
+			t.Fatal("a line typed into the terminal never reached the bouncer")
+		}
 	}
 }

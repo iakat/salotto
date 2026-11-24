@@ -629,6 +629,15 @@ func (c *client) readLoop() {
 }
 
 func (c *client) handle(line, rest []byte) bool {
+	// "PRIVMSG *status <command>" is how ZNC is driven from a client that does not know
+	// bouncer commands are bare verbs - which is every client that offers a "/msg" box.
+	// The whole message is rewritten into the command it names and dispatched again, so
+	// there is exactly one implementation of each command and *status is not a second
+	// dialect.
+	if target, text, ok := statusPrivmsg(rest); ok {
+		_ = target
+		return c.handle([]byte(text), []byte(text))
+	}
 	switch {
 	case ircline.IsVerb(rest, "CAP"):
 		return c.handleCap(rest)
@@ -672,6 +681,8 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleDisableChan(rest, false)
 	case ircline.IsVerb(rest, "SETBUFFER"):
 		return c.handleSetBuffer(rest)
+	case ircline.IsVerb(rest, "HELP"):
+		return c.handleHelp(rest)
 	case ircline.IsVerb(rest, "LISTCHANS"):
 		return c.handleListChans()
 	case ircline.IsVerb(rest, "LISTNETWORKS"):
@@ -705,6 +716,30 @@ func (c *client) handle(line, rest []byte) bool {
 	default:
 		return c.forward(line)
 	}
+}
+
+// statusPrivmsg reports whether a line is a PRIVMSG addressed to the bouncer's own status
+// window, and if so returns the command it carries.
+//
+// Both "*status" and "status" are accepted: ZNC uses the star, salotto names its own window
+// without one, and a user typing either means the same thing. The check is on the target
+// only - a message to a channel that happens to start with "status" is chat.
+func statusPrivmsg(rest []byte) (target string, text string, ok bool) {
+	if !ircline.IsVerb(rest, "PRIVMSG") {
+		return "", "", false
+	}
+	params := ircline.Params(rest)
+	to := string(ircline.FirstParam(params))
+	if to != "*status" && to != "status" {
+		return "", "", false
+	}
+	_, body, _ := strings.Cut(string(params), " ")
+	body = strings.TrimPrefix(body, ":")
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return to, "", false
+	}
+	return to, body, true
 }
 
 // commandNetwork returns the network the bind-host commands act on. Like

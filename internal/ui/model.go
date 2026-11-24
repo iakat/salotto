@@ -11,6 +11,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -23,6 +24,15 @@ type Line struct {
 	Nick   string
 	Text   string
 	Kind   LineKind
+
+	// Time is when the line happened. It comes from the server-time tag when the server
+	// or the bouncer sent one, and from the clock otherwise.
+	//
+	// A buffer that spans days cannot be read without it: a bouncer replays what happened
+	// while you were away, and a replay with no timestamps is a wall of text in an order
+	// that only looks chronological. The zero value means "no time known" and renders as
+	// no timestamp rather than as an epoch, because a wrong timestamp is worse than none.
+	Time time.Time
 
 	// Mention marks a line that addressed us by name. It lives on the line rather
 	// than in a separate index so a renderer draws a highlight from the data it is
@@ -72,6 +82,11 @@ const (
 	// the status window means the next thing you type goes out as a bouncer command - the
 	// user joins #chan, says "hello", and the server answers "421 Unknown command".
 	LineSelfJoin
+	// LineDay is the date rule inserted between two lines from different days. It is a
+	// line rather than a per-render decoration so it scrolls with the conversation: a
+	// separator that is computed at draw time moves as you scroll, and the whole point is
+	// to tell you where one day ended.
+	LineDay
 
 	// LinePreview is a link card. It is a line and not a panel because a terminal
 	// has no panels: the one thing a terminal can show beside a message is another
@@ -333,7 +348,7 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// A submitted line is echoed as a line of our own: the model is not the
 		// place that decides whether the transport accepted it, so this is a
 		// local echo and nothing more.
-		m.append(Line{Window: m.active, Nick: "me", Text: text, Kind: LineMessage, Pending: true})
+		m.append(Line{Window: m.active, Nick: "me", Text: text, Kind: LineMessage, Pending: true, Time: time.Now()})
 		m.input = m.input[:0]
 		return m, nil
 
@@ -450,6 +465,19 @@ func (m *Model) append(l Line) {
 	if _, seen := m.windows[l.Window]; !seen {
 		m.order = append(m.order, l.Window)
 	}
+	// A new day gets a rule in the conversation, not a decoration in the renderer. It is
+	// inserted before the first line of the day, which is the only place where "this is a
+	// different day" is true no matter how far the user scrolls.
+	if !l.Time.IsZero() && l.Kind != LineDay {
+		if prev := m.lastTime(l.Window); !prev.IsZero() && !sameDay(prev, l.Time) {
+			m.windows[l.Window] = append(m.windows[l.Window], Line{
+				Window: l.Window,
+				Kind:   LineDay,
+				Text:   l.Time.Format("Monday 2 Jan 2006"),
+				Time:   l.Time,
+			})
+		}
+	}
 	m.windows[l.Window] = append(m.windows[l.Window], l)
 	// Unread is a count of things you did not see arrive. A line in the window you
 	// are looking at was seen, so it does not count; that is what makes the number
@@ -467,6 +495,27 @@ func (m *Model) append(l Line) {
 	if m.scroll > 0 {
 		m.scroll++
 	}
+}
+
+// lastTime is the time of the newest line in a window that has one. Used to decide
+// whether an arriving line starts a new day.
+func (m *Model) lastTime(window string) time.Time {
+	lines := m.windows[window]
+	for i := len(lines) - 1; i >= 0; i-- {
+		if !lines[i].Time.IsZero() {
+			return lines[i].Time
+		}
+	}
+	return time.Time{}
+}
+
+// sameDay compares two instants by calendar day in the same location. Comparing hours is
+// wrong across a day boundary and comparing UTC days is wrong for anyone not on UTC, which
+// would put the rule an evening early or late depending on the season.
+func sameDay(a, b time.Time) bool {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	return ay == by && am == bm && ad == bd
 }
 
 // Styles are built once: lipgloss resolves colours lazily, so the profile set
@@ -496,13 +545,16 @@ var (
 	// for something a person said.
 	previewStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
 	timeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	bodyStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
-	actionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
-	noticeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
-	systemStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	gapStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	inputStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
-	barStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
+	// dayStyle is the date rule: present enough to find while scrolling, quiet enough that
+	// it does not compete with the conversation on either side of it.
+	dayStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
+	bodyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("188"))
+	actionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
+	noticeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
+	systemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	gapStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	inputStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
+	barStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 )
 
 // View renders the whole screen: a titled box with the scrollback and an input
@@ -516,6 +568,10 @@ type layout struct {
 	winWidth, nickWidth int
 	inner               int
 	contentRows         int
+	// topicRow is true when the active window's topic is drawn on its own line. The
+	// renderer and the mouse handler share this value, so a click lands on the row the
+	// user sees rather than one row off.
+	topicRow bool
 }
 
 func (m Model) layout() layout {
@@ -554,8 +610,16 @@ func (m Model) layout() layout {
 	if l.inner < 8 {
 		l.inner = 8
 	}
-	// Rows: top border, content, separator, input, bottom border, status.
+	// A topic gets a row of its own directly under the title, spanning the full width:
+	// a topic is about the channel, not about the conversation column, and squeezing it
+	// into the title bar truncated the one piece of text a newcomer needs to read in full.
+	l.topicRow = m.topics[m.active] != "" && height >= 10
+
+	// Rows: top border, [topic], content, separator, input, bottom border, status.
 	l.contentRows = height - 5
+	if l.topicRow {
+		l.contentRows--
+	}
 	if l.contentRows < 1 {
 		l.contentRows = 1
 	}
@@ -590,14 +654,21 @@ func (m Model) View() string {
 	if modes := m.modes[m.active]; modes != "" && modes != "+" {
 		b.WriteString(topicStyle.Render("  " + modes))
 	}
-	if topic := m.topics[m.active]; topic != "" {
-		room := l.width - lipgloss.Width(b.String()) - 6
-		if room > 12 {
-			b.WriteString(topicStyle.Render("  " + truncateTo(topic, room)))
-		}
-	}
 	m.closeTop(&b, l.width, "╮")
 	b.WriteString("\n")
+
+	// The topic row. It spans the whole frame rather than the conversation column: a
+	// topic belongs to the channel, and the member list is not a margin for it.
+	if l.topicRow {
+		topic := m.topics[m.active]
+		room := l.width - 4
+		b.WriteString(borderStyle.Render("│ ") + topicStyle.Render(truncateTo(topic, room)))
+		if pad := room - lipgloss.Width(topicStyle.Render(truncateTo(topic, room))); pad > 0 {
+			b.WriteString(strings.Repeat(" ", pad))
+		}
+		b.WriteString(borderStyle.Render(" │"))
+		b.WriteString("\n")
+	}
 
 	for i := 0; i < l.contentRows; i++ {
 		b.WriteString(borderStyle.Render("│"))
@@ -740,6 +811,9 @@ func (m Model) WindowAt(x, y int) string {
 		return ""
 	}
 	row := y - 1 // row 0 is the top border
+	if l.topicRow {
+		row-- // the topic row sits between the border and the list
+	}
 	if row < 0 || row >= l.contentRows {
 		return ""
 	}
@@ -836,6 +910,41 @@ func (m Model) bodyLines(width, n int) []string {
 // style; continuation lines are indented under the text so a wrapped message still
 // reads as one message.
 func lineLines(l Line, width int) []string {
+	// A timestamp is prefixed to every line that has one, and the wrap width shrinks by
+	// exactly the prefix: a line that is wrapped before its timestamp is added is a line
+	// that overflows the frame by six columns on every busy channel.
+	if l.Kind == LineDay {
+		return dayRule(l, width)
+	}
+	stamp := ""
+	if !l.Time.IsZero() {
+		stamp = l.Time.Format("15:04:05") + " "
+	}
+	if stamp != "" {
+		width -= lipgloss.Width(stamp)
+		if width < 8 {
+			stamp = ""
+			width += lipgloss.Width(l.Time.Format("15:04:05")) + 1
+		}
+	}
+	if stamp != "" {
+		out := lineLinesStyled(l, width)
+		for i := range out {
+			if i == 0 {
+				out[i] = timeStyle.Render(stamp) + out[i]
+				continue
+			}
+			out[i] = timeStyle.Render(strings.Repeat(" ", lipgloss.Width(stamp))) + out[i]
+		}
+		return out
+	}
+	return lineLinesStyled(l, width)
+}
+
+// lineLinesStyled is the per-kind renderer, without the timestamp. It is separate so the
+// timestamp logic exists once: each kind already knows how to draw itself, and threading a
+// prefix through all of them would be thirteen chances to forget one.
+func lineLinesStyled(l Line, width int) []string {
 	switch l.Kind {
 	case LineGap:
 		return wrapStyled(gapStyle, l.Text, width, "")
@@ -871,6 +980,22 @@ func lineLines(l Line, width int) []string {
 	}
 }
 
+// dayRule draws the separator between two days: a horizontal rule with the date in it.
+//
+// A chat buffer that spans days needs the boundary to be visible, because "yesterday" is
+// not a property of a line, it is a property of where the line sits in the flow. Deriving
+// it at draw time would put the rule at a different place every scroll; storing it as a
+// line means it scrolls with the conversation it belongs to and a replay from the bouncer
+// carries the same boundaries the live view had.
+func dayRule(l Line, width int) []string {
+	label := l.Text
+	if s := "─── " + label + " "; lipgloss.Width(s) < width {
+		line := s + strings.Repeat("─", width-lipgloss.Width(s))
+		return []string{dayStyle.Render(line)}
+	}
+	return []string{dayStyle.Render(truncateTo(label, width))}
+}
+
 // wrapStyled wraps text to width and styles each resulting line. The indent is applied
 // to continuation lines so a wrapped message lines up under its own text rather than
 // under the nickname.
@@ -878,15 +1003,69 @@ func wrapStyled(style lipgloss.Style, text string, width int, indent string) []s
 	if width < 4 {
 		return []string{style.Render(text)}
 	}
-	chunks := wrapText(text, width)
-	if indent != "" {
-		for i := 1; i < len(chunks); i++ {
-			chunks[i] = indent + chunks[i]
-		}
+	// Continuation lines carry the indent, so they have that many fewer columns to work
+	// with. Adding the indent AFTER wrapping is what pushed every long message one line
+	// past the right border: the chunk was measured at the full width and then made wider.
+	chunks := wrapIndented(text, width, lipgloss.Width(indent))
+	for i := 1; i < len(chunks); i++ {
+		chunks[i] = indent + chunks[i]
 	}
 	out := make([]string, 0, len(chunks))
 	for _, c := range chunks {
 		out = append(out, style.Render(c))
+	}
+	return out
+}
+
+// wrapIndented wraps text where the first line may be `width` wide and every later line only
+// `width-indent`. Indent is the column the continuation has to start at.
+func wrapIndented(text string, width, indent int) []string {
+	if indent <= 0 || width-indent < 4 {
+		return wrapText(text, width)
+	}
+	var out []string
+	cur, curW := "", 0
+	limit := func() int {
+		if len(out) == 0 {
+			return width
+		}
+		return width - indent
+	}
+	flush := func() {
+		if cur != "" {
+			out = append(out, cur)
+			cur, curW = "", 0
+		}
+	}
+	for _, word := range strings.Split(text, " ") {
+		w := lipgloss.Width(word)
+		sep := 0
+		if curW > 0 {
+			sep = 1
+		}
+		if curW+sep+w <= limit() {
+			if sep == 1 {
+				cur += " "
+				curW++
+			}
+			cur += word
+			curW += w
+			continue
+		}
+		flush()
+		for lipgloss.Width(word) > limit() {
+			head := lipgloss.NewStyle().MaxWidth(limit()).Render(word)
+			out = append(out, head)
+			word = strings.TrimPrefix(word, head)
+			if word == "" {
+				break
+			}
+		}
+		cur, curW = word, lipgloss.Width(word)
+	}
+	flush()
+	if len(out) == 0 {
+		out = append(out, "")
 	}
 	return out
 }
