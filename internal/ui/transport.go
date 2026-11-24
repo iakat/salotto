@@ -62,6 +62,11 @@ type Transport struct {
 	modes  map[string]string
 	active string
 
+	// away is who is away and why, from away-notify. It lives here and not on the model for the
+	// same reason membership does: it is wire state that arrives as a line, and the model does
+	// not know what an AWAY is.
+	away map[string]string
+
 	// whois holds the answers being assembled, per nick in lower case. A whois reply arrives as
 	// up to eight numerics and is one answer; collecting them is what lets it be drawn as a
 	// block when it is complete instead of as eight protocol lines. See whois.go.
@@ -111,6 +116,7 @@ func Dial(addr string) (*Transport, error) {
 		topics:  make(map[string]string),
 		modes:   make(map[string]string),
 		whois:   make(map[string]*whoisPending),
+		away:    make(map[string]string),
 		active:  "status",
 		outq:    make(chan string, 64),
 		msgs:    make(chan tea.Msg, 256),
@@ -650,6 +656,13 @@ func (t *Transport) handle(raw []byte) {
 		}
 		if channel != "" && t.isSelf(from) {
 			t.note(channel)
+			// Our own membership has to exist as membership, not just as a window. knowsChannel
+			// answers from t.members, so a self-join that only opened a window left every later
+			// join in that channel looking like a join to a channel we are not in - and those
+			// are dropped on purpose. The symptom was a nicklist and a set of presence events
+			// that never mentioned anyone: bob could join, change his nick and go away, and the
+			// client knew none of it.
+			t.addMember(channel, from)
 			push(Line{
 				Window: channel,
 				Nick:   from,
@@ -683,13 +696,95 @@ func (t *Transport) handle(raw []byte) {
 		if fields := strings.Fields(strings.TrimPrefix(params, ":")); len(fields) > 0 {
 			to = fields[0]
 		}
-		if to != "" && from != "" {
+		// Where the nick was, read *before* the rename lands: renameEverywhere rewrites every
+		// member list, so asking afterwards which channels the old nick was in answers "none".
+		var wasIn []string
+		if from != "" && to != "" {
+			wasIn = t.channelsOf(from)
 			t.renameEverywhere(from, to)
 		}
+		// Drawn in words, not as "alice NICK alice2". The rename is news in every channel the
+		// nick was in, because that is where the change matters - the same reasoning as QUIT,
+		// and the same window set. A nick that only ever spoke in queries still gets the status
+		// line, so a rename is never silent.
+		said := false
+		if from != "" && to != "" {
+			text := "is now known as " + to
+			if t.isSelf(from) {
+				text = "you are now known as " + to
+			}
+			for _, channel := range wasIn {
+				push(Line{
+					Window: channel,
+					Nick:   from,
+					Text:   text,
+					Kind:   LineNick,
+				})
+				said = true
+			}
+			if t.isSelf(from) {
+				push(Line{Window: "status", Text: strings.TrimSpace(text), Kind: LineNick})
+				said = true
+			}
+		}
+		if !said {
+			push(Line{
+				Window: "status",
+				Text:   strings.TrimSpace(from + " " + verb + " " + strings.TrimPrefix(params, ":")),
+				Kind:   LineSystem,
+			})
+		}
+		return
+
+	case "AWAY":
+		// away-notify is what we ask CAP for, so the server volunteers this whenever anyone
+		// changes status - and an unhandled AWAY falls through to the raw dump, which is how
+		// "alice AWAY :gone to lunch" ends up in status as protocol text. It is state, not
+		// scrollback: the nicklist keeps the flag (see setAway) and a line says the change,
+		// because "why did nobody answer" has a better answer than silence.
+		reason := strings.TrimPrefix(strings.TrimSpace(params), ":")
+		t.setAway(from, reason)
+		if from == "" {
+			return
+		}
+		text := "is back"
+		if reason != "" {
+			text = "is away (" + reason + ")"
+		}
+		if t.isSelf(from) {
+			text = strings.TrimPrefix(text, "is ")
+			text = "you are " + text
+		}
+		// In every channel the nick is in, for the same reason a quit is: that is where the
+		// user noticed them, and that is where the answer will or will not come.
+		said := false
+		for _, channel := range t.channelsOf(from) {
+			push(Line{Window: channel, Nick: from, Text: text, Kind: LineAway})
+			said = true
+		}
+		if !said || t.isSelf(from) {
+			push(Line{Window: "status", Nick: from, Text: text, Kind: LineAway})
+		}
+		return
+
+	case "INVITE":
+		// <target> <channel>: somebody wants us in a channel. It is the one message whose whole
+		// value is that it is noticed, so it goes to status as a notice rather than to a channel
+		// the user may not be watching.
+		fields := strings.Fields(params)
+		if len(fields) < 2 {
+			return
+		}
+		// The channel is the last parameter and arrives with its colon when it is a channel
+		// name, which is always: "INVITE us :#secret". Left on, the line reads "invites you to
+		// :#secret" - seen in a diagnostic before it was seen on screen.
+		channel := strings.TrimPrefix(fields[1], ":")
 		push(Line{
-			Window: "status",
-			Text:   strings.TrimSpace(from + " " + verb + " " + params),
-			Kind:   LineSystem,
+			Window:  "status",
+			Nick:    from,
+			Text:    "invites you to " + channel,
+			Kind:    LineNotice,
+			Mention: true,
 		})
 		return
 
@@ -1177,6 +1272,24 @@ func (t *Transport) addMember(channel, nick string) {
 	}
 	if _, seen := set[nick]; !seen {
 		set[nick] = ""
+	}
+	t.mu.Unlock()
+}
+
+// setAway records a nick's presence. It is kept per nick and not per channel, which is what the
+// protocol says: away is a property of the person, and away-notify announces it once.
+func (t *Transport) setAway(nick, reason string) {
+	if nick == "" {
+		return
+	}
+	t.mu.Lock()
+	if t.away == nil {
+		t.away = make(map[string]string)
+	}
+	if reason == "" {
+		delete(t.away, nick)
+	} else {
+		t.away[nick] = reason
 	}
 	t.mu.Unlock()
 }

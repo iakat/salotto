@@ -133,6 +133,10 @@ const (
 	// line, and putting it there means the SSH and PTY front ends get previews for
 	// free instead of the browser getting them alone.
 	LinePreview
+	// LineAway is a presence change: somebody went away or came back. It is news in the
+	// channels they are in, for the same reason a quit is - that is where the user was
+	// talking to them and where the silence will be noticed.
+	LineAway
 
 	// LineError is a numeric reply in the error range: 401 no such nick, 403 cannot
 	// send to channel, 404 too many channels, 473 invite only. It is separate from
@@ -3244,7 +3248,18 @@ func lineLinesStyled(l Line, width int, st Settings) []string {
 	case LineKick:
 		return wrapStyled(kickStyle, "✖ "+l.Text, width, "")
 	case LineNick:
+		// The old nick is part of the sentence in a channel ("bob is now known as boberta"),
+		// and the text alone would read "is now known as boberta" with no subject - which is
+		// what a live probe caught: the line was right and the sentence had lost its beginning.
+		//
+		// A status line carries the whole sentence already ("you are now known as ..."), so
+		// adding a nick there would give "alice you are now known as alice2".
+		if l.Nick != "" {
+			return wrapStyled(eventStyle, "↔ "+l.Nick+" "+l.Text, width, "")
+		}
 		return wrapStyled(eventStyle, "↔ "+l.Text, width, "")
+	case LineAway:
+		return wrapStyled(eventStyle, "⋯ "+l.Nick+" "+l.Text, width, "")
 	case LineTopic:
 		return wrapStyled(topicEventStyle, "≡ "+l.Nick+" "+l.Text, width, "")
 	case LineMode:
