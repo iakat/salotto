@@ -1485,17 +1485,15 @@ func lineLinesStyled(l Line, width int, st Settings) []string {
 	case LineSystem:
 		return wrapStyled(systemStyle, l.Text, width, "")
 	case LineNotice:
-		n := l.Nick
-		if st.NickColors && n != "" {
-			n = nickColor(n).Render(n)
+		if st.NickColors && l.Nick != "" {
+			return nickStyled(noticeStyle, l.Nick, "<", "> ", l.Text, width, "")
 		}
-		return wrapStyled(noticeStyle, "<"+n+"> "+l.Text, width, "")
+		return wrapStyled(noticeStyle, "<"+l.Nick+"> "+l.Text, width, "")
 	case LineAction:
-		n := l.Nick
-		if st.NickColors && n != "" {
-			n = nickColor(n).Render(n)
+		if st.NickColors && l.Nick != "" {
+			return nickStyled(actionStyle, l.Nick, "* ", " ", l.Text, width, "")
 		}
-		return wrapStyled(actionStyle, "* "+n+" "+l.Text, width, "")
+		return wrapStyled(actionStyle, "* "+l.Nick+" "+l.Text, width, "")
 	case LineJoin, LineSelfJoin:
 		return wrapStyled(eventStyle, "→ "+l.Nick+" "+l.Text, width, "")
 	case LinePart:
@@ -1518,14 +1516,14 @@ func lineLinesStyled(l Line, width int, st Settings) []string {
 		if l.Mention {
 			style = mentionStyle
 		}
-		lines := wrapStyled(style, prefix+l.Text, width, strings.Repeat(" ", lipgloss.Width(prefix)))
+		indent := strings.Repeat(" ", lipgloss.Width(prefix))
 		// The nick is coloured, the text is not: a person is recognisable by their name, and
 		// colouring the body makes a busy channel unreadable and the mention highlight
 		// invisible.
-		if len(lines) > 0 && l.Nick != "" && st.NickColors {
-			lines[0] = strings.Replace(lines[0], "<"+l.Nick+">", "<"+nickColor(l.Nick).Render(l.Nick)+">", 1)
+		if l.Nick != "" && st.NickColors {
+			return nickStyled(style, l.Nick, "<", "> ", l.Text, width, indent)
 		}
-		return lines
+		return wrapStyled(style, prefix+l.Text, width, indent)
 	}
 }
 
@@ -1548,6 +1546,35 @@ func dayRule(l Line, width int) []string {
 // wrapStyled wraps text to width and styles each resulting line. The indent is applied
 // to continuation lines so a wrapped message lines up under its own text rather than
 // under the nickname.
+// nickStyled renders lead+nick+trail+body in style, with the nick in its own colour.
+//
+// The pieces are rendered separately on purpose. A lipgloss render ends with an ANSI reset,
+// so splicing a coloured nick into an already-styled string - which is what this used to do -
+// ends the outer style at the nick: every character after it is drawn in the terminal's
+// default colour. For a message that means an uncoloured body, and for the case that found
+// it, a mention highlight set on the line and then wiped by the nick that precedes the text.
+// Each piece therefore re-establishes the outer colour instead of inheriting the gap.
+func nickStyled(style lipgloss.Style, nick, lead, trail, body string, width int, indent string) []string {
+	plainPrefix := lead + nick + trail
+	chunks := wrapIndented(plainPrefix+body, width, lipgloss.Width(indent))
+	for i := 1; i < len(chunks); i++ {
+		chunks[i] = indent + chunks[i]
+	}
+	out := make([]string, 0, len(chunks))
+	for i, c := range chunks {
+		if i == 0 && strings.HasPrefix(c, plainPrefix) {
+			out = append(out,
+				style.Render(lead)+
+					nickColor(nick).Render(nick)+
+					style.Render(trail)+
+					style.Render(strings.TrimPrefix(c, plainPrefix)))
+			continue
+		}
+		out = append(out, style.Render(c))
+	}
+	return out
+}
+
 func wrapStyled(style lipgloss.Style, text string, width int, indent string) []string {
 	if width < 4 {
 		return []string{style.Render(text)}

@@ -223,3 +223,50 @@ func TestTheReadBackIsTheValueNotTheDefault(t *testing.T) {
 		t.Fatalf("timestamps reads back as %q after being turned off", got)
 	}
 }
+
+// TestTheNickColourDoesNotEndTheLineColour pins the bug that hid every highlight.
+//
+// A lipgloss render ends with an ANSI reset. Coloring the nick by splicing that rendered
+// string into an already-styled line therefore ends the line's own style at the nick: the
+// text after it is drawn in the terminal default, so a mention highlight set on the line is
+// visibly wiped by the nick that precedes the text. It was invisible in the model (the
+// Mention flag was set) and invisible in a frame that only checks for escape codes, and
+// obvious the moment a real terminal was asked for the cell colours.
+func TestTheNickColourDoesNotEndTheLineColour(t *testing.T) {
+	m := New("#salotto").WithSettings("/tmp/nowhere.json")
+	m.width, m.height = 120, 30
+	m.settings.NickColors = true
+	m.settings.Highlights = []string{"salotto"}
+	m2, _ := m.Step(Incoming{Window: "#salotto", Nick: "bob", Text: "the salotto spec", Kind: LineMessage})
+	lines := m2.windows["#salotto"]
+	if len(lines) != 1 || !lines[0].Mention {
+		t.Fatalf("the highlight word did not mark the line: %+v", lines)
+	}
+
+	rendered := lineLinesStyled(lines[0], 60, m2.settings)
+	if len(rendered) == 0 {
+		t.Fatal("nothing rendered")
+	}
+	// The mention colour has to still be in effect when the body starts, which is the part
+	// after "> ". Counting the sequence in the whole line is not enough: the old bug had
+	// exactly one occurrence, at the front, and none after the nick.
+	body := rendered[0]
+	if i := strings.Index(body, "> "); i >= 0 {
+		body = body[i:]
+	}
+	if !strings.Contains(body, "\x1b[1;38;5;222m") {
+		t.Fatalf("the mention colour does not continue past the nick: %q", rendered[0])
+	}
+
+	// And a plain line keeps its own body colour, which the same bug had also been eating
+	// for every message on every deployment with nick colours on.
+	plain, _ := New("#salotto").Step(Incoming{Window: "#salotto", Nick: "bob", Text: "hello", Kind: LineMessage})
+	plain.settings.NickColors = true
+	out := lineLinesStyled(plain.windows["#salotto"][0], 60, plain.settings)
+	if len(out) == 0 {
+		t.Fatal("nothing rendered")
+	}
+	if b := out[0]; strings.Index(b, "> ") >= 0 && !strings.Contains(b[strings.Index(b, "> "):], "\x1b[38;5;188m") {
+		t.Fatalf("the body colour stops at the nick: %q", out[0])
+	}
+}
