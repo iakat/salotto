@@ -87,6 +87,42 @@ The `?width=`/`?height=` parameters exist so the page can be exercised without a
 browser; they are applied through the same `tea.WindowSizeMsg` the terminal
 driver sends, not a parallel path (`TestWebResizeIsTheSameWindowSizeMsg`).
 
+## The window list: grouped by server, numbered like weechat
+
+The sidebar is the one part of the screen that needs a fact the model is not
+given by the IRC protocol: which network a window belongs to. A live line is
+not inside a `BATCH`, so the batch id replay happens to carry is not available,
+and two networks can both hold a window called `status`. The bouncer therefore
+writes `@salotto.network=<net>` on **every** line it produces, live and
+replayed (`internal/ircline.TagNetwork` spells it for both ends), and the client
+learns the network from the line rather than guessing it from a batch.
+
+`Model.netOf` caches window → network, fed by lines and by `353` membership -
+membership, because a quiet channel's first traffic is usually its JOIN and a
+sidebar that waited for a message would file the channel under nothing for
+hours. The map is never cleared by an untagged line: a relayed line or a web
+frame rebuilt from JSON must not move a window out from under its heading.
+
+`sidebarRows` builds the list once and both the renderer and `WindowAt` read it.
+That is deliberate - the two used to walk `m.order` separately, and the first
+heading makes an index off by one, which is a click on `#salotto` selecting the
+row above it. A heading row has no window, so a click on one does nothing; and
+when the headings do not fit the budget the list falls back to flat rather than
+clipping, because half a grouped list is worse than the flat one it replaced.
+
+Buffer numbers are identity, not position: assigned the first time the model
+sees a window, never reassigned, never reused after a close. `/b <n>` and
+`/buffer <n>` switch by number, bare `/b` lists them, and `/b` lives in
+`modelCommands` so `/help` and Tab derive it instead of a hand-written string.
+Both behaviours are `/fset` settings (`group_by_server`, `buffer_numbers`),
+defaulting to on; `group_by_server=off` is the flat arrival-order list, drawn by
+the same renderer.
+
+The limit worth knowing: window *identity* is still the name, so two networks'
+`status` are one window. The grouping makes that collision visible instead of
+silent, and QUEUE.md §2.1.1 stays open until the key carries the network through
+`/go`, the unread maps and the settings screen too.
+
 ## What is deliberately not here yet
 
 - **No WebSocket.** W1 replaces the request-per-page part; the render half in
