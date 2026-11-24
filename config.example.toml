@@ -12,6 +12,10 @@ tls_key = ""
 server_name = "salotto"
 stats_listen = "127.0.0.1:6668"
 log_dir = ""                     # empty disables logging
+# Where the bouncer keeps the client settings blob it holds for every client.
+# The file is <state_dir>/prefs.json and its contents are opaque to the daemon.
+# Empty keeps the blob in memory only, so a restart forgets it.
+state_dir = ""
 log_queue = 4096
 # Write message text without IRC colours and control bytes, like ZNC's
 # stripcontrols module. Off by default: the log records what was said.

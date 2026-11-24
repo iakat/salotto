@@ -81,6 +81,12 @@ type Config struct {
 	// them here is what makes scrollback as deep as the logs rather than as deep
 	// as the last restart.
 	LogDir string
+	// StateDir is where the client settings blob is persisted when it is set.
+	// Empty keeps the blob in memory only: this daemon still persists no rings
+	// and no cursors, so requiring a directory to hold settings would make the
+	// default configuration refuse to start over a feature most clients never
+	// use.
+	StateDir string
 }
 
 // BindHosts is the bind-host state the wire commands mutate. Resolution is
@@ -288,6 +294,14 @@ type Server struct {
 	// an act, not a message, and mixing them is how the trail becomes unreadable.
 	adminLog *adminLog
 
+	// prefs is the client settings blob exactly as a client sent it: base64 of
+	// the settings JSON, never parsed here. A new /fset key must ship in a client
+	// release without this daemon changing, and the only way to keep that true is
+	// to have no field list to fall behind. The mutex is what makes a GET racing
+	// a SET answer one of the two complete blobs.
+	prefsMu sync.Mutex
+	prefs   string
+
 	linePool sync.Pool
 }
 
@@ -383,6 +397,10 @@ func New(cfg Config) (*Server, error) {
 		b := make([]byte, 0, maxLine)
 		return &b
 	}
+	// Load even when StateDir is empty: loadPrefs is a no-op then, and keeping
+	// the call here means the first PREF GET after a restart is answered without
+	// waiting for a client that may not exist yet.
+	s.loadPrefs()
 	return s, nil
 }
 
@@ -799,6 +817,8 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleChatHistory(rest)
 	case ircline.IsVerb(rest, "HELP"):
 		return c.handleHelp(rest)
+	case ircline.IsVerb(rest, "PREF"):
+		return c.handlePref(rest)
 	case ircline.IsVerb(rest, "LISTCHANS"):
 		return c.handleListChans()
 	case ircline.IsVerb(rest, "LISTNETWORKS"):

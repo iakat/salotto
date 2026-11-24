@@ -62,14 +62,19 @@ type Network struct {
 
 // Config is the complete salottod configuration.
 type Config struct {
-	Listen          string
-	TLSListen       string
-	TLSCert         string
-	TLSKey          string
-	ServerName      string
-	AdminLog        string
-	StatsListen     string
-	LogDir          string
+	Listen      string
+	TLSListen   string
+	TLSCert     string
+	TLSKey      string
+	ServerName  string
+	AdminLog    string
+	StatsListen string
+	LogDir      string
+	// StateDir is where the bouncer keeps state that outlives a restart. Today
+	// that is only the opaque client settings blob, at <state_dir>/prefs.json;
+	// empty means memory only, which is the honest default while the rings and
+	// cursors still live in RAM.
+	StateDir        string
 	LogQueue        int
 	LogListen       string
 	LogToken        string
@@ -354,6 +359,11 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.StatsListen, err = parseString(value)
 	case "log_dir":
 		c.LogDir, err = parseString(value)
+	case "state_dir":
+		// Where the bouncer keeps the client settings blob. Empty keeps it in
+		// memory only, which is what every test and every deployment that has
+		// not asked for persistence gets.
+		c.StateDir, err = parseString(value)
 	case "log_queue":
 		c.LogQueue, err = parseInt(value)
 	case "log_listen":

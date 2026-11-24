@@ -210,6 +210,7 @@ func run() int {
 		Scripts:        scripts,
 		ScriptDir:      cfg.ScriptDir,
 		LogDir:         cfg.LogDir,
+		StateDir:       cfg.StateDir,
 	})
 	if err != nil {
 		logger.Error("facade config invalid", "err", err)

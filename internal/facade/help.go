@@ -53,6 +53,7 @@ var statusCommands = []commandDoc{
 	{"MOVENETWORK", "", "refused: salotto has a single network per user"},
 	{"PING", "<arg>", "the bouncer answers PONG"},
 	{"PLAYBUFFER", "<#chan>", "replay a window's buffer"},
+	{"PREF", "GET|SET <base64>", "the client settings the bouncer holds for every client"},
 	{"QUIT", "", "close the connection"},
 	{"SETBINDHOST", "<host>", "bind outbound connections to an address"},
 	{"SETBUFFER", "<lines>", "how many lines a window keeps"},
