@@ -459,15 +459,32 @@ PREF SET <base64>
 
 - The blob is the client's settings JSON, base64-encoded so it survives as one
   IRC parameter. The bouncer does not know a setting name, has no field list and
-  performs no validation beyond a 64 KiB cap; a new client-side setting needs no
+  performs no validation beyond a size cap; a new client-side setting needs no
   daemon change.
+- **The cap is reachable through the reader.** `max_line_len` (default 8192) is
+  the command limit and is far smaller than the 64 KiB blob cap, so the reader
+  assembles a line up to `(64 KiB + 2)/3*4 + 1024` bytes — the base64 expansion,
+  the verb and the tags — and dispatch applies `max_line_len` to every verb
+  except `PREF`. Both numbers are computed from one shared constant
+  (`ircline.MaxPrefsBytes`), not configured separately: a cap the reader cannot
+  reach is a promise the daemon cannot keep.
+- **A `PREF SET` whose line was cut is refused, not decoded.** This is not
+  defensive coding. Base64 cut on a four-character boundary still decodes, to
+  JSON that is not JSON: the store would keep a fragment of the settings, `PREF
+  GET` would hand it to every client, each would fail to parse it, and every
+  client would silently revert to the defaults. The symptom ("my settings keep
+  resetting") points at the client while the damage happens here, which is why
+  the truncation is reported by the reader instead of being invisible to the
+  handler.
 - `PREF GET` answers the stored blob, or an explicit empty `PREF` when none is
   stored. The empty answer is what lets a client seed the bouncer's settings
   without a timer: silence would make "nothing stored" indistinguishable from
   "not answered yet".
 - `PREF SET` stores the blob and fans it out to every other attached client,
-  never to the sender. A `SET` with no argument, an oversized blob, or a token
-  that is not base64 is refused with a status `NOTICE`.
+  never to the sender. A `SET` with no argument, a blob over the cap, or a token
+  that is not base64 is refused with a status `NOTICE` that says which of the
+  three it was — a refusal that blames the encoding for an oversized blob sends
+  the user to look at the wrong thing.
 - When `state_dir` is configured the token is written to
   `<state_dir>/prefs.json` as `{"prefs":"<base64>"}` with a temporary file and
   rename, `0o600`, and loaded at startup. Without `state_dir` the blob is in
@@ -476,6 +493,10 @@ PREF SET <base64>
   echoing it, and treats an empty answer as "be the seed". `/fset` and `/alias`
   write the client's local file first (the offline copy for a plain IRCd) and
   then send `PREF SET`.
+- **A blob the bouncer would refuse is refused by the client**, in the status
+  window, before it is sent. The file still has the change, so the honest
+  statement is "saved here, not shared" — not an error that reads as a lost
+  setting.
 
 ## 10. The client
 

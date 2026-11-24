@@ -70,6 +70,16 @@ func TagValue(tags, key []byte) []byte {
 // and a client that does not know it ignores it.
 const TagNetwork = "salotto.network"
 
+// MaxPrefsBytes bounds one client settings blob, and it lives here for the same reason
+// TagNetwork does: the bouncer enforces it and the client refuses locally against it, and two
+// copies of the number would drift into a client that cheerfully sends something the daemon
+// rejects.
+//
+// The number is far larger than any settings document a client has today. The point is not to
+// fit a particular client: it is that an unbounded parameter read off the wire is a way to
+// allocate the operator's memory from the client.
+const MaxPrefsBytes = 64 << 10
+
 // AppendTagValue appends a tag value with the escapes IRCv3 requires. The five characters
 // matter because they are the ones that end a value: a ';' starts the next tag and a space
 // ends the tag blob altogether, so an unescaped value does not produce a wrong tag, it

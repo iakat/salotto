@@ -889,7 +889,7 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 			// nothing better to offer than the defaults the bouncer will use
 			// anyway.
 			if m.settingsPath != "" {
-				return m, m.prefsCmd()
+				return m.prefsCmd()
 			}
 			return m, nil
 		}
@@ -1630,7 +1630,7 @@ func (m Model) handleFset(name, rest string) (Model, tea.Cmd) {
 	}
 	m.saveSettings()
 	m = m.appendSystem(fmt.Sprintf("%s is now %s", key, valueOf(m.settings, key)))
-	return m, m.prefsCmd()
+	return m.prefsCmd()
 }
 
 // handleAlias adds an alias, or lists them. Listing on a bare invocation matters: an alias
@@ -1647,7 +1647,7 @@ func (m Model) handleAlias(rest string) (Model, tea.Cmd) {
 	}
 	m.saveSettings()
 	m = m.appendSystem("alias set: " + rest)
-	return m, m.prefsCmd()
+	return m.prefsCmd()
 }
 
 // valueOf reads a setting back for the confirmation line. It is a second switch over the
@@ -1734,20 +1734,20 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if row.kind == "int" {
 			_ = m.settings.set(row.key, strconv.Itoa(max(1, m.settings.ScrollStep-1)))
 			m.saveSettings()
-			return m, m.prefsCmd()
+			return m.prefsCmd()
 		}
 		return m, nil
 	case tea.KeyRight:
 		if row.kind == "int" {
 			_ = m.settings.set(row.key, strconv.Itoa(m.settings.ScrollStep+1))
 			m.saveSettings()
-			return m, m.prefsCmd()
+			return m.prefsCmd()
 		}
 		return m, nil
 	case tea.KeyEnter, tea.KeySpace:
 		_ = m.settings.set(row.key, "")
 		m.saveSettings()
-		return m, m.prefsCmd()
+		return m.prefsCmd()
 	case tea.KeyRunes:
 		if len(msg.Runes) == 1 && (msg.Runes[0] == 'q' || msg.Runes[0] == 'Q') {
 			m.showSettings = false
@@ -1761,12 +1761,22 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 // separate from saveSettings because the model never owns a socket: the same
 // model drives a terminal, an SSH session and a browser tab, and only the
 // driver knows how to say PREF SET on its wire.
-func (m Model) prefsCmd() tea.Cmd {
+//
+// A blob too large for the bouncer is refused here rather than sent and refused
+// there. The client already knows the size, so sending it would earn a status
+// NOTICE for something it could have reported itself - and the user would be
+// left wondering whether their settings were shared. The file has already been
+// written by the caller, so the change is not lost: it is saved locally and not
+// shared, and the status line says exactly that.
+func (m Model) prefsCmd() (Model, tea.Cmd) {
 	token, err := m.settings.token()
 	if err != nil {
-		return nil
+		return m, nil
 	}
-	return func() tea.Msg { return PrefsPush{Token: token} }
+	if len(token) > maxPrefsToken {
+		return m.appendSystem(fmt.Sprintf("settings saved here but not shared: they encode to %d bytes, over the %d-byte limit a client may send", len(token), maxPrefsToken)), nil
+	}
+	return m, func() tea.Msg { return PrefsPush{Token: token} }
 }
 
 // saveSettings persists the settings next to the client's other state. A failure is reported

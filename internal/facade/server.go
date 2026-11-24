@@ -674,7 +674,12 @@ type client struct {
 
 	scratch   []byte
 	replayBuf []byte
-	readBuf   []byte
+
+	// lineOverflow says the line being handled was cut to fit. It is a field rather than a
+	// parameter because dispatch is recursive, and only PREF consults it: a settings blob cut
+	// in half is the one truncation that turns into silent data loss instead of a shorter
+	// command.
+	lineOverflow bool
 }
 
 func (s *Server) handleConn(conn net.Conn) {
@@ -693,7 +698,6 @@ func (s *Server) handleConn(conn net.Conn) {
 		br:        bufio.NewReaderSize(conn, readSize),
 		scratch:   make([]byte, 0, s.cfg.MaxLineLen+512),
 		replayBuf: make([]byte, 0, maxRingLine+512),
-		readBuf:   make([]byte, s.cfg.MaxLineLen),
 	}
 
 	go c.writeLoop()
@@ -728,7 +732,7 @@ func (c *client) writeLoop() {
 
 func (c *client) readLoop() {
 	for {
-		line, err := c.readLine()
+		line, overflow, err := c.readLine()
 		if err != nil {
 			return
 		}
@@ -737,6 +741,16 @@ func (c *client) readLoop() {
 		}
 		_, rest := ircline.Tags(line)
 		_, rest = ircline.Prefix(rest)
+		// One verb may be longer than a command: PREF SET carries a settings blob, and a blob
+		// cut to MaxLineLen is a fragment that either fails to decode or decodes to broken
+		// JSON. Everything else is cut exactly as it always was.
+		if !isPrefsSet(rest) {
+			line, overflow = c.cutCommandLine(line, overflow)
+		}
+		// A field rather than a parameter because dispatch is recursive: a "PRIVMSG *status
+		// <cmd>" is rewritten into a bare verb and re-enters handle, and the fact that the
+		// original line was cut has to survive that hop. Only PREF consults it.
+		c.lineOverflow = overflow
 		if !c.handle(line, rest) {
 			return
 		}
@@ -1448,35 +1462,119 @@ func (c *client) sendBytes(prefix []string, tail []byte) bool {
 	return c.sub.Write(b)
 }
 
-func (c *client) readLine() ([]byte, error) {
-	line, err := c.br.ReadSlice('\n')
-	if err == bufio.ErrBufferFull {
-		n := len(line)
-		if n > c.srv.cfg.MaxLineLen {
-			n = c.srv.cfg.MaxLineLen
-		}
-		copy(c.readBuf[:n], line[:n])
-		for {
-			_, derr := c.br.ReadSlice('\n')
-			switch derr {
-			case nil:
-				return trimEOL(c.readBuf[:n]), nil
-			case bufio.ErrBufferFull:
-				continue
-			case io.EOF:
-				return trimEOL(c.readBuf[:n]), nil
-			default:
-				return nil, derr
-			}
-		}
+// maxReadLine is the longest line the reader will assemble, and it is larger than MaxLineLen on
+// purpose: one verb carries more than a command.
+//
+// PREF SET carries a base64 settings blob whose legal size is ircline.MaxPrefsBytes, so that is
+// the floor. The extra slack covers the verb, the target and the tags, and it is computed rather
+// than configured so that the two numbers cannot drift: a blob cap the reader cannot reach is a
+// promise the daemon cannot keep, and the failure would be silent at some byte alignments and
+// loud at others.
+func (s *Server) maxReadLine() int {
+	// base64 expands 3 bytes to 4, then the verb, the target, the tags and CRLF.
+	need := (ircline.MaxPrefsBytes+2)/3*4 + 1024
+	if need < s.cfg.MaxLineLen {
+		return s.cfg.MaxLineLen
 	}
-	if err != nil {
-		return nil, err
+	return need
+}
+
+// cutCommandLine applies MaxLineLen to an ordinary command, and reports whether it had to.
+//
+// The long line the reader assembled is only allowed through whole for PREF SET; every other
+// verb gets exactly the truncation it has always had, so a daemon with a 64 KiB blob cap does not
+// silently start accepting 64 KiB PRIVMSGs from anyone who can reach the port.
+func (c *client) cutCommandLine(line []byte, overflow bool) ([]byte, bool) {
+	if overflow {
+		return line, true
 	}
 	if len(line) > c.srv.cfg.MaxLineLen {
-		line = line[:c.srv.cfg.MaxLineLen]
+		return line[:c.srv.cfg.MaxLineLen], true
 	}
-	return trimEOL(line), nil
+	return line, false
+}
+
+// isPrefsSet reports whether a line is the one verb allowed to be longer than a command.
+//
+// It looks at the verb, not at the handler's return value, because the decision has to be made
+// before the line is cut - and a line that has already been cut cannot be recognised by its
+// content any more.
+func isPrefsSet(rest []byte) bool {
+	return ircline.IsVerb(rest, "PREF")
+}
+
+// readLine reads one complete line and reports whether the stream ran past the read limit.
+//
+// The overflow flag is reported rather than silent because one verb cannot survive being cut.
+// Every command the daemon has always accepted a truncated line for - a long JOIN list, a pasted
+// message - is merely shorter when cut, which is why nobody noticed. PREF SET is not shorter
+// when cut: it carries a base64 settings blob, and base64 cut on a four-character boundary still
+// decodes, to JSON that is not JSON. The store would then hold a fragment of somebody's settings
+// and every client that adopted it would silently revert to the defaults.
+//
+// The line is returned whole up to the read limit; applying the command limit is the dispatch's
+// job (see cutCommandLine) because PREF SET is allowed to be longer than a command.
+func (c *client) readLine() ([]byte, bool, error) {
+	line, err := c.br.ReadSlice('\n')
+	if err == bufio.ErrBufferFull {
+		return c.readLongLine(line)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return trimEOL(line), false, nil
+}
+
+// readLongLine finishes a line that did not fit the reader's buffer.
+//
+// Two limits apply and they are deliberately different. MaxLineLen is the command limit, applied
+// after this returns. maxReadLine is larger and exists for one line: PREF SET carries a base64
+// blob whose legal size is MaxPrefsBytes, so a blob the daemon would accept has to be able to
+// arrive at all. Without this the 64 KiB blob cap would be a promise the 8 KiB reader makes
+// impossible to keep, and the failure would depend on whether the cut landed on a base64
+// quantum - a refusal at one alignment and silent data loss at the next.
+//
+// The accumulation is a local slice rather than c.readBuf so that a connection which never
+// pushes settings does not pin the larger buffer: the blob is rare, and a per-client 87 KiB for
+// something used once a session is a cost that only shows up at a thousand connections.
+//
+// Past the read limit the rest of the line is drained and discarded rather than the read
+// stopping: a reader that stops consuming does not reject the line, it desynchronises the
+// stream, and the next command would be parsed out of the middle of the blob.
+func (c *client) readLongLine(head []byte) ([]byte, bool, error) {
+	limit := c.srv.maxReadLine()
+	buf := append([]byte(nil), head...)
+	overflow := false
+	// take appends what fits of one chunk and reports whether something had to be left out.
+	// Both branches of the loop below do exactly this, and writing it twice is how one of them
+	// ends up not setting the flag.
+	take := func(chunk []byte) {
+		room := limit - len(buf)
+		if room <= 0 {
+			if len(chunk) > 0 {
+				overflow = true
+			}
+			return
+		}
+		if len(chunk) > room {
+			buf = append(buf, chunk[:room]...)
+			overflow = true
+			return
+		}
+		buf = append(buf, chunk...)
+	}
+	for {
+		chunk, err := c.br.ReadSlice('\n')
+		switch err {
+		case nil, io.EOF:
+			take(chunk)
+			return trimEOL(buf), overflow, nil
+		case bufio.ErrBufferFull:
+			take(chunk)
+		default:
+			return nil, false, err
+		}
+	}
 }
 
 // tagNetwork is the vendor tag that names the network a line belongs to.

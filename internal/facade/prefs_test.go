@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/iakat/salotto/internal/ircline"
 )
 
 // prefsResponse reads one PREF GET answer and returns its token. The empty token
@@ -144,12 +146,12 @@ func TestPrefsRefuseAnOversizedBlob(t *testing.T) {
 	register(t, conn, br, "alice")
 	collectReplay(t, conn, br)
 
-	big := strings.Repeat("x", maxPrefsBytes+1)
+	big := strings.Repeat("x", ircline.MaxPrefsBytes+1)
 	token := base64.StdEncoding.EncodeToString([]byte(big))
 	sendLines(t, conn, "PREF SET "+token)
 
 	line := readClientLine(t, conn, br)
-	if !strings.Contains(line, " NOTICE ") || !strings.Contains(strings.ToLower(line), "too large") {
+	if !strings.Contains(line, " NOTICE ") || !strings.Contains(strings.ToLower(line), "larger than this daemon accepts") {
 		t.Fatalf("oversized blob was not refused with a status NOTICE: %q", line)
 	}
 

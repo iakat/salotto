@@ -11,12 +11,6 @@ import (
 	"github.com/iakat/salotto/internal/ircline"
 )
 
-// maxPrefsBytes bounds one settings blob. The number is deliberately much
-// larger than any settings document a client has today: the point is not to
-// fit a particular client, it is that an unbounded parameter read off the wire
-// is a way to allocate the operator's memory from the client.
-const maxPrefsBytes = 64 * 1024
-
 // prefsFile is the one file the bouncer keeps here. Its contents are
 // {"prefs":"<base64>"} and nothing in this package parses the string: it is
 // wrapped so the file is valid JSON, and it is opaque so a human poking at it
@@ -32,6 +26,13 @@ const prefsFile = "prefs.json"
 // token is the same fact without the race. The blob itself is never inspected
 // beyond its base64 envelope and its size, which is what lets a client add a
 // setting without this daemon changing.
+//
+// A SET whose line was cut to fit is refused instead of decoded. That check is
+// first and it is not defensive: base64 cut on a four-character boundary still
+// decodes, so without it the store would keep a fragment of somebody's settings,
+// PREF GET would hand that fragment to every client, and each one would fail to
+// parse it and quietly revert to the defaults. The symptom would be "my settings
+// keep resetting", investigated in the client, while the damage happened here.
 func (c *client) handlePref(rest []byte) bool {
 	sub, args := nextToken(ircline.Params(rest))
 	switch {
@@ -47,6 +48,9 @@ func (c *client) handlePref(rest []byte) bool {
 		return c.send(":", c.srv.cfg.ServerName, " PREF ", nick, " ", token)
 
 	case equalFold(sub, "SET"):
+		if c.lineOverflow {
+			return c.status("PREF blob is larger than this daemon accepts (", itoa(uint64(ircline.MaxPrefsBytes)), " bytes)")
+		}
 		token := strings.TrimSpace(strings.TrimPrefix(string(args), ":"))
 		if token == "" {
 			return c.status("Usage: PREF SET <base64>")
@@ -58,8 +62,8 @@ func (c *client) handlePref(rest []byte) bool {
 			// can decode.
 			return c.status("PREF SET expects base64")
 		}
-		if len(raw) > maxPrefsBytes {
-			return c.status("PREF blob is too large (64 KiB max)")
+		if len(raw) > ircline.MaxPrefsBytes {
+			return c.status("PREF blob is larger than this daemon accepts (", itoa(uint64(ircline.MaxPrefsBytes)), " bytes)")
 		}
 		if err := c.srv.storePrefs(token); err != nil && !c.status("PREF stored in memory but not persisted: "+err.Error()) {
 			return false
@@ -172,7 +176,7 @@ func (s *Server) loadPrefs() {
 		s.log.Warn("prefs file is not base64", "path", path, "err", err)
 		return
 	}
-	if len(raw) > maxPrefsBytes {
+	if len(raw) > ircline.MaxPrefsBytes {
 		s.log.Warn("prefs file is too large", "path", path, "bytes", len(raw))
 		return
 	}

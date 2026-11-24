@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/iakat/salotto/internal/ircline"
 )
 
 // Settings is the client's own configuration: how this terminal looks and behaves.
@@ -333,6 +335,14 @@ func LoadSettings(path string) Settings {
 // no spaces after json.Marshal today, but a value containing one - or a future
 // MarshalIndent - would be truncated at the first space, so the encoding is
 // not decoration.
+// maxPrefsToken is the largest token this client will put on the wire.
+//
+// It is the bouncer's blob cap as base64 plus room for the verb and the tags, computed from the
+// shared constant rather than configured: a client-side number that drifts from the daemon's is a
+// client that either refuses something the bouncer would accept or sends something the bouncer
+// rejects, and the second case used to end with a fragment in the settings store.
+const maxPrefsToken = (ircline.MaxPrefsBytes+2)/3*4 + 1024
+
 func (s Settings) token() (string, error) {
 	data, err := json.Marshal(s)
 	if err != nil {
