@@ -174,9 +174,16 @@ recomputed per line - recomputing counts the copies the batch itself has drawn, 
 replay reconciles from scratch instead of drawing one extra copy of everything.
 
 A live line is never compared, because the bouncer never tags one: an untagged repeat is a server
-saying the same thing twice, and dropping it is the silent loss this package refuses. The search
-covers the last 512 lines of a window, which is bounded work per line and still correct, because a
-replay cannot be longer than the ring.
+saying the same thing twice, and dropping it is the silent loss this package refuses.
+
+The baseline is a tally of the window taken once, on the batch's first line, not a search per line.
+That distinction is the whole of it: an earlier version scanned the last 512 lines for each replayed
+line, which made a long reconnect quadratic and, worse, was wrong - the daemon replays a window's
+*whole ring*, so after a real absence the first lines of the replay matched nothing inside the cap
+and were drawn again. Measured against the old code, a 2000-line window replayed after a reconnect
+came back as 4000, and a batch of 700 identical lines over a window holding none delivered 699,
+because a capped scan loses as well as repeats. Tallying once makes the per-line work a map lookup,
+so there is no cap to get wrong.
 
 ## The window you were in is a setting
 

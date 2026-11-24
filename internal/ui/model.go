@@ -268,20 +268,22 @@ type replayKey struct {
 	kind   LineKind
 }
 
-// replayCount is how a batch is reconciled against what the window already held.
-type replayCount struct {
-	// baseline is the number of copies the window held when the batch started.
-	baseline int
-	// seen is how many copies the batch has delivered so far.
-	seen int
-}
-
-// replaySeenWindow is how many trailing lines of a window a replayed line is looked for in.
+// replayBatch is the reconciliation for one replay batch.
 //
-// Not the whole buffer, because the ring is bounded: a replay cannot be longer than the ring, so
-// a duplicate is always near the end of what the client holds. Searching the tail keeps the work
-// per replayed line constant instead of making a long reconnect quadratic.
-const replaySeenWindow = 512
+// The baseline used to be recounted from the window for every replayed line, which made a
+// reconnect quadratic and forced a 512-line cap on the search - and that cap was wrong: the daemon
+// replays a window's whole ring, so after a long absence the first lines of the replay matched
+// nothing inside the cap and were drawn again, every time. The fix is not a bigger window, it is
+// counting once: the baseline is the window as it stood when the batch began, tallied in a single
+// pass, and every line of the batch is then a constant-time lookup.
+type replayTally struct {
+	// id is the batch tag these counts belong to, so a new batch starts from a new tally.
+	id string
+	// held is how many copies of each line identity the window held when the batch started.
+	held map[replayKey]int
+	// seen is how many copies of each identity this batch has delivered so far.
+	seen map[replayKey]int
+}
 
 // replayDuplicate reports whether this replayed line is a copy of one already held, and counts
 // the decision.
@@ -292,39 +294,33 @@ const replaySeenWindow = 512
 // a replay that drops a message the user never saw is worse than one that repeats a message they
 // did.
 func (m *Model) replayDuplicate(window string, l Line) bool {
-	lines := m.windows[window]
-	key := replayKey{batch: l.Batch, window: window, nick: l.Nick, text: l.Text, kind: l.Kind}
-	if m.replaySeen == nil {
-		m.replaySeen = make(map[replayKey]replayCount)
+	// One batch, one tally. The batch is identified by the tag the bouncer put on the line, and
+	// the tally is taken from the window as it is on the batch's first line - before any of the
+	// batch has been drawn, which is what makes "already on screen" mean what it says.
+	b := m.replayTally
+	if b == nil || b.id != l.Batch {
+		b = &replayTally{
+			id:   l.Batch,
+			held: make(map[replayKey]int, 16),
+			seen: make(map[replayKey]int, 16),
+		}
+		for _, have := range m.windows[window] {
+			b.held[replayKey{window: window, nick: have.Nick, text: have.Text, kind: have.Kind}]++
+		}
+		m.replayTally = b
 	}
 
-	// The baseline is how many copies the window held *when this batch started*, and it has to
-	// be recorded on the first line of the batch rather than recomputed per line: every copy the
-	// batch draws becomes part of the window, so a recount would measure the second copy against
-	// a window that now contains the first and suppress the third. That was a real bug - a batch
-	// of three over a window holding one left two.
-	c, started := m.replaySeen[key]
-	if !started {
-		held := 0
-		for i := len(lines) - 1; i >= 0 && i >= len(lines)-replaySeenWindow; i-- {
-			have := lines[i]
-			if have.Nick == l.Nick && have.Text == l.Text && have.Kind == l.Kind {
-				held++
-			}
-		}
-		c.baseline = held
+	// The identity a line is recognised by, without the batch: the batch says which replay this
+	// is, and the window is part of what a line is, not of which replay delivered it.
+	bare := replayKey{window: window, nick: l.Nick, text: l.Text, kind: l.Kind}
+	if b.seen[bare] < b.held[bare] {
+		// Already on screen: this copy is one the client had.
+		b.seen[bare]++
+		return true
 	}
-	if c.baseline == 0 {
-		return false
-	}
-	// The first `baseline` copies this batch delivers are the ones already on screen; anything
-	// past that count is news the client missed while it was away.
-	if c.seen >= c.baseline {
-		return false
-	}
-	c.seen++
-	m.replaySeen[key] = c
-	return true
+	// Past the baseline, this copy is news the client missed while it was away, and drawing it
+	// is the point of the replay.
+	return false
 }
 
 // Disconnected is the message a transport sends once, when its stream ends: the bouncer went
@@ -377,10 +373,10 @@ type Model struct {
 	// reconnectAt is when the last failed attempt was reported, for the same reason: an outage
 	// of a minute is a handful of attempts and only the first needs saying.
 	reconnectAt time.Time
-	// replaySeen counts, per line identity, how many copies the current replay has delivered.
-	// It is how a multiset reconciliation stays honest when the same line legitimately appears
-	// more than once - see replayDuplicate.
-	replaySeen map[replayKey]replayCount
+	// replayTally is the reconciliation for the batch currently arriving, or nil before the
+	// first replayed line. It is how a multiset reconciliation stays honest when the same line
+	// legitimately appears more than once - see replayDuplicate.
+	replayTally *replayTally
 
 	// historyAsked is set once a request for older history is outstanding, so holding the
 	// PgUp key does not send one CHATHISTORY per repeat to an empty log.
@@ -946,10 +942,10 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// After a disconnect the transport retries on its own; say so once, in place of the
 		// disconnect notice, so the user knows the line was not dropped for good.
 		//
-		// A fresh replay counter, because a new connection is a new conversation about what the
-		// client holds. What marks a line as replayed is the bouncer's batch tag, not this
-		// counter - see Line.Replayed.
-		m.replaySeen = make(map[replayKey]replayCount)
+		// A fresh tally, because a new connection is a new conversation about what the client
+		// holds. What marks a line as replayed is the bouncer's batch tag, not this field - see
+		// Line.Replayed.
+		m.replayTally = nil
 		if !m.reconnectShown {
 			m.reconnectShown = true
 			m.append(Line{Window: "status", Text: "reconnecting...", Kind: LineSystem, Time: time.Now()})
