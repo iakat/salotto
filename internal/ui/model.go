@@ -464,6 +464,17 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			}
 			return m.appendSystem("no window matches " + arg + "\n"), nil
 		}
+		// "/search pattern" searches across every window in memory and shows the hits as a
+		// list of jumps. It is resolved here for the same reason /go is: the scrollback lives
+		// in the client, so a command sent upstream could only return what the bouncer's
+		// ring holds rather than what this client has shown.
+		//
+		// The result is a list rather than a jump because search has several answers and
+		// picking one for the user is a guess. Each row names its window, so the next /go
+		// reaches it.
+		if query, ok := searchCommand(text); ok {
+			return m.searchIntoWindow(query), nil
+		}
 		if text == "/close" {
 			// Closing is the mirror of /go and needs the same knowledge of the window list.
 			return m.closeActive(), nil
@@ -560,6 +571,18 @@ func goCommand(text string) (arg string, ok bool) {
 	body := strings.TrimPrefix(text, "/")
 	verb, rest, _ := strings.Cut(body, " ")
 	if !strings.EqualFold(verb, "go") {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
+}
+
+// searchCommand parses "/search <pattern>". Like /go, the pattern is everything after the verb:
+// a phrase with spaces is the common case and cutting at the first space would search for a word
+// the user did not ask for.
+func searchCommand(text string) (query string, ok bool) {
+	body := strings.TrimPrefix(text, "/")
+	verb, rest, _ := strings.Cut(body, " ")
+	if !strings.EqualFold(verb, "search") && !strings.EqualFold(verb, "find") {
 		return "", false
 	}
 	return strings.TrimSpace(rest), true
@@ -1808,6 +1831,44 @@ func (m Model) Search(query string) []SearchResult {
 		}
 	}
 	return out
+}
+
+// searchIntoWindow renders the hits of a search into the active window as system lines.
+//
+// It reports the count first, because "3 hits" is the answer to "did I spell it right" and a list
+// alone does not say whether the list is over. Hits are capped for the same reason the scrollback
+// is: an unbounded write into the window from a one-word query would push everything else out.
+func (m Model) searchIntoWindow(query string) Model {
+	if query == "" {
+		return m.appendSystem("usage: /search <text>\n")
+	}
+	hits := m.Search(query)
+	if len(hits) == 0 {
+		// Naming the query matters: "/search sat" returning nothing and "/search satloto"
+		// returning nothing are different problems and the message should say which.
+		return m.appendSystem("no matches for " + query + "\n")
+	}
+	const maxShown = 50
+	shown := hits
+	extra := 0
+	if len(shown) > maxShown {
+		extra = len(shown) - maxShown
+		shown = shown[:maxShown]
+	}
+	m = m.appendSystem(fmt.Sprintf("%d match(es) for %q, newest window first seen order:\n", len(hits), query))
+	for _, hit := range shown {
+		// The window, the nick and the text, because a hit with no window is a line the user
+		// cannot go back to.
+		nick := hit.Line.Nick
+		if nick == "" {
+			nick = "-"
+		}
+		m = m.appendSystem(fmt.Sprintf("  %s  <%s> %s\n", hit.Window, nick, hit.Line.Text))
+	}
+	if extra > 0 {
+		m = m.appendSystem(fmt.Sprintf("  ... and %d more\n", extra))
+	}
+	return m
 }
 
 // Nicklist returns the members of the active window, or of a named one. An empty
