@@ -772,9 +772,11 @@ func (m *Model) rememberWindow() {
 		return
 	}
 	m.settings.LastWindow = m.active
-	if m.settingsPath != "" {
-		m.saveSettings()
-	}
+	// In memory only. SetActive is called by a click, by /go, by /b, by our own JOIN and by every
+	// step of a search walk - and the walk moves the view once per arrow key. Writing the file
+	// here turned "hold the down arrow in a result list" into one disk write per keystroke, for a
+	// value that is only read back at startup. The write happens with the next real settings
+	// change, which is the same granularity the comment on this feature promises.
 }
 
 // noteNetwork records which network a window is on, ignoring an empty answer.
@@ -1385,9 +1387,11 @@ func (m Model) cycle(delta int) Model {
 		}
 	}
 	idx = (idx + delta + len(m.order)) % len(m.order)
-	m.active = m.order[idx]
-	m.scroll = 0
-	return m
+	// Through SetActive, not by assigning m.active: cycling is choosing a window like any other,
+	// and assigning here left every ^N/^P switch out of the remembered position - so a user who
+	// moved around with the keyboard, quit and came back landed wherever they had last clicked
+	// instead of where they were.
+	return m.SetActive(m.order[idx])
 }
 
 // complete is Tab: it completes what the cursor is on, cycling through candidates on repeat.
@@ -1951,7 +1955,7 @@ func (m Model) handleFset(name, rest string) (Model, tea.Cmd) {
 	if err := m.settings.set(key, value); err != nil {
 		return m.appendSystem(err.Error()), nil
 	}
-	m.saveSettings()
+	m = m.saveSettings()
 	m = m.appendSystem(fmt.Sprintf("%s is now %s", key, valueOf(m.settings, key)))
 	return m.prefsCmd()
 }
@@ -1968,7 +1972,7 @@ func (m Model) handleAlias(rest string) (Model, tea.Cmd) {
 	if err := m.settings.applyAlias(rest); err != nil {
 		return m.appendSystem(err.Error()), nil
 	}
-	m.saveSettings()
+	m = m.saveSettings()
 	m = m.appendSystem("alias set: " + rest)
 	return m.prefsCmd()
 }
@@ -2064,7 +2068,7 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 				return m, nil
 			}
 			m.settingsHint = ""
-			m.saveSettings()
+			m = m.saveSettings()
 			return m.prefsCmd()
 		case tea.KeyBackspace:
 			if len(m.settingsEdit) > 0 {
@@ -2100,14 +2104,14 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case tea.KeyLeft:
 		if row.kind == "int" {
 			_ = m.settings.set(row.key, strconv.Itoa(max(1, m.settings.ScrollStep-1)))
-			m.saveSettings()
+			m = m.saveSettings()
 			return m.prefsCmd()
 		}
 		return m, nil
 	case tea.KeyRight:
 		if row.kind == "int" {
 			_ = m.settings.set(row.key, strconv.Itoa(m.settings.ScrollStep+1))
-			m.saveSettings()
+			m = m.saveSettings()
 			return m.prefsCmd()
 		}
 		return m, nil
@@ -2125,7 +2129,7 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		_ = m.settings.set(row.key, "")
-		m.saveSettings()
+		m = m.saveSettings()
 		return m.prefsCmd()
 	case tea.KeyRunes:
 		if len(msg.Runes) == 1 && (msg.Runes[0] == 'q' || msg.Runes[0] == 'Q') {
@@ -2161,13 +2165,21 @@ func (m Model) prefsCmd() (Model, tea.Cmd) {
 // saveSettings persists the settings next to the client's other state. A failure is reported
 // in the window rather than ignored: a setting that looks saved and is not is worse than one
 // that refused.
-func (m Model) saveSettings() {
+// saveSettings writes the local copy and returns the model with the failure drawn, if any.
+//
+// It used to be a value receiver that appended the error to its own copy and returned nothing, so
+// the message was written into a Model that was immediately discarded: a full disk or a read-only
+// home meant every setting change silently did not persist, and the user was told nothing. The
+// failure is worth a line because the visible symptom otherwise is "my settings keep resetting" -
+// investigated in the sync code, while the cause was here.
+func (m Model) saveSettings() Model {
 	if m.settingsPath == "" {
-		return
+		return m
 	}
 	if err := SaveSettings(m.settingsPath, m.settings); err != nil {
-		m.appendSystem("settings not saved: " + err.Error())
+		return m.appendSystem("settings not saved: " + err.Error())
 	}
+	return m
 }
 
 // WithSettings gives the model a settings file to load and save. It is a separate call rather

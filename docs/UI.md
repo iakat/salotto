@@ -185,6 +185,29 @@ came back as 4000, and a batch of 700 identical lines over a window holding none
 because a capped scan loses as well as repeats. Tallying once makes the per-line work a map lookup,
 so there is no cap to get wrong.
 
+## The settings file is written when a setting changes
+
+Two defects lived in the gap between "the model holds the right value" and "the file holds it",
+and neither is visible from a test that only reads the model.
+
+`saveSettings` appended its failure message to its own copy and returned nothing, because it was a
+value receiver. A full disk or a read-only home therefore meant every setting change silently did
+not persist, and the symptom the user reported would have been "my settings keep resetting" -
+investigated in the sync code, while the cause was local. It now returns the model with the failure
+drawn, and the change still applies in memory: reporting a write failure must not undo what the user
+asked for.
+
+The remembered window was written to disk on every window switch, and a switch happens on every
+step of a search walk. Holding the down arrow in a result list meant one whole-document write per
+keystroke, for a value that is only read at startup. The write now happens with the next real
+settings change, which is the same granularity the feature promises - "my settings sync", not "my
+scrolling syncs".
+
+A third defect surfaced while testing the second: `cycle` (`^N`/`^P`) assigned `m.active` directly
+instead of going through `SetActive`, so every keyboard window switch was invisible to the
+remembered position. A user who moved around with the keyboard and came back landed wherever they
+had last clicked.
+
 ## A search result is something you can go to
 
 `/search` used to write its hits into the active window as a numbered list of text. That answered
