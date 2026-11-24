@@ -345,8 +345,10 @@ func TestReplay(t *testing.T) {
 	}
 
 	wantTime := time.Unix(0, ts).UTC().Format("2006-01-02T15:04:05.000Z")
-	if !strings.HasPrefix(msgs[0], "@batch=libera-#c-replay;aaa=bbb;time="+wantTime+" ") {
-		t.Fatalf("first replayed line = %q, want batch first, existing tag preserved and time tag", msgs[0])
+	// The network tag is appended after the tags the line arrived with, so the existing order
+	// - and the prefix assertion that pins it - is unchanged apart from the new tag at the end.
+	if !strings.HasPrefix(msgs[0], "@batch=libera-#c-replay;aaa=bbb;time="+wantTime+";salotto.network=libera ") {
+		t.Fatalf("first replayed line = %q, want batch first, existing tag preserved, time tag and the network tag", msgs[0])
 	}
 	for i, msg := range msgs {
 		if !strings.Contains(msg, "batch=libera-#c-replay") {
@@ -354,6 +356,12 @@ func TestReplay(t *testing.T) {
 		}
 		if !strings.Contains(msg, "time=") {
 			t.Fatalf("line %d lacks time tag: %q", i, msg)
+		}
+		// The network is on every line, live or replay: a client that only learned it from
+		// batches could not file a live message under its server, and replay is not where a
+		// client that just attached learns about live traffic.
+		if !strings.Contains(msg, "salotto.network=libera") {
+			t.Fatalf("line %d lacks the network tag: %q", i, msg)
 		}
 	}
 	if !strings.HasSuffix(msgs[0], " :one") || !strings.HasSuffix(msgs[1], " :two") || !strings.HasSuffix(msgs[2], " :three") {
@@ -392,6 +400,12 @@ func TestLiveBroadcast(t *testing.T) {
 	wantTime := time.Unix(0, ts).UTC().Format("2006-01-02T15:04:05.000Z")
 	if !strings.Contains(line, "time="+wantTime) {
 		t.Fatalf("live line missing time tag %s: %q", wantTime, line)
+	}
+	// A live line carries the network too. The batch id is not available here - a live line is
+	// not inside a batch - so without this tag a client cannot file the message under a server,
+	// and the sidebar would be flat for exactly the traffic that matters.
+	if !strings.Contains(line, "salotto.network=libera") {
+		t.Fatalf("live line missing the network tag: %q", line)
 	}
 }
 

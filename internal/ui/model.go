@@ -67,6 +67,15 @@ type Line struct {
 	// The echoed line replaces the pending one rather than being added: that keeps the
 	// message in the place the user saw it and gives it its real nick and timestamp.
 	Pending bool
+
+	// Network is the network this line came from, from the bouncer's salotto.network tag.
+	// Empty means "not told".
+	//
+	// It lives on the line because nothing else on the wire carries it: the client keys
+	// windows by name, two networks can both hold "status", and a live line is not inside a
+	// batch, so the batch id that replay happens to carry is not available. Without it the
+	// sidebar is one flat list with no way to say which server a channel belongs to.
+	Network string
 }
 
 // LineKind selects the style a line is drawn with. It exists so the model never
@@ -141,6 +150,12 @@ type PreviewReady struct {
 type Nicklist struct {
 	Window string
 	Nicks  []Nick
+	// Network is which network the window is on, from the same tag the lines carry. It is
+	// here as well as on Line because membership is often the first thing that arrives for a
+	// channel - 353 comes right after our JOIN, before any conversation - and a sidebar that
+	// only learned networks from messages would file a quiet channel under the wrong heading
+	// until somebody spoke in it.
+	Network string
 }
 
 // Nick is one member of a channel: a name and its highest prefix mode, "" for an
@@ -236,6 +251,20 @@ type Model struct {
 	// reason.
 	modes map[string]string
 
+	// netOf is which network each window belongs to, learned from the salotto.network tag
+	// the bouncer puts on every line. It is never erased: a later line without the tag is
+	// not evidence that the window moved, and the sidebar would reshuffle itself under the
+	// user's pointer if it were.
+	//
+	// A window with no entry is the fallback case - a client talking to a plain IRCd, which
+	// has no networks to name - and it is drawn, just not grouped.
+	netOf map[string]string
+
+	// bufferNo is the weechat-style number of each window. The number is identity, not
+	// position: it is assigned the first time the model sees the window and never changes,
+	// so a user who has learnt that #salotto is 3 keeps 3 when other buffers open and close.
+	bufferNo map[string]int
+
 	input   []rune
 	scroll  int
 	focused bool
@@ -285,9 +314,92 @@ func New(window string) Model {
 		nicks:    make(map[string][]Nick),
 		topics:   make(map[string]string),
 		modes:    make(map[string]string),
+		netOf:    make(map[string]string),
+		bufferNo: make(map[string]int),
 	}
 	m.windows[window] = nil
+	// The first window is number 1, which is what weechat does and what makes the numbers
+	// mean something from the first frame: a sidebar of numbers that starts at 2 reads as a
+	// window that failed to load.
+	m.assignBuffer(window)
 	return m
+}
+
+// ensureBuffers numbers every window that has no number yet.
+//
+// It runs on the way into Step, which is the only door a message comes through, and that is
+// enough because every path that creates a window also assigns a number. It is here as well
+// because a driver is free to build a Model value directly (a test does) and a window with no
+// number cannot be reached with /b: a number is cheap to assign and impossible to recover once
+// the user has learnt the wrong one.
+func (m *Model) ensureBuffers() {
+	for _, name := range m.order {
+		m.assignBuffer(name)
+	}
+	// Anything a driver put in m.windows without also putting in m.order: sorted, because map
+	// iteration order is random and would otherwise hand out numbers differently on every run -
+	// a bug that only shows up as a flaky test, which is the worst kind to inherit.
+	var stray []string
+	for name := range m.windows {
+		if _, numbered := m.bufferNo[name]; !numbered {
+			stray = append(stray, name)
+		}
+	}
+	if len(stray) == 0 {
+		return
+	}
+	sort.Strings(stray)
+	for _, name := range stray {
+		m.assignBuffer(name)
+	}
+}
+
+// assignBuffer gives a window its number if it does not have one yet, and reports the number.
+//
+// Numbers are never reused, including the number of a window that has been closed: the map
+// keeps every number ever handed out, so the next window takes the next free one. "Keep
+// forever" is the whole property - a user who has learnt that #salotto is 3 must not type
+// /b 3 next week and land in a query window that inherited the number.
+func (m *Model) assignBuffer(window string) int {
+	if window == "" {
+		return 0
+	}
+	if n, ok := m.bufferNo[window]; ok {
+		return n
+	}
+	if m.bufferNo == nil {
+		m.bufferNo = make(map[string]int, 8)
+	}
+	used := make(map[int]bool, len(m.bufferNo))
+	for _, n := range m.bufferNo {
+		used[n] = true
+	}
+	n := 1
+	for used[n] {
+		n++
+	}
+	m.bufferNo[window] = n
+	return n
+}
+
+// bufferByName finds the window holding a number, for /b <n>. It reports false rather than
+// guessing: a mistyped number must not switch to whichever window happened to be nearest.
+func (m Model) bufferByName(n int) (string, bool) {
+	if n <= 0 {
+		return "", false
+	}
+	for window, have := range m.bufferNo {
+		if have != n {
+			continue
+		}
+		// Only a window the model still lists. The number of a closed window is kept
+		// forever, so without this check /b 3 would reopen a buffer the user closed - and
+		// SetActive would happily do it, because a window name is all it needs.
+		if _, live := m.windows[window]; live {
+			return window, true
+		}
+	}
+	return "", false
 }
 
 // Init satisfies tea.Model. There is no timer: the model is driven entirely by
@@ -309,6 +421,9 @@ func (m Model) SetActive(name string) Model {
 		m.windows[name] = nil
 		m.order = append(m.order, name)
 	}
+	// A window named by a driver (a web request, a click) is a window, and every window has
+	// a number: leaving this unset would give a clickable buffer no /b number.
+	m.assignBuffer(name)
 	m.active = name
 	m.scroll = 0
 	// Looking at a window is the only thing that clears it: not reading it, not
@@ -316,6 +431,23 @@ func (m Model) SetActive(name string) Model {
 	delete(m.unread, name)
 	delete(m.mention, name)
 	return m
+}
+
+// noteNetwork records which network a window is on, ignoring an empty answer.
+//
+// An empty network is not information: a plain IRCd has no networks, and a line whose tag
+// was stripped on the way (the web bridge rebuilding a frame from JSON) must not erase what
+// an earlier line said. Forgetting would move a channel back to the ungrouped section as
+// soon as an untagged line arrived, which is a sidebar that reshuffles while it is being
+// read.
+func (m *Model) noteNetwork(window, network string) {
+	if window == "" || network == "" {
+		return
+	}
+	if m.netOf == nil {
+		m.netOf = make(map[string]string, 4)
+	}
+	m.netOf[window] = network
 }
 
 // Input returns the current input line, for a driver that echoes it elsewhere.
@@ -335,6 +467,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // Step is Update returning the concrete type, so a driver can loop without a
 // type assertion per message.
 func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
+	// Give a number to any window that somehow has none, before the message can be drawn.
+	// Every creation path assigns one, but a model built field by field (a test, a future
+	// driver restoring a session) would otherwise show a window with no number in a sidebar
+	// that is otherwise numbered - and a window with no number cannot be reached with /b.
+	m.ensureBuffers()
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -404,10 +541,22 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		} else {
 			m.nicks[msg.Window] = msg.Nicks
 		}
+		// Membership is often the first thing a quiet channel sends, so this is where the
+		// network is most likely to be learned first.
+		m.noteNetwork(msg.Window, msg.Network)
 		return m, nil
 
 	case Incoming:
 		line := Line(msg)
+		// Learn the network before anything can drop the line: a line in a window the user is
+		// not looking at still says which server that window is on, and the sidebar must know
+		// it whether or not the line ends up drawn. The window is resolved here as append()
+		// resolves it, because a line with no window belongs to the active one.
+		noteWindow := line.Window
+		if noteWindow == "" {
+			noteWindow = m.active
+		}
+		m.noteNetwork(noteWindow, line.Network)
 		// Our own line coming back from the bouncer confirms the pending echo instead of
 		// being drawn beside it. A bouncer echoes the sender - that is how a second
 		// client sees the same conversation - so anything else shows every message twice.
@@ -511,6 +660,13 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 				return m, nil
 			}
 			return m.appendSystem("no window matches " + arg + "\n"), nil
+		}
+		// "/b <n>" and "/buffer <n>" switch by number. Resolved here for the same reason /go
+		// is: the numbers are the model's, and a bouncer has never heard of them. Two
+		// spellings because both are in muscle memory - weechat's is /buffer, and on a
+		// sidebar of numbers the one-letter form is what people actually type.
+		if _, arg, ok := slash(text, "b", "buffer"); ok {
+			return m.switchBuffer(arg), nil
 		}
 		// "/search pattern" searches across every window in memory and shows the hits as a
 		// list of jumps. It is resolved here for the same reason /go is: the scrollback lives
@@ -710,7 +866,7 @@ func (m Model) helpIntoWindow() Model {
 // table for the benefit of Tab would mean two lists to keep in step - the failure mode the /fset
 // screen already had once.
 var modelCommands = []string{
-	"/alias", "/close", "/fset", "/find", "/go", "/help", "/search", "/settings",
+	"/alias", "/b", "/close", "/fset", "/find", "/go", "/help", "/search", "/settings",
 }
 
 // wireCommands are passed through to the bouncer with the leading slash stripped. They are listed
@@ -895,6 +1051,51 @@ func (m Model) clampScroll() Model {
 		m.scroll = top
 	}
 	return m
+}
+
+// switchBuffer is /b <n>: switch to the window with that number.
+//
+// A bare /b says what the numbers are, because a command whose whole interface is a number is
+// useless if the user cannot see the numbers - the sidebar can be off (GroupByServer and
+// BufferNumbers are both settings) and in a narrow terminal it is not drawn at all. A number
+// nobody holds is refused by name rather than ignored: a silent no-op reads as a broken key.
+func (m Model) switchBuffer(arg string) Model {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return m.appendSystem(m.bufferList())
+	}
+	n, err := strconv.Atoi(arg)
+	if err != nil {
+		return m.appendSystem("/b takes a buffer number; \"/b\" alone lists them\n")
+	}
+	name, ok := m.bufferByName(n)
+	if !ok {
+		return m.appendSystem(fmt.Sprintf("no buffer %d\n", n))
+	}
+	return m.SetActive(name)
+}
+
+// bufferList renders "3 #salotto" style lines, in number order so the list reads like the
+// sidebar it is a text form of.
+func (m Model) bufferList() string {
+	type entry struct {
+		n    int
+		name string
+	}
+	entries := make([]entry, 0, len(m.windows))
+	for name := range m.windows {
+		entries = append(entries, entry{m.bufferNo[name], name})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].n < entries[j].n })
+	var b strings.Builder
+	b.WriteString("buffers: ")
+	for i, e := range entries {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%d %s", e.n, e.name)
+	}
+	return b.String()
 }
 
 // goCommand parses "/go <pattern>". The argument is everything after the verb, spaces and
@@ -1258,6 +1459,10 @@ func (m *Model) append(l Line) {
 	if _, seen := m.windows[l.Window]; !seen {
 		m.order = append(m.order, l.Window)
 	}
+	// Every window has a number from the moment it exists. Assigning at creation rather than
+	// at draw time is what makes the numbers stable: a renderer that numbered windows in
+	// display order would renumber the list whenever a server was added or a sort moved a row.
+	m.assignBuffer(l.Window)
 	// A new day gets a rule in the conversation, not a decoration in the renderer. It is
 	// inserted before the first line of the day, which is the only place where "this is a
 	// different day" is true no matter how far the user scrolls.
@@ -1648,6 +1853,133 @@ func cell(col []string, i, width int) string {
 	return out
 }
 
+// sidebarRow is one line of the window list, before styling: a window, or the heading of a
+// server that groups some windows.
+//
+// It exists so the renderer and the click hit-test read the same description of the list. The
+// two used to be an index into m.order in one place and a loop in the other, and the moment a
+// row that is not a window (a heading) appears between them, an index is off by one - a click
+// on #salotto selecting the row above it, or the server heading quietly standing in for
+// whichever window happens to be third.
+type sidebarRow struct {
+	// window is the window this row selects, and is empty for a heading: a heading is not a
+	// window, so clicking it must do nothing rather than switch to its first child.
+	window string
+	// heading marks a server heading, which is drawn unindented and styled as context.
+	heading bool
+	// text is the label: the window name, or the network name for a heading.
+	text string
+	// badge is the right-aligned unread count or mention mark, already rendered as a string.
+	badge string
+}
+
+// sidebarRows is the window list as rows, in drawing order, at most n of them.
+//
+// Grouping is the default because the user asked for it, but it is a setting and the flat list
+// is what turning it off returns. The headings are dropped when they do not fit rather than
+// clipped: n rows in a 12-row terminal cannot hold a heading and still show every window, and
+// a sidebar that shows the servers but not the channels under the last one is worse than the
+// list it replaced.
+func (m Model) sidebarRows(n int) []sidebarRow {
+	if n <= 0 {
+		return nil
+	}
+	// Not m.ensureBuffers() here: a renderer must not write to the model, and every map on the
+	// model is shared by value, so a View that numbered a window would be visible to the next
+	// Step and could race with it. Numbering happens at the doors that create windows instead,
+	// and a window that somehow has none is drawn without one rather than numbered at draw time.
+	if m.settings.GroupByServer {
+		// len > 0, not just <= n: groupedSidebarRows returns nil when no window has a known
+		// network, and an empty list is a sidebar with nothing in it rather than a grouped one.
+		if rows := m.groupedSidebarRows(); len(rows) > 0 && len(rows) <= n {
+			return rows
+		}
+	}
+	// The flat list is m.order: the order windows were opened, which is what the sidebar has
+	// always been, so GroupByServer=false is the old client and not a third layout.
+	rows := make([]sidebarRow, 0, n)
+	for _, name := range m.order {
+		if len(rows) >= n {
+			break
+		}
+		rows = append(rows, m.windowRow(name))
+	}
+	return rows
+}
+
+// groupedSidebarRows builds the server headings and the windows under them: servers sorted by
+// name, windows sorted by name within their server.
+//
+// Sorting is the user's "it should be ordered": a list in arrival order is a list whose shape
+// changes every time the client reconnects, because replay arrives in whatever order the
+// bouncer's rings were walked. A sorted list is the same list on every reconnect.
+func (m Model) groupedSidebarRows() []sidebarRow {
+	// Which windows belong to which server. A window whose network is not known is not put
+	// under a made-up heading: it goes in the ungrouped block at the end, drawn exactly as it
+	// would be in the flat list.
+	groups := make(map[string][]string, 4)
+	var loose []string
+	for _, name := range m.order {
+		if net := m.netOf[name]; net != "" {
+			groups[net] = append(groups[net], name)
+			continue
+		}
+		loose = append(loose, name)
+	}
+	if len(groups) == 0 {
+		// Nothing to group by - a plain IRCd, or a bouncer that does not tag its lines. The
+		// flat list is the honest answer; a heading per window would be noise.
+		return nil
+	}
+
+	nets := make([]string, 0, len(groups))
+	for net := range groups {
+		nets = append(nets, net)
+	}
+	sort.Slice(nets, func(i, j int) bool {
+		return strings.ToLower(nets[i]) < strings.ToLower(nets[j])
+	})
+
+	rows := make([]sidebarRow, 0, len(m.order)+len(nets))
+	for _, net := range nets {
+		rows = append(rows, sidebarRow{heading: true, text: net})
+		names := groups[net]
+		sort.Slice(names, func(i, j int) bool {
+			return strings.ToLower(names[i]) < strings.ToLower(names[j])
+		})
+		for _, name := range names {
+			rows = append(rows, m.windowRow(name))
+		}
+	}
+	sort.Slice(loose, func(i, j int) bool {
+		return strings.ToLower(loose[i]) < strings.ToLower(loose[j])
+	})
+	for _, name := range loose {
+		rows = append(rows, m.windowRow(name))
+	}
+	return rows
+}
+
+// windowRow builds one window's row: its number and name, and its unread badge. The badge
+// logic is the same on both layouts because it is not about grouping - a mention beats a
+// count, and a count is only worth drawing when it is not zero.
+func (m Model) windowRow(name string) sidebarRow {
+	text := name
+	if m.settings.BufferNumbers {
+		if n := m.bufferNo[name]; n > 0 {
+			text = strconv.Itoa(n) + " " + name
+		}
+	}
+	badge := ""
+	switch {
+	case m.mention[name]:
+		badge = "@"
+	case m.unread[name] > 0:
+		badge = strconv.Itoa(m.unread[name])
+	}
+	return sidebarRow{window: name, text: text, badge: badge}
+}
+
 // windowColumn renders the window list: the active one marked, and a mention or an
 // unread count where there is one. It is inside the frame because the whole screen
 // belongs to the model - a window list drawn by the page was the second renderer that
@@ -1656,39 +1988,62 @@ func (m Model) windowColumn(width, n int) []string {
 	if width <= 2 || n <= 0 {
 		return nil
 	}
-	out := make([]string, 0, n)
-	for _, name := range m.order {
-		if len(out) >= n {
+	rows := m.sidebarRows(n)
+	// Whether the list is grouped, decided by whether any heading is actually drawn: a
+	// grouped list whose headings did not fit is the flat list, and indenting it would make
+	// the same windows look different for no reason the user can see.
+	grouped := false
+	for _, row := range rows {
+		if row.heading {
+			grouped = true
 			break
 		}
+	}
+	activeNet := m.netOf[m.active]
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.heading {
+			// A heading is context, not a window: no marker column, no badge, dimmer than a
+			// name, and bold - but not in the title colour - when it is the server the active
+			// window is on. Bold alone is what keeps the heading from competing with the row
+			// that is actually selected: two rows in the same bright colour is a sidebar where
+			// the user cannot tell which one they are typing into.
+			style := topicStyle
+			if activeNet != "" && strings.EqualFold(activeNet, row.text) {
+				style = topicStyle.Bold(true)
+			}
+			out = append(out, style.Render(truncateTo(row.text, width)))
+			continue
+		}
 		marker := "  "
-		if name == m.active {
+		if row.window == m.active {
 			marker = "▸ "
 		}
-		badge := ""
-		switch {
-		case m.mention[name]:
-			badge = "@"
-		case m.unread[name] > 0:
-			badge = fmt.Sprintf("%d", m.unread[name])
+		indent := ""
+		if grouped {
+			// Two spaces under the heading: the indent is what makes a heading read as a
+			// heading rather than as a window with no number, and the marker sits inside it so
+			// the active window's arrow lines up with its siblings.
+			indent = "  "
 		}
-		room := width - 2
-		if badge != "" {
+		room := width - lipgloss.Width(marker) - lipgloss.Width(indent)
+		if row.badge != "" {
 			room -= 2
 		}
-		label := truncateTo(name, room)
-		line := marker + label
-		if badge != "" {
-			pad := width - lipgloss.Width(line) - lipgloss.Width(badge)
-			if pad > 0 {
+		// The number is part of the label and is truncated with it: a name short enough to fit
+		// beside its number is the common case, and a row whose number was cut off is a row
+		// that cannot be reached with /b.
+		line := indent + marker + truncateTo(row.text, room)
+		if row.badge != "" {
+			if pad := width - lipgloss.Width(line) - lipgloss.Width(row.badge); pad > 0 {
 				line += strings.Repeat(" ", pad)
 			}
-			line += badge
+			line += row.badge
 		}
 		switch {
-		case name == m.active:
+		case row.window == m.active:
 			out = append(out, titleStyle.Render(line))
-		case m.mention[name]:
+		case m.mention[row.window]:
 			out = append(out, mentionStyle.Render(line))
 		default:
 			out = append(out, bodyStyle.Render(line))
@@ -1716,10 +2071,14 @@ func (m Model) WindowAt(x, y int) string {
 	if row < 0 || row >= l.contentRows {
 		return ""
 	}
-	if row < len(m.order) {
-		return m.order[row]
+	// The rows come from the same builder the renderer used, so a heading occupies its screen
+	// row here exactly as it does on screen. Reading this off m.order instead is what would
+	// make every row after the first heading select its neighbour.
+	rows := m.sidebarRows(l.contentRows)
+	if row >= len(rows) {
+		return ""
 	}
-	return ""
+	return rows[row].window
 }
 
 // nickColumn renders the member list as n rows of at most width-2 columns. Ops keep

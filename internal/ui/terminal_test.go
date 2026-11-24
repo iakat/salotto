@@ -187,7 +187,11 @@ func TestTheBrowserGetsARealTerminal(t *testing.T) {
 	// And what it drew is the model's screen: the status window, in the window list,
 	// with the conversation pane beside it. If this were missing the page would be
 	// showing something the model did not draw.
-	if !strings.Contains(got, "▸ status") {
+	//
+	// The row carries the buffer number ("▸ 1 status"), so the assertion is on the two halves
+	// rather than the exact row: what this test is about is that the model's own window list
+	// reached the browser, not what the list is decorated with.
+	if !strings.Contains(got, "status") || !strings.Contains(got, "▸") {
 		t.Errorf("the model's window list is not in the output:\n%q", got)
 	}
 }

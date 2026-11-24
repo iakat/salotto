@@ -197,7 +197,7 @@ func (c *client) handleChatHistory(rest []byte) bool {
 	for _, sl := range selected {
 		forLine, next := ne.advanceNick(un, sl.line)
 		un = next
-		buf := appendReplayLine(nil, sl.line, id, sl.ts)
+		buf := appendReplayLine(nil, sl.line, id, ne.name, sl.ts)
 		if !c.sub.WriteFrom(buf, forLine) {
 			return false
 		}
@@ -293,7 +293,10 @@ func (c *client) historyFromLogs(network, window, sub string, cursor int64, limi
 		return false
 	}
 	for i, line := range lines {
-		buf := appendReplayLine(nil, line, id, times[i])
+		// The network here can be empty - the log query reads every network when it is not
+		// told one - and an empty tag is worse than no tag: a client would group those lines
+		// under a heading named "". Leaving it off makes them the fallback case instead.
+		buf := appendReplayLine(nil, line, id, network, times[i])
 		if !c.sub.WriteFrom(buf, window) {
 			return false
 		}

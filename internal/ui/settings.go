@@ -49,6 +49,17 @@ type Settings struct {
 	// a second mention system, which is why it shares the mention colour rather than
 	// getting a colour of its own.
 	Highlights []string `json:"highlights"`
+
+	// GroupByServer draws the window list under a heading per server, with the windows
+	// sorted inside each group. On by default because a bouncer with two networks otherwise
+	// shows one flat list in which two windows called "status" are indistinguishable; turning
+	// it off is the flat arrival-order list the client had before, which is what someone who
+	// learnt the old layout wants back.
+	GroupByServer bool `json:"group_by_server"`
+	// BufferNumbers prefixes every window with its weechat-style number, which is also the
+	// argument to /b. On by default: the numbers are the only stable name a buffer has, and
+	// they cost one column.
+	BufferNumbers bool `json:"buffer_numbers"`
 }
 
 // DefaultSettings is what a new installation gets. The defaults are the ones that make a
@@ -62,6 +73,10 @@ func DefaultSettings() Settings {
 		Hotlist:    true,
 		ScrollStep: 3,
 		Aliases:    map[string]string{"j": "join", "q": "query", "m": "msg", "w": "go"},
+		// Both on: the user asked for grouping and numbers, so a fresh client is the one they
+		// asked for. They are settings, not constants, so the old flat list is one /fset away.
+		GroupByServer: true,
+		BufferNumbers: true,
 	}
 }
 
@@ -93,6 +108,8 @@ func (s Settings) rows() []settingRow {
 		{"date_rule", "date rules", onOff(s.DateRule), "bool"},
 		{"nick_colors", "nick colours", onOff(s.NickColors), "bool"},
 		{"hotlist", "hotlist", onOff(s.Hotlist), "bool"},
+		{"group_by_server", "group by server", onOff(s.GroupByServer), "bool"},
+		{"buffer_numbers", "buffer numbers", onOff(s.BufferNumbers), "bool"},
 		{"scroll_step", "scroll step", strconv.Itoa(s.ScrollStep), "int"},
 		{"highlight", "highlights", listOrNone(s.Highlights), "text"},
 		{"mute", "mutes", listOrNone(s.Mutes), "text"},
@@ -152,6 +169,10 @@ func canonical(key string) string {
 		return "highlight"
 	case "mutes":
 		return "mute"
+	case "groups", "group", "servers", "group_by_server", "groupby":
+		return "group_by_server"
+	case "numbers", "buffer_number", "buffers", "buffer_no":
+		return "buffer_numbers"
 	}
 	return key
 }
@@ -186,6 +207,10 @@ func (s *Settings) set(key, value string) error {
 		return boolean(&s.NickColors)
 	case "hotlist":
 		return boolean(&s.Hotlist)
+	case "group_by_server":
+		return boolean(&s.GroupByServer)
+	case "buffer_numbers":
+		return boolean(&s.BufferNumbers)
 	case "scroll_step", "scroll":
 		n, err := strconv.Atoi(value)
 		if err != nil || n < 1 || n > 50 {

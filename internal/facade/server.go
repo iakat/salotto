@@ -461,7 +461,7 @@ func (s *Server) Broadcast(netName string, seq uint64, line []byte, ts int64) {
 	}
 
 	p := s.linePool.Get().(*[]byte)
-	b := appendLiveLine((*p)[:0], line, ts)
+	b := appendLiveLine((*p)[:0], line, netName, ts)
 	s.hub.BroadcastFrom(b, un)
 	*p = b
 	s.linePool.Put(p)
@@ -1227,7 +1227,7 @@ func (c *client) replayNetwork(ne *networkEntry) bool {
 			}
 			forLine, next := ne.advanceNick(un, line)
 			un = next
-			buf = appendReplayLine(buf[:0], line, id, ts)
+			buf = appendReplayLine(buf[:0], line, id, ne.name, ts)
 			if !c.sub.WriteFrom(buf, forLine) {
 				wrote = false
 				return false
@@ -1459,30 +1459,62 @@ func (c *client) readLine() ([]byte, error) {
 	return trimEOL(line), nil
 }
 
-func appendLiveLine(dst, line []byte, ts int64) []byte {
+// tagNetwork is the vendor tag that names the network a line belongs to.
+//
+// A client cannot infer it from anything else on the wire. A live line is not in a batch, so
+// the batch id that replay happens to carry is not available; two networks can both hold a
+// window called "status", and the client keys windows by name. Without this tag the sidebar
+// has one flat list of names and no way to say which network a channel came from - which is
+// exactly the data-visibility bug QUEUE.md §2.1 records, one network's status window being
+// unreachable.
+//
+// The key itself is ircline.TagNetwork: one spelling for both ends of the wire.
+var tagNetwork = []byte(ircline.TagNetwork)
+
+// appendNetworkTag adds the network tag unless the line already carries one.
+//
+// The "already carries" check is not defensive noise: the tag is inside the vendor namespace,
+// which is ours, so a line that arrives with it (a bouncer relaying another bouncer's output)
+// knows better than we do, and two copies of one tag leave a client reading whichever the
+// parser found first.
+func appendNetworkTag(dst, tags []byte, network string, needSep bool) []byte {
+	if network == "" || ircline.TagValue(tags, tagNetwork) != nil {
+		return dst
+	}
+	if needSep {
+		dst = append(dst, ';')
+	}
+	dst = append(dst, tagNetwork...)
+	dst = append(dst, '=')
+	// Escaped, not raw: a network name comes from the config file, where an operator is free
+	// to write "my net" or "libera;test". An unescaped ';' would end the tag and a space would
+	// end the tag blob, and the client would then read the message verb out of the middle of
+	// the name.
+	return ircline.AppendTagValue(dst, network)
+}
+
+func appendLiveLine(dst, line []byte, network string, ts int64) []byte {
 	if ts == 0 {
 		ts = time.Now().UnixNano()
 	}
 	tags, rest := ircline.Tags(line)
-	if tags == nil {
-		dst = append(dst, '@')
-		dst = append(dst, "time="...)
-		dst = appendISOTime(dst, ts)
-		dst = append(dst, ' ')
-		dst = append(dst, line...)
-		return append(dst, '\r', '\n')
-	}
 	dst = append(dst, '@')
+	added := false
 	if ircline.TagValue(tags, tagTime) == nil {
 		dst = append(dst, "time="...)
 		dst = appendISOTime(dst, ts)
-		if len(tags) > 0 {
-			dst = append(dst, ';')
-			dst = append(dst, tags...)
-		}
-	} else {
-		dst = append(dst, tags...)
+		added = true
 	}
+	if len(tags) > 0 {
+		if added {
+			dst = append(dst, ';')
+		}
+		dst = append(dst, tags...)
+		added = true
+	}
+	// Appended last, so the order the existing tags were written in - and the tests that pin
+	// it - is untouched.
+	dst = appendNetworkTag(dst, tags, network, added)
 	if len(rest) > 0 {
 		dst = append(dst, ' ')
 		dst = append(dst, rest...)
@@ -1490,19 +1522,8 @@ func appendLiveLine(dst, line []byte, ts int64) []byte {
 	return append(dst, '\r', '\n')
 }
 
-func appendReplayLine(dst, line []byte, batch string, ts int64) []byte {
+func appendReplayLine(dst, line []byte, batch, network string, ts int64) []byte {
 	tags, rest := ircline.Tags(line)
-	if tags == nil {
-		dst = append(dst, '@')
-		dst = append(dst, "batch="...)
-		dst = append(dst, batch...)
-		dst = append(dst, ";time="...)
-		dst = appendISOTime(dst, ts)
-		dst = append(dst, ' ')
-		dst = append(dst, line...)
-		return append(dst, '\r', '\n')
-	}
-
 	dst = append(dst, '@')
 	dst = append(dst, "batch="...)
 	dst = append(dst, batch...)
@@ -1514,6 +1535,7 @@ func appendReplayLine(dst, line []byte, batch string, ts int64) []byte {
 		dst = append(dst, ";time="...)
 		dst = appendISOTime(dst, ts)
 	}
+	dst = appendNetworkTag(dst, tags, network, true)
 	if len(rest) > 0 {
 		dst = append(dst, ' ')
 		dst = append(dst, rest...)

@@ -48,6 +48,12 @@ type Transport struct {
 	// topic is replaced, not appended to, and the whole point of showing it is
 	// that it is the current answer to "what is this channel for".
 	topics map[string]string
+	// netOf is which network each window was last seen on, from the salotto.network tag.
+	// It is kept here as well as on the model because a Nicklist message is built in this
+	// file from membership alone, and a member list that arrived with no network in it would
+	// leave the sidebar waiting for the next message before it could file the channel under
+	// its server.
+	netOf map[string]string
 	// modes is the current channel mode string per channel ("+nt"), and
 	// prefixOverrides records mode changes received before the member list that
 	// they apply to: ergo can send MODE before our 353 for a channel we just
@@ -74,6 +80,7 @@ func Dial(addr string) (*Transport, error) {
 		br:      bufio.NewReaderSize(conn, 64*1024),
 		windows: make(map[string]bool),
 		own:     make(map[string]bool),
+		netOf:   make(map[string]string),
 		members: make(map[string]map[string]string),
 		topics:  make(map[string]string),
 		modes:   make(map[string]string),
@@ -307,10 +314,19 @@ func (t *Transport) handle(raw []byte) {
 	// the client reconnected. Servers that do not send the tag fall back to the clock,
 	// which is right for a live line and wrong only for a server that is lying.
 	stamp := lineTime(tags)
+	// The network comes from the bouncer's own tag, and there is no fallback: a line without
+	// it is a line from a client of a plain IRCd, and inventing a name ("default", the
+	// server's hostname) would put every such window under a heading that means nothing. The
+	// model treats "" as "not told" and draws those windows ungrouped.
+	network := ircline.TagText(ircline.TagValue(tags, []byte(ircline.TagNetwork)))
 	push := func(l Line) {
 		if l.Time.IsZero() {
 			l.Time = stamp
 		}
+		if l.Network == "" {
+			l.Network = network
+		}
+		t.noteNetwork(l.Window, l.Network)
 		t.push(Incoming(l))
 	}
 
@@ -939,7 +955,10 @@ func (t *Transport) publishMembers(channel string) {
 		}
 		return strings.ToLower(nicks[i].Name) < strings.ToLower(nicks[j].Name)
 	})
-	t.push(Nicklist{Window: channel, Nicks: nicks})
+	t.mu.Lock()
+	network := t.netOf[channel]
+	t.mu.Unlock()
+	t.push(Nicklist{Window: channel, Nicks: nicks, Network: network})
 }
 
 // isSelf reports whether a prefix nick is one of ours. A bouncer can hold more
@@ -1014,6 +1033,22 @@ func isNickChar(b byte) bool {
 func (t *Transport) note(window string) {
 	t.mu.Lock()
 	t.windows[window] = true
+	t.mu.Unlock()
+}
+
+// noteNetwork records which network a window was seen on, for the Nicklist messages built
+// from membership alone and for a later live line that arrives without the tag (some servers
+// strip unknown tags on the way through). Last seen wins: a window really can be on one
+// network only, so a differing value is a correction, not a conflict.
+func (t *Transport) noteNetwork(window, network string) {
+	if window == "" || network == "" {
+		return
+	}
+	t.mu.Lock()
+	if t.netOf == nil {
+		t.netOf = make(map[string]string, 4)
+	}
+	t.netOf[window] = network
 	t.mu.Unlock()
 }
 

@@ -290,3 +290,54 @@ func TestSlicesAliasInput(t *testing.T) {
 		line[off] = old
 	}
 }
+
+// A tag value is free text that happens to live inside a line, so the five characters that end
+// a value have to be escaped on the way out and undone on the way in.
+//
+// Getting this wrong is not a cosmetic bug: an unescaped space ends the tag blob, so a network
+// called "my net" would truncate the tags and the client would read the line's verb out of the
+// middle of the name - the message disappears and something that is not a message appears.
+func TestTagValueRoundTrips(t *testing.T) {
+	for _, want := range []string{
+		"libera",
+		"my net",
+		"semi;colon",
+		"back\\slash",
+		"line\rbreak",
+		"new\nline",
+		"",
+	} {
+		blob := []byte("other=1;" + TagNetwork + "=")
+		blob = AppendTagValue(blob, want)
+		blob = append(blob, ";last=2"...)
+
+		tags, rest := Tags(append([]byte("@"), append(blob, " PRIVMSG #c :hi"...)...))
+		if len(rest) == 0 {
+			t.Fatalf("%q: the tag blob swallowed the whole line", want)
+		}
+		if got := string(Verb(rest)); got != "PRIVMSG" {
+			t.Fatalf("%q: the verb came out as %q, so the tag blob ended early", want, got)
+		}
+		if got := TagText(TagValue(tags, []byte(TagNetwork))); got != want {
+			t.Fatalf("value %q round-tripped as %q", want, got)
+		}
+		// And nothing after it was damaged: an escape that ate the separator would lose the
+		// tags that follow.
+		if got := string(TagValue(tags, []byte("last"))); got != "2" {
+			t.Fatalf("%q: the tag after it reads %q, so a separator was consumed", want, got)
+		}
+	}
+}
+
+// TestAnUnknownEscapeKeepsItsCharacter: a peer that sends a backslash before something we do not
+// escape must not have that character eaten. Dropping it changes a name, and a name that changes
+// silently is a window nobody can find again.
+func TestAnUnknownEscapeKeepsItsCharacter(t *testing.T) {
+	if got := TagText([]byte(`a\zb`)); got != "azb" {
+		t.Fatalf("an unknown escape decoded as %q", got)
+	}
+	// A trailing backslash has nothing to escape, so it stays.
+	if got := TagText([]byte(`a\`)); got != `a\` {
+		t.Fatalf("a trailing backslash decoded as %q", got)
+	}
+}

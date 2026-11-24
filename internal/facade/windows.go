@@ -523,7 +523,7 @@ func (s *Server) BroadcastWindow(netName, window string, seq uint64, line []byte
 	}
 
 	p := s.linePool.Get().(*[]byte)
-	b := appendLiveLine((*p)[:0], line, ts)
+	b := appendLiveLine((*p)[:0], line, netName, ts)
 	for _, sub := range subs {
 		sub.WriteFrom(b, un)
 	}
@@ -572,7 +572,7 @@ func (s *Server) BroadcastWindowsFrom(netName string, windows []string, seq uint
 	}
 
 	p := s.linePool.Get().(*[]byte)
-	b := appendLiveLine((*p)[:0], line, ts)
+	b := appendLiveLine((*p)[:0], line, netName, ts)
 	for _, sub := range attached {
 		if sub == source && !sub.HasEchoMessage() {
 			continue
@@ -645,7 +645,7 @@ func (s *Server) PlayBuffer(sub *Subscriber, network string, windows ...string) 
 			}
 			forLine, next := ne.advanceNick(un, line)
 			un = next
-			buf = appendReplayLine(buf[:0], line, batch, ts)
+			buf = appendReplayLine(buf[:0], line, batch, network, ts)
 			if !sub.WriteFrom(buf, forLine) {
 				ok = false
 				return false

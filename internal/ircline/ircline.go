@@ -61,6 +61,77 @@ func TagValue(tags, key []byte) []byte {
 	return nil
 }
 
+// TagNetwork is the vendor tag that names the network a line belongs to. It lives here, in the
+// wire-format package, because the two ends must not spell it differently: a typo on one side is
+// a tag the other side silently never finds, and the symptom is a sidebar that is flat for one
+// deployment and grouped for another with no error anywhere.
+//
+// The "salotto." prefix is a vendor namespace, so an upstream server cannot send it by accident
+// and a client that does not know it ignores it.
+const TagNetwork = "salotto.network"
+
+// AppendTagValue appends a tag value with the escapes IRCv3 requires. The five characters
+// matter because they are the ones that end a value: a ';' starts the next tag and a space
+// ends the tag blob altogether, so an unescaped value does not produce a wrong tag, it
+// produces a line whose verb the client reads out of the middle of the value - which is why
+// the message it was attached to disappears instead of arriving with a strange tag.
+func AppendTagValue(dst []byte, value string) []byte {
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case ';':
+			dst = append(dst, '\\', ':')
+		case ' ':
+			dst = append(dst, '\\', 's')
+		case '\\':
+			dst = append(dst, '\\', '\\')
+		case '\r':
+			dst = append(dst, '\\', 'r')
+		case '\n':
+			dst = append(dst, '\\', 'n')
+		default:
+			dst = append(dst, value[i])
+		}
+	}
+	return dst
+}
+
+// TagText decodes a tag value into a string, undoing AppendTagValue's escapes. It exists so
+// that a name carrying one of the five special characters round-trips: a network called
+// "my net" is tagged as "my\snet", and a client that showed the raw bytes would draw a
+// heading nobody could match against the config file it came from.
+func TagText(value []byte) string {
+	if len(value) == 0 {
+		return ""
+	}
+	// The common case is a value with no escapes at all, and this runs on every line.
+	if bytes.IndexByte(value, '\\') < 0 {
+		return string(value)
+	}
+	out := make([]byte, 0, len(value))
+	for i := 0; i < len(value); i++ {
+		if value[i] != '\\' || i+1 >= len(value) {
+			out = append(out, value[i])
+			continue
+		}
+		i++
+		switch value[i] {
+		case ':':
+			out = append(out, ';')
+		case 's':
+			out = append(out, ' ')
+		case 'r':
+			out = append(out, '\r')
+		case 'n':
+			out = append(out, '\n')
+		default:
+			// "\\\\" and anything a peer invented: an unknown escape keeps the character it
+			// escaped, because dropping it would silently change a name.
+			out = append(out, value[i])
+		}
+	}
+	return string(out)
+}
+
 // Prefix splits a leading :prefix off the line (after Tags has been applied).
 func Prefix(line []byte) (prefix, rest []byte) {
 	if len(line) == 0 || line[0] != ':' {
