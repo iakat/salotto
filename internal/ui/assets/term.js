@@ -274,6 +274,116 @@
     return btoa(bin);
   }
 
+  // --- Uploads ---------------------------------------------------------------
+  //
+  // A file is on *this* machine, not on the bouncer, so this is the one thing the terminal
+  // cannot express: there is no keystroke that means "this PNG". It is also the one place
+  // where being a browser is an advantage, because dropping a file on a page is what people
+  // expect, and a phone gets a picker instead of a drag.
+  //
+  // The upload is a plain POST to /uploads/; the answer is JSON with a URL, and the URL is
+  // what a channel wants. So the whole feature is: upload, then type the URL into the input
+  // line where the user can add a message to it or press Enter.
+  var uploading = 0;
+
+  function uploadFiles(files) {
+    if (!files || !files.length) return;
+    for (var i = 0; i < files.length; i++) uploadOne(files[i]);
+  }
+
+  function uploadOne(file) {
+    uploading++;
+    setBanner("uploading " + file.name + "\u2026");
+    var form = new FormData();
+    form.append("file", file);
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", "/uploads/", true);
+    xhr.onload = function () {
+      uploading--;
+      if (xhr.status !== 201) {
+        // The server says why in the status: 413 is the file limit, 507 is the quota.
+        // Showing the raw status is better than "upload failed" because the user can act
+        // on "too large" and cannot act on nothing.
+        setBanner(uploadMessage(xhr.status, file.name));
+        return;
+      }
+      var meta;
+      try { meta = JSON.parse(xhr.responseText); } catch (e) {
+        setBanner("upload failed: unreadable answer");
+        return;
+      }
+      setBanner("");
+      // The URL goes into the input line rather than being sent, so the user can add a
+      // comment before pressing Enter. Sending it for them would be a message they did not
+      // write, and IRC has no way to edit one.
+      insertText(meta.url + " ");
+    };
+    xhr.onerror = function () {
+      uploading--;
+      // A hard network failure here can be the server refusing a too-large body by closing
+      // the connection, so say the thing the user can act on.
+      setBanner(uploadMessage(0, file.name));
+    };
+    xhr.send(form);
+  }
+
+  function uploadMessage(status, name) {
+    if (status === 413) return "too large to upload: " + name;
+    if (status === 507) return "storage full: delete an upload first";
+    if (status === 401) return "not signed in";
+    if (status === 0) return "upload refused (possibly too large): " + name;
+    return "upload failed (" + status + "): " + name;
+  }
+
+  // insertText types into the terminal as if it had been pasted, which is what puts the URL in
+  // the bubbletea input line and leaves the cursor after it.
+  function insertText(text) {
+    if (term.paste) {
+      term.paste(text);
+      return;
+    }
+    send({ type: "input", data: btoa(text) });
+  }
+
+  // A drop target on the terminal, with the browser's own default (navigate to the file)
+  // suppressed. Without preventDefault on both dragover and drop the page simply leaves.
+  var dropDepth = 0;
+  termEl.addEventListener("dragenter", function (e) {
+    if (!e.dataTransfer || e.dataTransfer.types.indexOf("Files") === -1) return;
+    e.preventDefault();
+    dropDepth++;
+    setBanner("drop to upload");
+  });
+  termEl.addEventListener("dragover", function (e) {
+    if (!e.dataTransfer || e.dataTransfer.types.indexOf("Files") === -1) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  });
+  termEl.addEventListener("dragleave", function () {
+    if (dropDepth > 0) dropDepth--;
+    if (dropDepth === 0 && uploading === 0) setBanner("");
+  });
+  termEl.addEventListener("drop", function (e) {
+    if (!e.dataTransfer || e.dataTransfer.types.indexOf("Files") === -1) return;
+    e.preventDefault();
+    dropDepth = 0;
+    uploadFiles(e.dataTransfer.files);
+  });
+
+  // The phone path: no drag, so a paste of an image from the clipboard or a file picked from
+  // a menu. Pasting a *file* (not text) is offered by the clipboard API on mobile.
+  //
+  // Capture phase, and on the document rather than the terminal element: xterm's own textarea
+  // handles paste and may stop the event before it bubbles, so a listener on termEl would
+  // sometimes never run. Capture reaches us first, and the files check means ordinary text
+  // paste is untouched - it falls through to xterm as usual.
+  document.addEventListener("paste", function (e) {
+    if (!e.clipboardData || !e.clipboardData.files || !e.clipboardData.files.length) return;
+    e.preventDefault();
+    e.stopPropagation();
+    uploadFiles(e.clipboardData.files);
+  }, true);
+
   // Clicks and drags are input too: xterm encodes them as mouse escape sequences when
   // the program has asked for mouse reporting, which bubbletea does. That is why the
   // sidebar is clickable without a single line of click handling here.
