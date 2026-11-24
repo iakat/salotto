@@ -387,3 +387,98 @@ func TestSomeoneElsesJoinDoesNotSwitch(t *testing.T) {
 		t.Fatalf("another person's join switched the view to %q", m.Active())
 	}
 }
+
+// TestEnterPutsTheLineOnTheWire is the test the user's bug report deserved and did not get.
+//
+// Every earlier test checked the local echo, and the local echo is drawn by the model
+// whether or not anything is sent. Under a real bubbletea runtime nothing was sent at all:
+// Program.Update passed resolve=false, and resolving the model's command was the only thing
+// that ever reached submit(). So the suite was green, the screen showed the message, and
+// the message existed nowhere but the screen.
+//
+// The witness here is the socket. "hi" appearing on screen proves nothing; "PRIVMSG #test :hi"
+// arriving at the other end of a TCP connection proves it left.
+func TestEnterPutsTheLineOnTheWire(t *testing.T) {
+	Configure()
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	p := NewProgram("#test", tr)
+	p.Step(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// Type the way a runtime delivers it, then Enter, then run the command the way
+	// bubbletea does and feed the result back. No Step() shortcut: this is Update only.
+	for _, ru := range "hi" {
+		if _, cmd := p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ru}}); cmd != nil {
+			t.Fatalf("typing returned a command: %T", cmd)
+		}
+	}
+	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter returned no command")
+	}
+	if msg := cmd(); msg != nil {
+		p.Update(msg)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line := <-fb.sent:
+			if strings.Contains(line, "NICK") || strings.Contains(line, "USER") {
+				continue
+			}
+			if line != "PRIVMSG #test :hi" {
+				t.Fatalf("sent %q, want PRIVMSG #test :hi", line)
+			}
+			return
+		case <-deadline:
+			t.Fatal("Enter drew the line on screen but sent nothing to the bouncer")
+		}
+	}
+}
+
+// TestABareStatusLineReachesTheWire is the same defect in the other window, and it is the
+// one the user actually hit: "listchans" in the status window did nothing at all.
+func TestABareStatusLineReachesTheWire(t *testing.T) {
+	Configure()
+	fb := newFakeBouncer(t)
+	tr, err := Dial(fb.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	p := NewProgram("status", tr)
+	p.Step(tea.WindowSizeMsg{Width: 100, Height: 30})
+	for _, ru := range "listchans" {
+		p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ru}})
+	}
+	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter returned no command")
+	}
+	if msg := cmd(); msg != nil {
+		p.Update(msg)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case line := <-fb.sent:
+			if strings.Contains(line, "NICK") || strings.Contains(line, "USER") {
+				continue
+			}
+			if line != "listchans" {
+				t.Fatalf("sent %q, want the verb as typed", line)
+			}
+			return
+		case <-deadline:
+			t.Fatal("the status-window command never left")
+		}
+	}
+}

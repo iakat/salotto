@@ -151,6 +151,13 @@ func (p *Program) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // step is Step with the command resolution and the active-window sync made optional.
 func (p *Program) step(msg tea.Msg, resolve, sync bool) tea.Cmd {
+	// A Sent has crossed the model already: the local echo was applied when it was produced,
+	// and all that is left is the wire. It is handled here, before the model sees it, so the
+	// line is sent exactly once whether it arrives from a runtime or from step() itself.
+	if sent, ok := msg.(Sent); ok {
+		p.submit(sent.Text)
+	}
+
 	p.mu.Lock()
 	next, cmd := p.model.Step(msg)
 	p.model = next
@@ -164,10 +171,9 @@ func (p *Program) step(msg tea.Msg, resolve, sync bool) tea.Cmd {
 		// stays empty until the bouncer echoes it - which it only does with echo-message,
 		// which salotto deliberately does not request upstream.
 		if sent, ok := cmd().(Sent); ok {
-			p.mu.Lock()
-			p.model, _ = p.model.Step(sent)
-			p.mu.Unlock()
-			p.submit(sent.Text)
+			// Re-enter through step so the wire and the local echo are applied in exactly
+			// one place. resolve=false because this Sent is already the resolution.
+			p.step(sent, false, false)
 		}
 	}
 
