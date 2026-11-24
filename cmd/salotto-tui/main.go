@@ -60,16 +60,10 @@ func main() {
 		tr.Register(*nick, "")
 	}
 
-	// The starting window is the user's own status window, which is where a bouncer
-	// tells you what it did while you were away.
-	active := *window
-	if active == "" {
-		if *nick != "" {
-			active = *nick
-		} else {
-			active = "status"
-		}
-	}
+	// The starting window is the user's own status window, which is where a bouncer tells you what
+	// it did while you were away. ui.StartWindow holds the rule and the reason it is "status" and
+	// not the nick; what matters here is that the front end does not decide it a second time.
+	active := ui.StartWindow(*window)
 
 	// Settings are the client's, so each front end loads its own file. $SALOTTO_SETTINGS
 	// lets the web bridge point every browser session at the same one without adding a flag

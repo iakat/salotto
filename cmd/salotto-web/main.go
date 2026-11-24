@@ -51,7 +51,7 @@ func run() int {
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	bouncer := flag.String("bouncer", "", "bouncer address to attach to (host:port); empty serves a local-only UI")
 	nick := flag.String("nick", "salotto", "nick to register with the bouncer")
-	window := flag.String("window", "", "initial window (default: the nick's own window)")
+	window := flag.String("window", "", "initial window (default: status)")
 	tuiPath := flag.String("tui", "", "path to the salotto-tui binary (default: beside this binary)")
 	vapidPath := flag.String("vapid", "", "path to the VAPID key file; enables push notifications")
 	pushSubject := flag.String("vapid-subject", "mailto:admin@localhost", "contact for the push service")

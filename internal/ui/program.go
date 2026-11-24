@@ -7,6 +7,25 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// StartWindow decides which window a client opens on.
+//
+// The answer is "status", and it is a rule rather than a flag default because getting it wrong is
+// invisible until you look at the sidebar. ZNC names a client's server window after the user, and
+// this one used to copy that: the TUI opened on a window called after the nick. But salottod tags
+// every line with the window it belongs to, and that window is "status" - so the client created a
+// buffer nothing could ever write to, and the daemon's real status lines went to a second one. The
+// sidebar showed "1 nicholas" and "2 status", the first permanently empty. A window that can never
+// receive a line should never be created.
+//
+// -window still overrides, because someone may deliberately start in a channel; the rule is only
+// about the default.
+func StartWindow(requested string) string {
+	if requested != "" {
+		return requested
+	}
+	return "status"
+}
+
 // Program wraps a model and a transport into something a front end can run: the
 // SSH front end runs it as a tea.Program, the web bridge drives it from its own
 // loop, and a test can drive it with no terminal at all.

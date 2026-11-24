@@ -185,6 +185,24 @@ came back as 4000, and a batch of 700 identical lines over a window holding none
 because a capped scan loses as well as repeats. Tallying once makes the per-line work a map lookup,
 so there is no cap to get wrong.
 
+## A client opens on `status`, not on its own nick
+
+ZNC names a client's server window after the user, and the TUI copied that: with no `-window` it
+opened on a buffer called after the nick. This bouncer does not work that way - every line carries
+the window it belongs to, and that window is `status` - so the client created a buffer nothing could
+ever write to while the daemon's real status lines went into a second one. The sidebar showed
+`1 nicholas` (permanently empty) and `2 status` (holding everything), and the empty one had a number,
+an entry and no way to be filled.
+
+The rule is `ui.StartWindow`, in the same package as the model so it can be tested: a rule that
+lives in a `main` package is a rule pinned only by whatever happens to run the binary. `-window`
+still overrides, because starting in a channel deliberately is a real thing to want; the rule is
+only about the default.
+
+The general shape, which is worth keeping: **a window that can never receive a line should never be
+created.** The identity rules already prevent two windows for one name; they cannot prevent a front
+end from opening on a name nothing addresses.
+
 ## The settings file is written when a setting changes
 
 Two defects lived in the gap between "the model holds the right value" and "the file holds it",
