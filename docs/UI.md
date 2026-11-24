@@ -128,6 +128,74 @@ every map at once and keeps the buffer number the user has already learnt. When 
 hold the same name the buffer list prints `status (libera)`, and that spelling is a valid `/go`
 target, so the list never names a window nobody can type back in.
 
+## Activity, `/next`, and the chat monitor
+
+The sidebar already said which windows had something new; it did not say which
+were worth reading, and there was no way to move to one without knowing its
+number. The shape Quassel gets right is that a user reads **what changed**, so
+the model now carries one derived rank per window and two ways to reach it: a
+jump and a cross-buffer tail.
+
+**One rank, derived.** `Activity` is `None`, `Other`, `Message` or `Highlight`,
+and `activityOf(key)` is the only function that answers "is this worth visiting".
+It reads the counters the model already has - `unread` for a count, `mention`
+for a highlight - rather than a third parallel map. Three maps that must agree
+is how a badge and a jump target drift apart: the sidebar would colour one row
+and `/next` would land on another, and both would look broken. `unread` stays
+exactly what it was, because the badge prints a count and a rank is not a
+quantity. The zero-to-three ordering is load-bearing: a highlight draws warm
+(`38;5;222`), ordinary unread draws cooler (`38;5;117`), and the two comparisons
+in the renderer are `>` rather than `>=` so a message can never fall into the
+highlight branch.
+
+**Navigation walks the list on screen.** `/next` and `/prev` take the rows from
+`sidebarRows` and skip headings, so the visited order is the drawn order. Walking
+`m.order` instead - the order windows were opened - would be the same list only
+on a fresh client; once the sidebar sorts windows under their servers, a jump in
+arrival order appears to skip rows between here and there. The walk wraps, and
+`/next!` / `/prev!` raise the bar to `ActivityMessage` so only a highlight stops
+them. `alt-a`, the hotlist, is the same walk through `navigate`, for the same
+reason: two "next interesting window" keys that disagree are each other's bug
+report. All six commands are in `modelCommands`, so `/help` and Tab derive them
+rather than spelling a second list.
+
+**The monitor is a window, not a mode.** `/monitor [regex]` opens (or switches
+to) a window whose rows are built in `View()` from the current tail of every
+other window. It is deliberately not a slice appended to on every incoming line:
+that doubles the memory a long-running scrollback already costs, and the two
+copies disagree the moment a window is closed - the monitor would keep drawing a
+line the window no longer holds. Only the last 200 lines of each window are
+walked, because this view answers "what just happened"; `/search` is the
+archaeology tool and is allowed to be expensive. With no argument it shows the
+lines that carry `Line.Mention` - the same fact the highlight rank is built from
+- and a pattern matches the text or the nick. Every row is prefixed with its
+source window, because a line across buffers without its window is a quote with
+no attribution.
+
+Three consequences are deliberate. The monitor has **no number and no unread
+count**: a number puts it in `/b`, where a view is not a buffer, and a count
+would be a second, disagreeing answer to "how much is new". Typing in it is
+**refused in place**, not sent: a line has no channel to belong to, and falling
+through to `Sent` would deliver it to whichever window happened to be active
+before the monitor opened, which is the one mistake a user cannot take back. And
+it is never recorded as `last_window`, so a reconnect does not restore a view
+whose derived lines are gone.
+
+| key / command | what it does |
+|---|---|
+| `/next`, `/prev` | go to the next/previous window with any activity, wrapping in sidebar order |
+| `/next!`, `/prev!` | the same, but only a highlight (our nick or a `Settings.Highlights` word) stops the walk |
+| `alt-a` | the hotlist: the same walk as `/next` |
+| `/monitor` | open the cross-buffer tail, highlights only |
+| `/monitor <regex>` | open it with a filter on the line's text or nick |
+| `/monitor-off` | close it and return to the window it was opened from |
+
+`View()` does not mutate the model. The monitor is assembled from values the
+model already holds and the rank is computed from counters; a renderer that
+numbered a window or wrote an activity would write through the maps every
+`Step` shares, which is a race with the transport and a state change caused by
+looking at the screen.
+
 ## Reconnecting without doubling the scrollback
 
 The transport owns the retry loop, not the drivers. Three front ends, one of them spawning a

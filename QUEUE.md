@@ -746,6 +746,29 @@ is configured, and an idle registry with no `on_line` adds 0 allocations per lin
 |---|---|---|
 | P1 | **Plugin system**: named, hot-reloadable Starlark plugins | **done**: `internal/plugin`, `plugin_dir` config, `PLUGINS`, `PLUGIN RELOAD`, `PLUGIN ENABLE` and `PLUGIN DISABLE` on `*controlplane`, and `on_line` wired into `dispatchRouted` at exactly one call site. Hooks: `on_load(ctx)`, `on_line(line)` with `text`/`kind`/`drop` overrides, `on_command(ctx, argv)`. Deterministic name order, per-plugin recover and deadline, atomic registry snapshot, copy-only context and per-plugin `state`. Tests pin every listed mutation, including a broken reload keeping the old version and the alloc gate. Deliberate limits: enable/disable is in memory only (a restart forgets it), `drop` suppresses the live relay but not the ring or the log because the hook is on the relay path only, and `on_command` is implemented at the registry boundary but not wired into client command dispatch in v1. Docs: `docs/PLUGINS.md`. |
 
+## Part 2.6 — Quassel parity: activity, navigation, the monitor
+
+Katia's sentence — "basic IRC features and UX … and also whatever Quassel
+implements at least" — names a different centre from ZNC's and The Lounge's. A
+Quassel user does not read buffers; they read **what changed**. Three pieces of
+that are in, and the one that is not is written down rather than implied. All of
+it is client-side: the bouncer keeps the lines, and "read" is a fact about one
+pair of eyes, so nothing here is on the wire (`internal/facade` is untouched).
+
+| # | item | notes |
+|---|---|---|
+| Q1 | **Per-buffer activity levels**, derived, and a sidebar that ranks them | **done.** `Activity` is `None`/`Other`/`Message`/`Highlight`; `activityOf(key)` is the single answer to "is this worth visiting", read by the sidebar colour, the badge and the jump keys, so a row that looks interesting and a jump that lands elsewhere cannot disagree. It is derived from the existing `unread` count and `mention` flag - no third map to drift - and `mention` is the `Highlight` rank. A highlight draws warm (`38;5;222`), ordinary unread draws cooler (`38;5;117`), and the badge keeps printing the count: a rank is not a quantity. `ActivityOther` is declared for events that are not conversation but nothing returns it yet; the counters cannot tell a join from a message without scanning lines at draw time, which is the second source of truth the derivation exists to avoid. |
+| Q2 | **`/next`, `/prev` and the highlight-only `!` forms** | **done.** Both walk the list `sidebarRows` draws - not `m.order` - and wrap, because a jump in a different order than the list on screen appears to skip rows. `/next!` and `/prev!` stop only at highlights. They resolve in the model, are listed in `modelCommands`, and `/help` and Tab get them from that one list. `alt-a` (the hotlist) now uses the same walk, so two "next interesting window" keys cannot disagree about interesting or about order. |
+| Q3 | **Chat monitor**: one stream across buffers | **done.** `/monitor [regex]` opens a real window named `monitor` (default filter: highlights only); `/monitor-off` closes it. It is **derived at `View()` time** from a bounded tail (200 lines) of each window's actual `Line` values, never a copied history slice: appending every incoming line to a monitor buffer would double the memory of a long-running scrollback and the two copies would disagree after a close or a clear. Every row carries its source window. It has no buffer number and no unread count, so `/b` cannot reach it and it cannot compete with the badge. Typing in it is refused in place rather than sent to whichever window was active before - a message to the wrong channel is the mistake a user cannot undo. |
+| Q4 | **Remaining Quassel parity** | **open.** Buffer merge (treating two networks' same-named channels as one conversation) and ignore lists are the two behaviours still missing; both are separate features with their own persistence and their own failure modes, and neither is implied by the three above. The buffer-list activity filter (show only buffers with activity) is a smaller open item on top of Q1. |
+
+Ten frame-level tests in `internal/ui/activity_test.go` pin the table above, each
+written so the stated mutation turns it red: rank `>` to `>=`, walk every window,
+treat a message as a highlight, iterate `m.order`, stop at the end, build the
+monitor from the active window only, drop the source label, fall through to
+`Sent`, assign the monitor a number, and walk the whole history instead of the
+bounded tail.
+
 ## Part 3 — Explicitly refused, with citations
 
 From `https://wiki.archiveteam.org/index.php/User:JustAnotherArchivist/The_Lounge`

@@ -10,6 +10,7 @@ package ui
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -354,6 +355,48 @@ type HistoryWanted struct {
 	Before time.Time
 }
 
+// Activity is how much a window wants to be read, in the order a user would rank it.
+//
+// It is presentation, not bouncer state: the daemon keeps the lines, and "read" is a fact
+// about one client's eyes, so it stays here rather than on the wire. A bouncer that tracked
+// read state would be wrong for the second client attached to the same account, which has
+// seen nothing yet.
+//
+// The rank is derived by activityOf from the counters the model already keeps. Storing it in
+// a third map beside unread and mention would give two answers to "is this worth visiting"
+// that are free to drift apart, and the badge and the jump target would then disagree.
+type Activity int
+
+const (
+	// ActivityNone means every line in the window has been seen.
+	ActivityNone Activity = iota
+	// ActivityOther is the rank between "nothing" and "a message": something happened that
+	// is not conversation, such as a join or a topic change. The counters cannot tell that
+	// apart from a message without walking the lines, and a per-line scan at draw time is
+	// exactly the second source of truth this design refuses, so nothing returns it yet.
+	ActivityOther
+	// ActivityMessage means somebody said something we have not seen.
+	ActivityMessage
+	// ActivityHighlight means our nick or one of Settings.Highlights appeared. It outranks
+	// plain chatter because a mention is the one line a user is most likely to want now.
+	ActivityHighlight
+)
+
+// monitorKey is the identity of the chat monitor's window.
+//
+// It is not a bare "monitor" because a query window can belong to a person called monitor,
+// and the special view must never swallow that conversation. A key that comes from a line is
+// either a nick or a channel name, and neither can be this string: a nick cannot contain a
+// colon and a channel name must begin with '&', '#', '+' or '!'. winName translates the key
+// back to the name the user reads.
+const monitorKey = "salotto:monitor"
+
+// monitorTail is how many lines are walked at the end of each window when the monitor is
+// built. A monitor answers "what just happened", not "what was said last week": /search is
+// the archaeology tool, and walking a whole ring on every redraw would make a redraw cost the
+// scrollback.
+const monitorTail = 200
+
 // Model is the whole UI. It is a tea.Model and nothing more: three drivers
 // instantiate it, none of them subclass it.
 type Model struct {
@@ -396,6 +439,19 @@ type Model struct {
 	// there anything for me" - and the second is the one worth a colour.
 	unread  map[string]int
 	mention map[string]bool
+
+	// monitor is whether the chat monitor window is open, monitorPattern is the regex it
+	// filters on ("" for highlights only, the default), and monitorRE is that pattern
+	// compiled once at /monitor time rather than on every redraw.
+	//
+	// The monitor has no slice of its own: its lines are derived from the windows when View
+	// runs, so a long-running daemon's scrollback is not stored twice and the two copies
+	// cannot disagree after a /monitor-off. monitorReturn is the window /monitor-off goes
+	// back to, so opening a view and leaving it is not a trip through the whole sidebar.
+	monitor        bool
+	monitorPattern string
+	monitorRE      *regexp.Regexp
+	monitorReturn  string
 
 	// nicks is the membership of each channel, replaced wholesale by a Nicklist
 	// message. It is separate from windows because membership is not scrollback:
@@ -555,6 +611,11 @@ func keyWindow(key string) (network, name string) {
 // Everything the user reads goes through this, so two rows can both say "status" under two
 // headings instead of claiming to be "libera/status", which no IRC client has ever shown.
 func winName(key string) string {
+	if key == monitorKey {
+		// The monitor's key is deliberately not a name any line can produce; what the user
+		// reads is still "monitor", which is the name every other client gives it.
+		return "monitor"
+	}
 	_, name := keyWindow(key)
 	return name
 }
@@ -699,6 +760,12 @@ func (m *Model) assignBuffer(window string) int {
 	if window == "" {
 		return 0
 	}
+	// The monitor is a window but not a buffer. A number is what puts a window in the /b
+	// list, and the monitor is a view across buffers, so numbering it would offer a jump
+	// target that is not a place a conversation happened.
+	if window == monitorKey {
+		return 0
+	}
 	if n, ok := m.bufferNo[window]; ok {
 		return n
 	}
@@ -760,6 +827,20 @@ func (m Model) SetActive(name string) Model {
 	// does, and which server it is on is the model's knowledge. A name that is already a key
 	// passes through unchanged.
 	name = m.keyFor(name)
+	// The monitor is a view, not a conversation. It may be selected while it is open - a
+	// click on its row, or ctrl-n - but selecting it must not create it, because a monitor
+	// that exists without its filter is an empty buffer wearing a special name. It is also
+	// never recorded as the last window: the lines are derived from buffers that will not be
+	// there next time, so a reconnect would open a view with nothing in it.
+	if name == monitorKey {
+		if !m.monitor {
+			return m
+		}
+		m.active = name
+		m.windowChosen = true
+		m.scroll = 0
+		return m
+	}
 	if _, seen := m.windows[name]; !seen {
 		m.windows[name] = nil
 		m.order = append(m.order, name)
@@ -1389,6 +1470,34 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if _, arg, ok := slash(text, "b", "buffer"); ok {
 			return m.switchBuffer(arg), nil
 		}
+		// "/next", "/prev" and their "!" forms walk the window list the sidebar draws and
+		// stop at the next window worth reading. They resolve here rather than on the wire
+		// for the same reason /go does: the order and the activity are this client's
+		// presentation, and a bouncer has never heard of either.
+		//
+		// "/next!" and "/prev!" skip plain chatter and go only to highlights. The
+		// exclamation is weechat's spelling, and it is the difference between "anything new"
+		// and "something for me" that the badge already draws.
+		if _, _, ok := slash(text, "next!"); ok {
+			return m.navigate(1, ActivityMessage), nil
+		}
+		if _, _, ok := slash(text, "prev!"); ok {
+			return m.navigate(-1, ActivityMessage), nil
+		}
+		if _, _, ok := slash(text, "next"); ok {
+			return m.navigate(1, ActivityNone), nil
+		}
+		if _, _, ok := slash(text, "prev"); ok {
+			return m.navigate(-1, ActivityNone), nil
+		}
+		// "/monitor [regex]" opens the cross-buffer tail; "/monitor-off" closes it. Both are
+		// the model's because the monitor is built from lines this client holds.
+		if _, arg, ok := slash(text, "monitor"); ok {
+			return m.openMonitor(arg), nil
+		}
+		if _, _, ok := slash(text, "monitor-off"); ok {
+			return m.closeMonitor(), nil
+		}
 		// "/search pattern" searches across every window in memory and shows the hits as a
 		// list of jumps. It is resolved here for the same reason /go is: the scrollback lives
 		// in the client, so a command sent upstream could only return what the bouncer's
@@ -1403,6 +1512,13 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if text == "/close" {
 			// Closing is the mirror of /go and needs the same knowledge of the window list.
 			return m.closeActive(), nil
+		}
+		// The monitor is a view across buffers, so a line typed in it has no channel to
+		// belong to. Falling through to Sent would send it to whichever window happened to
+		// be active before the monitor opened, and a message to the wrong channel is the one
+		// mistake a user cannot take back. Refuse it where they are looking instead.
+		if m.active == monitorKey {
+			return m.appendSystem("the monitor is read-only; nothing was sent"), nil
 		}
 		return m, func() tea.Msg { return Sent{Text: text} }
 
@@ -1580,7 +1696,7 @@ func (m Model) helpIntoWindow() Model {
 	m.append(Line{Window: m.active, Nick: "salotto", Kind: LineSystem,
 		Text: "sent to the bouncer: " + strings.Join(wireCommands, " ")})
 	m.append(Line{Window: m.active, Nick: "salotto", Kind: LineSystem,
-		Text: "keys: up/down = sent history, tab = complete, PgUp/PgDn = scroll, ctrl-n = next window"})
+		Text: "keys: up/down = sent history, tab = complete, PgUp/PgDn = scroll, ctrl-n = next window, alt-a = next activity"})
 	return m
 }
 
@@ -1589,7 +1705,8 @@ func (m Model) helpIntoWindow() Model {
 // table for the benefit of Tab would mean two lists to keep in step - the failure mode the /fset
 // screen already had once.
 var modelCommands = []string{
-	"/alias", "/b", "/close", "/fset", "/find", "/go", "/help", "/search", "/settings",
+	"/alias", "/b", "/close", "/fset", "/find", "/go", "/help", "/monitor",
+	"/monitor-off", "/next", "/next!", "/prev", "/prev!", "/search", "/settings",
 }
 
 // wireCommands are passed through to the bouncer with the leading slash stripped. They are listed
@@ -1811,6 +1928,11 @@ func (m Model) bufferList() string {
 	}
 	entries := make([]entry, 0, len(m.windows))
 	for key := range m.windows {
+		// The monitor has no number and is not a buffer; listing it here would offer "/b 0"
+		// as a way to reach a view, which is not what /b is for.
+		if key == monitorKey {
+			continue
+		}
 		// The name, not the key; but when two networks hold the same name the list has to
 		// say which is which, or /b 2 and /b 5 both read "status" and the user has no way to
 		// tell which server they are choosing.
@@ -1953,6 +2075,9 @@ func fuzzyScore(text, pattern string) int {
 // channel someone else already parted; a PART is a different thing and still has to be typed.
 func (m Model) closeActive() Model {
 	name := m.active
+	if name == monitorKey {
+		return m.closeMonitor()
+	}
 	if len(m.order) <= 1 {
 		return m
 	}
@@ -1980,6 +2105,191 @@ func (m Model) closeActive() Model {
 	m.active = m.order[idx]
 	m.scroll = 0
 	return m
+}
+
+// openMonitor opens the chat monitor, or switches to it if it is already open, and sets its
+// filter. No argument means highlights only, which is the default everybody wants: the point
+// of the view is the lines addressed to you, and a pattern is for the times when it is not.
+//
+// The window is created here and not by SetActive because SetActive remembers its argument as
+// the client's last window. The monitor is a view, not a place a conversation happened, so a
+// client that quit while looking at it must not reopen into a view whose lines are gone.
+func (m Model) openMonitor(pattern string) Model {
+	pattern = strings.TrimSpace(pattern)
+	var re *regexp.Regexp
+	if pattern != "" {
+		compiled, err := regexp.Compile(pattern)
+		if err != nil {
+			// A pattern that does not compile is a typo, not an empty monitor: saying so
+			// leaves the previous filter doing what it was doing rather than silently
+			// showing everything.
+			return m.appendSystem("bad monitor pattern: " + err.Error())
+		}
+		re = compiled
+	}
+	if m.windows == nil {
+		m.windows = make(map[string][]Line, 4)
+	}
+	if _, seen := m.windows[monitorKey]; !seen {
+		m.windows[monitorKey] = nil
+		m.order = append(m.order, monitorKey)
+	}
+	if m.active != monitorKey {
+		// Remember where to go back to. Opening the monitor from a search picker or a
+		// settings screen is not possible - those are modes above the conversation - so the
+		// active window is always a real one here.
+		m.monitorReturn = m.active
+	}
+	m.monitor = true
+	m.monitorPattern = pattern
+	m.monitorRE = re
+	m.active = monitorKey
+	m.windowChosen = true
+	m.scroll = 0
+	delete(m.unread, monitorKey)
+	delete(m.mention, monitorKey)
+	return m
+}
+
+// closeMonitor removes the monitor window and returns to the window it was opened from.
+//
+// The derived lines go with the window and nothing else does: there is no slice of copied
+// history to keep in step, which is why closing and reopening cannot leave the monitor
+// showing a stale line from a window that has moved on.
+func (m Model) closeMonitor() Model {
+	if !m.monitor {
+		return m
+	}
+	wasActive := m.active == monitorKey
+	m.monitor = false
+	m.monitorPattern = ""
+	m.monitorRE = nil
+	delete(m.windows, monitorKey)
+	delete(m.unread, monitorKey)
+	delete(m.mention, monitorKey)
+	delete(m.nicks, monitorKey)
+	delete(m.topics, monitorKey)
+	delete(m.modes, monitorKey)
+	out := make([]string, 0, len(m.order))
+	for _, key := range m.order {
+		if key != monitorKey {
+			out = append(out, key)
+		}
+	}
+	m.order = out
+	if !wasActive {
+		return m
+	}
+	back := m.monitorReturn
+	m.monitorReturn = ""
+	if back != "" && back != monitorKey {
+		if _, live := m.windows[back]; live {
+			return m.SetActive(back)
+		}
+	}
+	return m.SetActive(m.firstRealWindow())
+}
+
+// firstRealWindow is the first window a user can read, used when the window the monitor was
+// opened from has since been closed. It falls back to "status" when the model holds nothing,
+// which SetActive creates rather than leaving the user on a blank screen.
+func (m Model) firstRealWindow() string {
+	for _, key := range m.navigationOrder() {
+		if key != monitorKey {
+			return key
+		}
+	}
+	return "status"
+}
+
+// monitorWants reports whether a line belongs in the monitor under the current filter.
+//
+// A day rule, a gap marker and a preview are not things somebody said, so none of them can be
+// a mention and none of them is what a monitor is for. With a pattern, the match is against
+// the line's text and nick, because a user searching for a person types the nick.
+func (m Model) monitorWants(l Line) bool {
+	switch l.Kind {
+	case LineDay, LineGap, LinePreview:
+		return false
+	}
+	if m.monitorRE != nil {
+		return m.monitorRE.MatchString(l.Text) || m.monitorRE.MatchString(l.Nick)
+	}
+	return l.Mention
+}
+
+// monitorMessages is the monitor's content, derived from the windows at call time.
+//
+// It is deliberately not a second slice of history. Appending every incoming line to a
+// monitor buffer would double the memory a long-running bouncer's scrollback already costs,
+// and the two copies would disagree the moment one window was closed or cleared: the monitor
+// would keep drawing a line the window no longer holds. Building from the windows means the
+// monitor and the window can never contradict each other.
+//
+// Only the tail of each window is walked (monitorTail lines), because this view answers "what
+// just happened"; /search is the tool for archaeology and it is allowed to be expensive.
+func (m Model) monitorMessages() []Line {
+	out := make([]Line, 0, monitorTail)
+	for _, key := range m.order {
+		lines := m.windows[key]
+		start := len(lines) - monitorTail
+		if start < 0 {
+			start = 0
+		}
+		own := key == monitorKey
+		for _, l := range lines[start:] {
+			// The monitor's own buffer holds the client's notices to it - "this view is
+			// read-only", a bad pattern - which are not chat from another window and must
+			// be shown regardless of the filter, or the refusal would be invisible.
+			if !own && !m.monitorWants(l) {
+				continue
+			}
+			out = append(out, l)
+		}
+	}
+	// A monitor is one stream across windows, so the rows are ordered by when they happened
+	// rather than by which window they belong to. Lines with no time keep their window
+	// order and sort last, which is where the client's own notices belong.
+	sort.SliceStable(out, func(i, j int) bool {
+		ti, tj := out[i].Time, out[j].Time
+		if ti.IsZero() {
+			return false
+		}
+		if tj.IsZero() {
+			return true
+		}
+		return ti.Before(tj)
+	})
+	return out
+}
+
+// monitorLines renders the monitor to n rows of at most width cells.
+//
+// The source window is prefixed to every line, not only the highlighted ones: the reason to
+// read a cross-buffer view is to know where a sentence came from, and a line without its
+// window is a quote with no attribution. The prefix lives in the text rather than in a second
+// column because a terminal has one column to spare and this is the one place it is needed.
+func (m Model) monitorLines(width, n int) []string {
+	if n < 1 {
+		n = 1
+	}
+	if width < 1 {
+		width = 1
+	}
+	msgs := m.monitorMessages()
+	out := make([]string, 0, n)
+	for _, l := range msgs {
+		shown := l
+		shown.Text = "[" + winName(l.Window) + "] " + l.Text
+		out = append(out, lineLines(shown, width, m.settings)...)
+	}
+	if len(out) > n {
+		out = out[len(out)-n:]
+	}
+	for len(out) < n {
+		out = append(out, "")
+	}
+	return out
 }
 
 // appendSystem puts a note in the active window. It is used for the client's own refusals -
@@ -2096,31 +2406,106 @@ func onOff(b bool) string {
 	return "off"
 }
 
-// hotlistNext jumps to the next window with unread activity, wrapping past the end. It is
-// the hotlist: the point is not to show what is unread but to take you there, and a jump that
-// stopped at the bottom would leave the user scrolling the sidebar by hand.
-func (m Model) hotlistNext() Model {
-	if !m.settings.Hotlist || len(m.order) < 2 {
+// activityOf ranks what the model already knows about a window. It is the single answer to
+// "is this worth visiting", used by the sidebar colour, the badge and /next alike, so the
+// row that looks interesting and the row a jump lands on cannot disagree.
+//
+// The rank is derived rather than stored: a highlight is the existing mention flag, and an
+// ordinary message is any unread count at all. A window with a highlight but no count cannot
+// happen through the transport, but NoteMention can set one directly, and a highlight with
+// no count must still rank as a highlight.
+func (m Model) activityOf(key string) Activity {
+	if m.mention[key] {
+		return ActivityHighlight
+	}
+	if m.unread[key] > 0 {
+		return ActivityMessage
+	}
+	return ActivityNone
+}
+
+// navigationOrder is the window list in the order the sidebar draws it.
+//
+// It goes through sidebarRows rather than reading m.order because the sidebar sorts windows
+// under their servers and /next has to visit them in the order the user sees. A jump that
+// followed arrival order on a sorted list would appear to skip rows: the user presses /next,
+// the arrow lands three rows down, and the row above it that was never visited looks like a
+// bug in /next.
+func (m Model) navigationOrder() []string {
+	// A bound that is always enough for the list itself: every row is a window, and a
+	// grouped list adds at most one heading per network. Asking for fewer would make
+	// sidebarRows fall back to the flat order, which is the different order this function
+	// exists to avoid.
+	rows := m.sidebarRows(len(m.order) + len(m.netOf) + 8)
+	out := make([]string, 0, len(rows))
+	seen := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		if row.window == "" || seen[row.window] {
+			continue
+		}
+		seen[row.window] = true
+		out = append(out, row.window)
+	}
+	return out
+}
+
+// navigate moves to the next or previous window whose activity outranks above, wrapping at
+// the ends. above is ActivityNone for /next and /prev and ActivityMessage for /next! and
+// /prev!, which are "take me only to something addressed to me".
+//
+// Stopping at the end rather than wrapping would make the last changed window a dead end:
+// the user would have to know they are at the end and start again, which on a forty-window
+// sidebar is the navigation problem this exists to remove. Walking the length of the list
+// visits every other row once, so a changed window ahead of the wrap is found, and when
+// nothing is changed the model does not move at all.
+func (m Model) navigate(delta int, above Activity) Model {
+	list := m.navigationOrder()
+	if len(list) == 0 {
 		return m
 	}
-	cur := 0
-	for i, name := range m.order {
-		if name == m.active {
+	cur := -1
+	for i, key := range list {
+		if key == m.active {
 			cur = i
 			break
 		}
 	}
-	for step := 1; step <= len(m.order); step++ {
-		idx := (cur + step) % len(m.order)
-		name := m.order[idx]
+	start := cur
+	if start < 0 {
+		// An active window the list does not contain - an empty model, or a mode that is not
+		// a window - has no position to walk from: start before the first row going forward
+		// and after the last going back, so the first /next reaches row 0 instead of
+		// skipping it.
+		if delta > 0 {
+			start = -1
+		} else {
+			start = 0
+		}
+	}
+	for step := 1; step <= len(list); step++ {
+		idx := ((start+delta*step)%len(list) + len(list)) % len(list)
 		if idx == cur {
 			continue
 		}
-		if m.unread[name] > 0 || m.mention[name] {
-			return m.SetActive(name)
+		key := list[idx]
+		if m.activityOf(key) > above {
+			return m.SetActive(key)
 		}
 	}
 	return m
+}
+
+// hotlistNext jumps to the next window with unread activity, wrapping past the end. It is
+// the hotlist: the point is not to show what is unread but to take you there, and a jump that
+// stopped at the bottom would leave the user scrolling the sidebar by hand.
+//
+// It is the same walk as /next, in the same order, because two "next interesting window"
+// keys that disagree about interesting or about order would each look broken from the other.
+func (m Model) hotlistNext() Model {
+	if !m.settings.Hotlist {
+		return m
+	}
+	return m.navigate(1, ActivityNone)
 }
 
 // updateSettingsKey drives the settings screen. Up and down move, space and enter toggle a
@@ -2536,6 +2921,11 @@ var (
 	// addresses us, so it stands out without a background fill that would fight
 	// the terminal's own theme.
 	mentionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("222")).Bold(true)
+	// activityStyle colours a sidebar row whose window has unread conversation that is not
+	// addressed to us. Distinct from mentionStyle on purpose: if both ranks drew the same
+	// colour, the badge would be the only thing telling "somebody talked" from "somebody
+	// said my name", and the jump keys would appear to do nothing different.
+	activityStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))
 	// opStyle marks channel operators in the nick column, in the same palette.
 	opStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
 	// topicStyle is deliberately dimmer than a nickname: a topic is context, not
@@ -2898,6 +3288,9 @@ type sidebarRow struct {
 	status bool
 	// text is the label: the window name, or the network name for a heading.
 	text string
+	// activity is the rank the row is drawn with. It is derived by windowRow, not stored on
+	// the model, so a row and a /next jump read the same answer from the same counters.
+	activity Activity
 	// badge is the right-aligned unread count or mention mark, already rendered as a string.
 	badge string
 }
@@ -3042,19 +3435,29 @@ func (m Model) windowRow(key string) sidebarRow {
 	// The row shows the name, never the key: "libera/status" is an implementation detail and
 	// two rows saying "status" under two headings is exactly what the grouping is for.
 	text := winName(key)
+	// The monitor is a view across buffers, not a buffer: no number, so /b cannot reach it,
+	// and no count, because it has no unread lines of its own and a badge here would be a
+	// second, disagreeing answer to "how much is new".
+	if key == monitorKey {
+		return sidebarRow{window: key, text: text}
+	}
 	if m.settings.BufferNumbers {
 		if n := m.bufferNo[key]; n > 0 {
 			text = strconv.Itoa(n) + " " + text
 		}
 	}
+	activity := m.activityOf(key)
 	badge := ""
 	switch {
-	case m.mention[key]:
+	case activity > ActivityMessage:
 		badge = "@"
-	case m.unread[key] > 0:
+	case activity > ActivityNone:
+		// The count, not the rank: the rank says a row is worth visiting, and the number
+		// says how much there is to read. Collapsing them would lose the only quantity the
+		// badge has ever shown.
 		badge = strconv.Itoa(m.unread[key])
 	}
-	return sidebarRow{window: key, text: text, badge: badge}
+	return sidebarRow{window: key, text: text, activity: activity, badge: badge}
 }
 
 // windowColumn renders the window list: the active one marked, and a mention or an
@@ -3130,8 +3533,14 @@ func (m Model) windowColumn(width, n int) []string {
 			// like the ones under it, and dimming it would hide the one row that says what
 			// server this whole group belongs to.
 			out = append(out, topicStyle.Bold(true).Render(line))
-		case m.mention[row.window]:
+		case row.activity > ActivityMessage:
 			out = append(out, mentionStyle.Render(line))
+		case row.activity > ActivityNone:
+			// Plain chatter is coloured, but in a different colour from a mention: a busy
+			// channel must not look like somebody calling your name. The comparison is > and
+			// not >= for exactly that reason - a message rank must not fall into the
+			// highlight branch, or the two ranks would be one.
+			out = append(out, activityStyle.Render(line))
 		default:
 			out = append(out, bodyStyle.Render(line))
 		}
@@ -3231,6 +3640,13 @@ func (m Model) bodyLines(width, n int) []string {
 	}
 	if m.searchPending || len(m.searchHits) > 0 {
 		return m.searchLines(width, n)
+	}
+	// The monitor is a derived view of every window, so it is built here, at draw time, from
+	// the Line values the model already holds. A monitor buffer appended to on every incoming
+	// line would be a second copy of the scrollback: doubled memory for a long-running
+	// daemon, and two copies that drift the moment a window is closed or cleared.
+	if m.active == monitorKey {
+		return m.monitorLines(width, n)
 	}
 	lines := m.windows[m.active]
 	end := len(lines) - m.scroll
