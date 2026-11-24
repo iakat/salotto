@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bufio"
+	"encoding/base64"
 	"net"
 	"sort"
 	"strings"
@@ -60,6 +61,13 @@ type Transport struct {
 	// joined, and a prefix change for a nick we have not listed yet would be lost.
 	modes  map[string]string
 	active string
+
+	// prefsAsked records that this connection has already asked for the
+	// bouncer's settings. Replayed upstream numerics include 001 too, so a bare
+	// verb test would ask once per replayed registration line and, on an empty
+	// bouncer, seed the same settings repeatedly. It is touched only by the
+	// read loop.
+	prefsAsked bool
 
 	outq chan string
 	msgs chan tea.Msg
@@ -334,6 +342,14 @@ func (t *Transport) handle(raw []byte) {
 	from := ircline.Nick(prefix)
 	verb := strings.ToUpper(string(ircline.Verb(rest)))
 	params := string(ircline.Params(rest))
+
+	// PREF is the bouncer's opaque settings blob. It is intercepted before any
+	// routing can draw it: base64 in a status window would be a protocol line
+	// pretending to be a message, and the model wants the bytes, not a line.
+	if verb == "PREF" {
+		t.handlePrefs(params)
+		return
+	}
 
 	// A bouncer NOTICE about its own state is a status line, not a chat line:
 	// ZNC's *status answers everything this way.
@@ -641,6 +657,15 @@ func (t *Transport) handle(raw []byte) {
 			t.noteSelf(fields[0])
 		}
 	}
+	// Ask for the bouncer's settings exactly once per connection, on our own
+	// 001. The answer either carries a blob (adopt it) or is an explicit empty
+	// PREF (this client is the seed). Silence was considered and rejected: it
+	// would need a timer to tell "no settings" from "not answered yet", and a
+	// timer in the registration path is a race with the first settings change.
+	if verb == "001" && !t.prefsAsked {
+		t.prefsAsked = true
+		t.Send("PREF GET")
+	}
 
 	// Numerics and anything else are status. 001 also tells us our own nick,
 	// which the model shows in the status bar.
@@ -659,6 +684,26 @@ func (t *Transport) handle(raw []byte) {
 		Text:   strings.TrimSpace(verb + " " + params),
 		Kind:   kind,
 	})
+}
+
+// handlePrefs decodes one PREF line into a Prefs message. The nick in the line
+// is not needed: the bouncer sends it to this connection, and nothing here
+// routes by target. An empty token is the bouncer's explicit "I hold nothing",
+// which the model answers by seeding the settings it has on disk.
+func (t *Transport) handlePrefs(params string) {
+	_, token, _ := strings.Cut(params, " ")
+	token = strings.TrimSpace(strings.TrimPrefix(token, ":"))
+	if token == "" {
+		t.push(Prefs{})
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		// Not a settings blob. Dropping it is better than drawing it: the one
+		// thing a PREF line must never become is text in a status window.
+		return
+	}
+	t.push(Prefs{Data: data})
 }
 
 // windowFor decides which window a message belongs to. A message addressed to us

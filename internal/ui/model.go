@@ -188,6 +188,24 @@ type ChannelModes struct {
 // Sent is the message a transport sends when the user submitted a line.
 type Sent struct{ Text string }
 
+// Prefs is the settings blob the bouncer holds, decoded from its PREF line.
+//
+// It is a message of its own rather than a Line because it is state, not
+// conversation: drawing a base64 settings document in a status window would be
+// a protocol line pretending to be a message. Data is the JSON after base64
+// decoding; an empty Data means the bouncer holds no settings and this client
+// is the first one to arrive.
+type Prefs struct {
+	Data []byte
+}
+
+// PrefsPush asks the driver to send this client's settings to the bouncer. The
+// model has no socket, and the file remains the client's offline copy; this is
+// the other half, so /fset changes every attached client.
+type PrefsPush struct {
+	Token string
+}
+
 // HistoryWanted is the message asking the transport for older lines than the client holds.
 //
 // It is a message rather than a direct call because the model does not own a socket: the same
@@ -861,6 +879,23 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case Prefs:
+		// Adopting is deliberately silent: no saveSettings and no PREF SET.
+		// Two attached clients that echoed an adopted blob at each other would
+		// bounce the same settings forever, and the sender already has them.
+		if len(msg.Data) == 0 {
+			// The bouncer holds nothing. This client is the seed, but only if
+			// it has a file to seed from: a fresh client with defaults has
+			// nothing better to offer than the defaults the bouncer will use
+			// anyway.
+			if m.settingsPath != "" {
+				return m, m.prefsCmd()
+			}
+			return m, nil
+		}
+		m.settings = decodeSettings(msg.Data)
+		return m, nil
+
 	case Sent:
 		text := strings.TrimSpace(msg.Text)
 		if text == "" {
@@ -884,7 +919,7 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	// keystroke meant for it must not reach the input box behind it, and returning to the
 	// conversation has to restore exactly what it covered.
 	if m.showSettings {
-		return m.updateSettingsKey(msg), nil
+		return m.updateSettingsKey(msg)
 	}
 	switch msg.Type {
 	case tea.KeyEnter:
@@ -904,10 +939,10 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m.helpIntoWindow(), nil
 		}
 		if name, rest, ok := slash(text, "fset", "set"); ok {
-			return m.handleFset(name, rest), nil
+			return m.handleFset(name, rest)
 		}
 		if _, rest, ok := slash(text, "alias"); ok {
-			return m.handleAlias(rest), nil
+			return m.handleAlias(rest)
 		}
 		if _, _, ok := slash(text, "settings", "prefs"); ok {
 			// The screen, not the command: /fset sets one value, /settings shows them all
@@ -1573,39 +1608,46 @@ func slash(text string, names ...string) (name, rest string, ok bool) {
 
 // handleFset sets one client setting: "/fset timestamps off", "/fset scroll_step 5", and a
 // bare "/fset" to list them, which is what makes the command discoverable.
-func (m Model) handleFset(name, rest string) Model {
+//
+// A change is written to the client's file first and then sent to the bouncer. The file is
+// the offline copy that keeps a client talking to a plain IRCd, a headless test and the
+// renderer tests working; the bouncer is the shared truth that makes the same setting appear
+// in every other attached client.
+func (m Model) handleFset(name, rest string) (Model, tea.Cmd) {
 	if rest == "" {
 		for _, row := range m.settings.rows() {
 			m.appendSystem(fmt.Sprintf("%-14s %s", row.label, row.value))
 		}
 		m.appendSystem("use /fset <name> <value>; /settings shows the full screen")
-		return m
+		return m, nil
 	}
 	key, value, hasValue := strings.Cut(rest, " ")
 	if !hasValue {
 		value = ""
 	}
 	if err := m.settings.set(key, value); err != nil {
-		return m.appendSystem(err.Error())
+		return m.appendSystem(err.Error()), nil
 	}
 	m.saveSettings()
-	return m.appendSystem(fmt.Sprintf("%s is now %s", key, valueOf(m.settings, key)))
+	m = m.appendSystem(fmt.Sprintf("%s is now %s", key, valueOf(m.settings, key)))
+	return m, m.prefsCmd()
 }
 
 // handleAlias adds an alias, or lists them. Listing on a bare invocation matters: an alias
 // nobody can remember is an alias nobody uses.
-func (m Model) handleAlias(rest string) Model {
+func (m Model) handleAlias(rest string) (Model, tea.Cmd) {
 	if rest == "" {
 		for _, line := range m.settings.aliasList() {
 			m.appendSystem(line)
 		}
-		return m
+		return m, nil
 	}
 	if err := m.settings.applyAlias(rest); err != nil {
-		return m.appendSystem(err.Error())
+		return m.appendSystem(err.Error()), nil
 	}
 	m.saveSettings()
-	return m.appendSystem("alias set: " + rest)
+	m = m.appendSystem("alias set: " + rest)
+	return m, m.prefsCmd()
 }
 
 // valueOf reads a setting back for the confirmation line. It is a second switch over the
@@ -1665,7 +1707,7 @@ func (m Model) hotlistNext() Model {
 
 // updateSettingsKey drives the settings screen. Up and down move, space and enter toggle a
 // boolean, left and right change a number, and escape or q leaves.
-func (m Model) updateSettingsKey(msg tea.KeyMsg) Model {
+func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	rows := m.settings.rows()
 	if m.settingsRow >= len(rows) {
 		m.settingsRow = len(rows) - 1
@@ -1677,40 +1719,54 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) Model {
 	switch msg.Type {
 	case tea.KeyEsc, tea.KeyCtrlC:
 		m.showSettings = false
-		return m
+		return m, nil
 	case tea.KeyUp:
 		if m.settingsRow > 0 {
 			m.settingsRow--
 		}
-		return m
+		return m, nil
 	case tea.KeyDown:
 		if m.settingsRow < len(rows)-1 {
 			m.settingsRow++
 		}
-		return m
+		return m, nil
 	case tea.KeyLeft:
 		if row.kind == "int" {
 			_ = m.settings.set(row.key, strconv.Itoa(max(1, m.settings.ScrollStep-1)))
 			m.saveSettings()
+			return m, m.prefsCmd()
 		}
-		return m
+		return m, nil
 	case tea.KeyRight:
 		if row.kind == "int" {
 			_ = m.settings.set(row.key, strconv.Itoa(m.settings.ScrollStep+1))
 			m.saveSettings()
+			return m, m.prefsCmd()
 		}
-		return m
+		return m, nil
 	case tea.KeyEnter, tea.KeySpace:
 		_ = m.settings.set(row.key, "")
 		m.saveSettings()
-		return m
+		return m, m.prefsCmd()
 	case tea.KeyRunes:
 		if len(msg.Runes) == 1 && (msg.Runes[0] == 'q' || msg.Runes[0] == 'Q') {
 			m.showSettings = false
 		}
-		return m
+		return m, nil
 	}
-	return m
+	return m, nil
+}
+
+// prefsCmd asks the driver to push the current settings to the bouncer. It is
+// separate from saveSettings because the model never owns a socket: the same
+// model drives a terminal, an SSH session and a browser tab, and only the
+// driver knows how to say PREF SET on its wire.
+func (m Model) prefsCmd() tea.Cmd {
+	token, err := m.settings.token()
+	if err != nil {
+		return nil
+	}
+	return func() tea.Msg { return PrefsPush{Token: token} }
 }
 
 // saveSettings persists the settings next to the client's other state. A failure is reported

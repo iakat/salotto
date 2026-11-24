@@ -169,6 +169,13 @@ func (p *Program) step(msg tea.Msg, resolve, sync bool) tea.Cmd {
 		p.submit(sent.Text)
 	}
 
+	// Settings are the shared truth at the bouncer. The model produces the token
+	// because only it knows the current settings; the driver owns the socket, so
+	// the line is written here and nowhere else.
+	if push, ok := msg.(PrefsPush); ok {
+		p.sendPrefs(push.Token)
+	}
+
 	// A request for older history is resolved here for the same reason a Sent is: the model has
 	// no socket. The transport knows how to say "older than this" on this wire, and CHATHISTORY
 	// is the only form of it the protocol offers - so the model asks for history and the
@@ -189,10 +196,16 @@ func (p *Program) step(msg tea.Msg, resolve, sync bool) tea.Cmd {
 		// happens: the user presses Enter, the line goes to the bouncer, and their screen
 		// stays empty until the bouncer echoes it - which it only does with echo-message,
 		// which salotto deliberately does not request upstream.
-		if sent, ok := cmd().(Sent); ok {
-			// Re-enter through step so the wire and the local echo are applied in exactly
-			// one place. resolve=false because this Sent is already the resolution.
-			p.step(sent, false, false)
+		//
+		// A /fset command resolves to PrefsPush instead. Re-entering through step gives both
+		// the one place that knows how to put each on the wire, and the model's own state
+		// update has already happened.
+		switch out := cmd().(type) {
+		case Sent:
+			// resolve=false because this Sent is already the resolution.
+			p.step(out, false, false)
+		case PrefsPush:
+			p.step(out, false, false)
 		}
 	}
 
@@ -225,6 +238,16 @@ func (p *Program) submit(text string) {
 		return
 	}
 	p.tr.Send(line)
+}
+
+// sendPrefs writes a settings blob to the bouncer. A token with no destination
+// is impossible: the transport is the only destination, and a local-only
+// Program has no transport, so the file remains the whole story there.
+func (p *Program) sendPrefs(token string) {
+	if p.tr == nil || token == "" {
+		return
+	}
+	p.tr.Send("PREF SET " + token)
 }
 
 // requestHistory asks the bouncer for lines older than the cursor.

@@ -110,6 +110,7 @@ func newTestTransport(t *testing.T) *Transport {
 		members: make(map[string]map[string]string),
 		topics:  make(map[string]string),
 		modes:   make(map[string]string),
+		outq:    make(chan string, 64),
 		msgs:    make(chan tea.Msg, 64),
 	}
 	tr.noteSelf("alice")

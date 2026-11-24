@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -289,20 +290,12 @@ func (s Settings) aliasList() []string {
 	return out
 }
 
-// LoadSettings reads a settings file, falling back to the defaults. A missing file is not an
-// error: the first run of a new installation has no file, and refusing to start over that
-// would be a strange way to greet someone.
-func LoadSettings(path string) Settings {
+// decodeSettings applies one JSON document over the defaults. The file and the
+// bouncer's opaque blob share this rule on purpose: a setting added by a newer
+// client must not make an older client's file unreadable, and a blob from an
+// older client must keep the defaults for the keys it does not have.
+func decodeSettings(data []byte) Settings {
 	s := DefaultSettings()
-	if path == "" {
-		return s
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return s
-	}
-	// Decode over the defaults so a file written by an older version - missing keys - keeps
-	// the defaults for the keys it does not have.
 	if err := json.Unmarshal(data, &s); err != nil {
 		return DefaultSettings()
 	}
@@ -313,6 +306,33 @@ func LoadSettings(path string) Settings {
 		s.Aliases = DefaultSettings().Aliases
 	}
 	return s
+}
+
+// LoadSettings reads a settings file, falling back to the defaults. A missing file is not an
+// error: the first run of a new installation has no file, and refusing to start over that
+// would be a strange way to greet someone.
+func LoadSettings(path string) Settings {
+	if path == "" {
+		return DefaultSettings()
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return DefaultSettings()
+	}
+	return decodeSettings(data)
+}
+
+// token is the wire form of the settings: their JSON, base64-encoded so the
+// whole document survives as one IRC parameter. A raw JSON blob happens to have
+// no spaces after json.Marshal today, but a value containing one - or a future
+// MarshalIndent - would be truncated at the first space, so the encoding is
+// not decoration.
+func (s Settings) token() (string, error) {
+	data, err := json.Marshal(s)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
 }
 
 // SaveSettings writes the settings file. It writes a temporary file and renames it, so a

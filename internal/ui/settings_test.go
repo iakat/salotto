@@ -32,13 +32,23 @@ func TestFsetTogglesASetting(t *testing.T) {
 	}
 }
 
-// TestFsetNeverReachesTheWire is the property that makes it a client setting. A bouncer has
-// no "timestamps" command, so a /fset that got sent would be answered with a 421 and the
-// setting would not change - a failure that looks like the feature does not exist.
-func TestFsetNeverReachesTheWire(t *testing.T) {
+// TestFsetNeverReachesTheWireAsAClientCommand is the property that makes it a client setting.
+// A bouncer has no "timestamps" command, so a /fset that went out as FSET would be answered
+// with a 421 and the setting would not change. The change now reaches the bouncer as the
+// opaque PREF SET blob, which is the one form the daemon understands without knowing any
+// setting name.
+func TestFsetNeverReachesTheWireAsAClientCommand(t *testing.T) {
 	m := New("#test")
-	if cmd := typeLineCmd(m, "/fset seconds off"); cmd != nil {
-		t.Fatalf("/fset produced a command for the transport: %v", cmd())
+	cmd := typeLineCmd(m, "/fset seconds off")
+	if cmd == nil {
+		t.Fatal("/fset produced no PREF SET for the bouncer")
+	}
+	msg, ok := cmd().(PrefsPush)
+	if !ok {
+		t.Fatalf("/fset produced %T, want PrefsPush", msg)
+	}
+	if msg.Token == "" {
+		t.Fatal("/fset produced an empty settings blob")
 	}
 }
 
