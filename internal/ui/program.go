@@ -203,6 +203,11 @@ func (p *Program) step(msg tea.Msg, resolve, sync bool) tea.Cmd {
 		p.requestHistory(want)
 	}
 
+	// A search is the same split: the model knows the question, the transport owns the socket.
+	if want, ok := msg.(SearchWanted); ok {
+		p.search(want)
+	}
+
 	p.mu.Lock()
 	next, cmd := p.model.Step(msg)
 	p.model = next
@@ -224,6 +229,9 @@ func (p *Program) step(msg tea.Msg, resolve, sync bool) tea.Cmd {
 			// resolve=false because this Sent is already the resolution.
 			p.step(out, false, false)
 		case PrefsPush:
+			p.step(out, false, false)
+		case SearchWanted:
+			// Re-enter through step so the socket is touched in the one place that knows how.
 			p.step(out, false, false)
 		}
 	}
@@ -267,6 +275,18 @@ func (p *Program) sendPrefs(token string) {
 		return
 	}
 	p.tr.Send("PREF SET " + token)
+}
+
+// search asks the bouncer to run a query against its log index.
+//
+// It is asynchronous by construction: the model returns a command instead of scanning, and the
+// daemon's answer arrives later as ordinary NOTICEs that the transport folds into SearchResults.
+// The bouncer scans the disk; the render loop keeps drawing.
+func (p *Program) search(want SearchWanted) {
+	if p.tr == nil || want.Query == "" || want.ID == 0 {
+		return
+	}
+	p.tr.Send(searchWireLine(want))
 }
 
 // requestHistory asks the bouncer for lines older than the cursor.

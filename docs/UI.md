@@ -248,14 +248,69 @@ Three decisions in that:
 - **Any other keystroke closes the list and goes to the input.** A mode that swallows typing traps
   the user in it, and the first thing anyone does after finding a line is say something about it.
 
+### The list now asks the bouncer, not only the window in memory
+
+The picker above was still answering the small question. Its hits came from `Model.Search`, a
+linear scan of the scrollback this connection holds, so on a bouncer that had been running for
+weeks a line from last month was unfindable even though it was on disk - the client was searching
+the last few hundred lines of each window and calling that "search". The bouncer's log index
+already existed (`logfile.Query`, the same walk `CHATHISTORY` uses); nothing on the wire asked it.
+
+`/search` now sends a `SEARCH` verb to the bouncer and the bouncer answers from the index:
+
+```
+SEARCH [id:<n>] [window:<name>] [network:<name>] [since:<YYYY-MM-DD>] [until:<YYYY-MM-DD>] <query>
+NOTICE <nick> :SEARCH <date> <time> <network> <window> <body>
+NOTICE <nick> :SEARCH-END <count>
+NOTICE <nick> :SEARCH-ERR <reason>
+```
+
+The body is last and unescaped. It is the only free-text field in the format, and the reason the
+row is not, say, tab-separated is that a log body may contain tabs, colons and runs of spaces: a
+reader that splits the first four fields and takes the rest verbatim cannot lose any of them,
+while an escape scheme would have to be invented and agreed on by two ends for no benefit.
+
+Four decisions in that:
+
+- **Logging off is a refusal, not an empty answer.** With no log directory `SEARCH-ERR logging
+  disabled` is written, because `SEARCH-END 0` is indistinguishable from "nothing matched" and
+  sends the user looking for a spelling mistake in a search that never ran. The same rule applies
+  to a path in `window:` or `network:`: it is refused at the boundary with the field named, rather
+  than passed to the filesystem walk.
+- **The client does not wait.** The disk is the daemon's to scan; the model returns a command,
+  draws a `searching for "…"` row where the results will appear, and keeps drawing. A search that
+  blocked the render loop would freeze the input line behind a file walk, and on a busy bouncer
+  that is exactly when the user is most likely to be typing.
+- **A superseded answer is dropped, not shown late.** Each request carries an `id:` and every
+  reply line repeats it as the `salotto.search` tag. An answer whose id is not the newest is
+  discarded. A late picker is worse than no picker: it looks like the answer to the question on
+  screen, so the user walks a list from a query they have already replaced and only notices when
+  the rows are about words they no longer remember typing. The pending row remains, which is the
+  honest state - the current question has not been answered.
+- **One predicate chooses the path.** `searchRemote` is set when the registration burst's `002`
+  says salotto and cleared when the connection drops. With it, `/search` is asynchronous and asks
+  the index; without it, the old synchronous in-memory scan runs unchanged, which is what a
+  headless renderer, a test and a plain IRCd client all still get. Falling back to memory after a
+  failed remote search was considered and rejected: that is a second decision in a second place,
+  and the two would eventually disagree about which history was searched.
+
+**Fixed**: `/search` crosses the restart and reaches every window the bouncer has logged, not only
+the ones this connection happens to hold. **Made visible, not fixed**: the default range is the
+bouncer's own - today and the previous seven days, at most 200 rows - so a search further back
+needs `since:` (the cap is Query's and is not raised here). And a hit that exists only on disk is
+not in the client's ring, so `enter` opens the right window but lands at its bottom; the row still
+shows the date and time so the line can be found there. Streaming a hit into the ring to scroll to
+it would be a second history path, and a client that silently manufactured a line is worse than one
+that says where it is.
+
 The jump scrolls so the hit sits a few rows below the top rather than exactly at it: a match flush
 against the frame edge reads as the first line of the buffer, and the point of arriving is to read
 around it. A hit is placed by its whole identity - nick, text and kind - because two people can say
 the same words, and finding it by text alone lands on whichever copy is nearer the bottom.
 
-Search still covers only what this client holds in memory. Searching the bouncer's whole ring is
-§2.1 W4 and is a different feature: it needs the daemon to answer, and it is not what "jump to
-result context" was.
+The list is still a question about history, not a second buffer. A disk hit is
+not appended to the client's scrollback just so the jump can scroll to it: the row says when it
+happened and the jump opens the window, which is the part the user acts on next.
 
 ## The window you were in is a setting
 

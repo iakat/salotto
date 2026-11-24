@@ -230,7 +230,11 @@ func decodePostings(postings []byte, off uint64) ([]uint64, error) {
 	return out, nil
 }
 
-func isBadPathComponent(s string) bool {
+// BadPathComponent reports whether a value could escape the log directory when joined into a
+// path. It is exported because the facade must refuse a client-supplied window or network before
+// Query is reached, and a second copy of this check on that side would be a rule that can drift
+// from the one the filesystem walk enforces.
+func BadPathComponent(s string) bool {
 	if strings.ContainsAny(s, "/\\") {
 		return true
 	}
@@ -246,10 +250,10 @@ func validateDate(s string) error {
 }
 
 func safeJoin(logDir, network, window string) (string, bool) {
-	if isBadPathComponent(network) {
+	if BadPathComponent(network) {
 		return "", false
 	}
-	if window != "" && isBadPathComponent(window) {
+	if window != "" && BadPathComponent(window) {
 		return "", false
 	}
 	base := filepath.Clean(logDir)
@@ -268,10 +272,10 @@ func Query(logDir, network, window, q, since, until string, limit int, order str
 	if logDir == "" {
 		return nil, fmt.Errorf("logging disabled")
 	}
-	if isBadPathComponent(network) && network != "" {
+	if BadPathComponent(network) && network != "" {
 		return nil, fmt.Errorf("bad network")
 	}
-	if window != "" && isBadPathComponent(window) {
+	if window != "" && BadPathComponent(window) {
 		return nil, fmt.Errorf("bad window")
 	}
 	if _, ok := safeJoin(logDir, network, window); !ok {
@@ -333,7 +337,7 @@ func Query(logDir, network, window, q, since, until string, limit int, order str
 		if netName == "" {
 			continue
 		}
-		if isBadPathComponent(netName) {
+		if BadPathComponent(netName) {
 			continue
 		}
 		// windows to search
@@ -579,11 +583,11 @@ func SearchHandler(logDir, token string) http.Handler {
 		}
 		order := qp.Get("order")
 
-		if network != "" && isBadPathComponent(network) {
+		if network != "" && BadPathComponent(network) {
 			http.Error(w, "bad network", http.StatusBadRequest)
 			return
 		}
-		if window != "" && isBadPathComponent(window) {
+		if window != "" && BadPathComponent(window) {
 			http.Error(w, "bad window", http.StatusBadRequest)
 			return
 		}
@@ -639,7 +643,7 @@ func SearchHandler(logDir, token string) http.Handler {
 			}
 		}
 		network := r.URL.Query().Get("network")
-		if network == "" || isBadPathComponent(network) {
+		if network == "" || BadPathComponent(network) {
 			http.Error(w, "bad network", http.StatusBadRequest)
 			return
 		}

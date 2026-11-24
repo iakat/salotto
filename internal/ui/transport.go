@@ -72,6 +72,20 @@ type Transport struct {
 	// block when it is complete instead of as eight protocol lines. See whois.go.
 	whois map[string]*whoisPending
 
+	// searches holds the hits of a SEARCH answer until its SEARCH-END arrives. The wire is one
+	// NOTICE per hit because a line is the unit the socket already understands, but the model
+	// wants one message for the list; keeping the partial answer here is what lets the transport
+	// do that without asking the model to reassemble protocol lines.
+	//
+	// Keyed by the request id from the salotto.search tag, because more than one answer can be in
+	// flight: the client is free to ask again before the bouncer has finished scanning.
+	searches map[int][]SearchResult
+
+	// bouncer is whether the registration burst said this is salotto. A plain IRCd has no log
+	// index to search, and treating it as one would turn /search into a verb the server answers
+	// with 421 while the client waits for results that can never come.
+	bouncer bool
+
 	// prefsAsked records that this connection has already asked for the
 	// bouncer's settings. Replayed upstream numerics include 001 too, so a bare
 	// verb test would ask once per replayed registration line and, on an empty
@@ -108,19 +122,20 @@ func Dial(addr string) (*Transport, error) {
 		return nil, err
 	}
 	t := &Transport{
-		addr:    addr,
-		windows: make(map[string]bool),
-		own:     make(map[string]bool),
-		netOf:   make(map[string]string),
-		members: make(map[string]map[string]string),
-		topics:  make(map[string]string),
-		modes:   make(map[string]string),
-		whois:   make(map[string]*whoisPending),
-		away:    make(map[string]string),
-		active:  "status",
-		outq:    make(chan string, 64),
-		msgs:    make(chan tea.Msg, 256),
-		done:    make(chan struct{}),
+		addr:     addr,
+		windows:  make(map[string]bool),
+		own:      make(map[string]bool),
+		netOf:    make(map[string]string),
+		members:  make(map[string]map[string]string),
+		topics:   make(map[string]string),
+		modes:    make(map[string]string),
+		whois:    make(map[string]*whoisPending),
+		away:     make(map[string]string),
+		searches: make(map[int][]SearchResult),
+		active:   "status",
+		outq:     make(chan string, 64),
+		msgs:     make(chan tea.Msg, 256),
+		done:     make(chan struct{}),
 	}
 	t.install(conn)
 	go t.run()
@@ -135,6 +150,11 @@ func (t *Transport) install(conn net.Conn) {
 	t.conn, t.br = conn, br
 	// A new connection has not been asked for the settings yet.
 	t.prefsAsked = false
+	// Partial search answers belong to the old connection; no SEARCH-END can arrive for them.
+	t.searches = make(map[int][]SearchResult)
+	// The new connection has not said what it is yet. Keeping the old answer would leave a
+	// client that reconnected to a plain IRCd sending SEARCH into it for a session.
+	t.bouncer = false
 	t.mu.Unlock()
 }
 
@@ -582,6 +602,25 @@ func (t *Transport) handle(raw []byte) {
 		return
 	}
 
+	// SEARCH answers are the bouncer's log index. They are intercepted before the generic NOTICE
+	// routing: a hit names a window the client may have never opened, and filing it in status
+	// would put a wall of old conversation in the window the user is not looking at. The request
+	// id is in a tag, so a late answer can be recognised by the model when it arrives.
+	//
+	// The tag is also the marker that says the line is ours. A NOTICE from a person or a plain
+	// server is allowed to begin with the word "SEARCH", and swallowing it because of its text
+	// would silently delete a real message; only a line carrying salotto.search is an answer.
+	if verb == "NOTICE" {
+		if id := searchID(tags); id >= 0 {
+			_, text, _ := strings.Cut(params, " :")
+			if strings.HasPrefix(text, "SEARCH ") || strings.HasPrefix(text, "SEARCH-END") ||
+				strings.HasPrefix(text, "SEARCH-ERR") {
+				t.handleSearchReply(id, text)
+				return
+			}
+		}
+	}
+
 	// A bouncer NOTICE about its own state is a status line, not a chat line:
 	// ZNC's *status answers everything this way.
 	if verb == "NOTICE" && (from == "status" || from == "") {
@@ -984,6 +1023,15 @@ func (t *Transport) handle(raw []byte) {
 	// timer in the registration path is a race with the first settings change.
 	if verb == "001" {
 		t.push(Registered{})
+	}
+	// 002 names the software, and salotto writes its own name there. A plain IRCd never does,
+	// so this is a fact on the wire rather than a guess from the port or the config. A replayed
+	// upstream numeric does not count: the bouncer sends its own 002 outside any batch, and a
+	// network whose server happens to be called salotto must not make this client send SEARCH
+	// into that server.
+	if verb == "002" && batch == "" && strings.Contains(params, "running salotto-") && !t.bouncer {
+		t.bouncer = true
+		t.push(SearchAvailable{})
 	}
 	// 376 ends the registration burst, and this bouncer replays its ring before it - so the
 	// replay window the model opened on Reconnecting has to close here rather than on a timer.

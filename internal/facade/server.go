@@ -829,6 +829,8 @@ func (c *client) handle(line, rest []byte) bool {
 		return c.handleSetBuffer(rest)
 	case ircline.IsVerb(rest, "CHATHISTORY"):
 		return c.handleChatHistory(rest)
+	case ircline.IsVerb(rest, "SEARCH"):
+		return c.handleSearch(rest)
 	case ircline.IsVerb(rest, "HELP"):
 		return c.handleHelp(rest)
 	case ircline.IsVerb(rest, "PREF"):
@@ -1431,6 +1433,17 @@ func (c *client) notConnected() bool {
 }
 
 func (c *client) send(parts ...string) bool {
+	return c.sendTagged("", "", parts...)
+}
+
+// sendTagged is send with one extra vendor tag, and it exists so a SEARCH reply can carry the
+// client's request id without a second implementation of the tag block.
+//
+// The network tag has exactly one writer, here, and it stays here: a search hit is a line the
+// bouncer wrote about itself, so it gets the same network tag as the registration burst and a
+// PONG. The request id rides in the same block under ircline.TagSearch. An empty key means no
+// extra tag, which is every ordinary line.
+func (c *client) sendTagged(key, value string, parts ...string) bool {
 	b := c.scratch[:0]
 	// One tag block, written once, holding whatever this line needs to carry.
 	//
@@ -1461,6 +1474,18 @@ func (c *client) send(parts ...string) bool {
 			b = append(b, '@')
 		}
 		b = appendNetworkTag(b, nil, net, needSep)
+		needSep = true
+	}
+	if key != "" {
+		if !needSep {
+			b = append(b, '@')
+		}
+		if needSep {
+			b = append(b, ';')
+		}
+		b = append(b, key...)
+		b = append(b, '=')
+		b = ircline.AppendTagValue(b, value)
 		needSep = true
 	}
 	if needSep {

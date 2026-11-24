@@ -70,6 +70,13 @@ func TagValue(tags, key []byte) []byte {
 // and a client that does not know it ignores it.
 const TagNetwork = "salotto.network"
 
+// TagSearch carries the client's request id on every line of a SEARCH answer. The bouncer scans
+// the disk synchronously and the client can issue another search while the first is still being
+// written, so the reply itself has to say which request it belongs to. Putting the id in a tag
+// rather than in the NOTICE text leaves the documented reply shape intact: the fixed fields are
+// still date, time, network and window, and the free-text body is still the tail.
+const TagSearch = "salotto.search"
+
 // MaxPrefsBytes bounds one client settings blob, and it lives here for the same reason
 // TagNetwork does: the bouncer enforces it and the client refuses locally against it, and two
 // copies of the number would drift into a client that cheerfully sends something the daemon

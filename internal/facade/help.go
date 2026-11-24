@@ -55,6 +55,7 @@ var statusCommands = []commandDoc{
 	{"PLAYBUFFER", "<#chan>", "replay a window's buffer"},
 	{"PREF", "GET|SET <base64>", "the client settings the bouncer holds for every client"},
 	{"QUIT", "", "close the connection"},
+	{"SEARCH", "[window:<name>] [network:<name>] [since:<YYYY-MM-DD>] [until:<YYYY-MM-DD>] <query>", "search the conversation logs across every window"},
 	{"SETBINDHOST", "<host>", "bind outbound connections to an address"},
 	{"SETBUFFER", "<lines>", "how many lines a window keeps"},
 	{"SETUSERBINDHOST", "<host>", "bind outbound connections per user"},

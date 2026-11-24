@@ -471,6 +471,23 @@ type Model struct {
 	searchHits []SearchResult
 	searchAt   int
 
+	// searchSeq is the id of the newest search request, and searchPending is whether a request
+	// has gone to the bouncer and no answer has come back yet. The id exists because a disk scan
+	// is not instantaneous: a second /search can be typed while the first is still being written,
+	// and without an id the earlier answer would arrive and open a picker for a question the user
+	// has already replaced. A late answer to an old query is worse than no answer, because it
+	// looks current.
+	searchSeq     int
+	searchPending bool
+	searchQuery   string
+
+	// searchRemote is whether this model is allowed to ask a bouncer for its log index. It is set
+	// by the transport when the registration burst identifies salotto, so a model with no
+	// transport (a headless renderer, a test) and a client of a plain IRCd both keep the in-memory
+	// scan as the one behaviour they have always had. The predicate is checked in one place -
+	// startSearch - rather than by each caller.
+	searchRemote bool
+
 	// searchJumpedAt is the index in the target window of the line the user jumped to, or -1.
 	// A search hit is a position, and showing the window without moving the view to it would be
 	// a jump in name only: the user lands at the bottom of a buffer that scrolled weeks ago.
@@ -1003,6 +1020,11 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 			reason += ": " + msg.Reason.Error()
 		}
 		m.append(Line{Window: "status", Text: reason, Kind: LineError, Time: time.Now()})
+		m = m.cancelSearch("the bouncer connection ended")
+		// With the socket gone there is no index to ask. Falling back to the local scan is the
+		// same single predicate startSearch already consults; leaving it set would send /search
+		// into a connection that is not there and show "searching…" forever.
+		m.searchRemote = false
 		m.status = "disconnected"
 		return m, nil
 
@@ -1048,6 +1070,15 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 			Text:   previewText(msg.Title, msg.Site, msg.URL),
 		})
 		return m, nil
+
+	case SearchAvailable:
+		// The registration burst identified salotto. From here /search asks the bouncer's log
+		// index instead of scanning only what this connection happens to hold.
+		m.searchRemote = true
+		return m, nil
+
+	case SearchResults:
+		return m.applySearchResults(msg), nil
 
 	case ChannelModes:
 		if m.modes == nil {
@@ -1367,7 +1398,7 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// picking one for the user is a guess. Each row names its window, so the next /go
 		// reaches it.
 		if query, ok := searchCommand(text); ok {
-			return m.openSearch(query), nil
+			return m.startSearch(query)
 		}
 		if text == "/close" {
 			// Closing is the mirror of /go and needs the same knowledge of the window list.
@@ -3198,7 +3229,7 @@ func (m Model) bodyLines(width, n int) []string {
 	if width < 1 {
 		width = 1
 	}
-	if len(m.searchHits) > 0 {
+	if m.searchPending || len(m.searchHits) > 0 {
 		return m.searchLines(width, n)
 	}
 	lines := m.windows[m.active]
@@ -3573,9 +3604,17 @@ func (m Model) NoteMention(window string) Model {
 }
 
 // SearchResult is one hit: the window it is in and the line itself.
+//
+// Window is the display name a user can type back into /go, not the model's internal key. Date,
+// Time and Network are filled for a hit that came from the bouncer's log index; a hit found in the
+// client's own scrollback leaves them empty, because the Line already carries the time and the
+// window already knows its server.
 type SearchResult struct {
-	Window string
-	Line   Line
+	Window  string
+	Network string
+	Date    string
+	Time    string
+	Line    Line
 }
 
 // Search finds every line containing the query, case-insensitively, across every
@@ -3711,6 +3750,14 @@ func (m Model) searchIntoWindow(query string) Model {
 func (m Model) searchLines(width, n int) []string {
 	out := make([]string, 0, n)
 
+	if m.searchPending {
+		// The question is on the wire and the disk has not answered yet. Saying so in the same
+		// place the results will appear is what stops a slow search from looking like a dead
+		// keystroke.
+		out = append(out, systemStyle.Render(truncateTo(fmt.Sprintf("searching for %q…", m.searchQuery), width)))
+		return out
+	}
+
 	// The header states the question and the position, so a user who came back to the list
 	// knows what it is and how far along it they are.
 	head := fmt.Sprintf("%d of %d matches", m.searchAt+1, len(m.searchHits))
@@ -3732,6 +3779,12 @@ func (m Model) searchLines(width, n int) []string {
 			nick = "-"
 		}
 		row := fmt.Sprintf("%s  <%s> %s", hit.Window, nick, hit.Line.Text)
+		if hit.Date != "" {
+			// A log hit is not necessarily something this client ever drew, so the row has to
+			// say when it happened. A local hit already carries that in its Line, and printing
+			// the date twice would be noise.
+			row = fmt.Sprintf("%s %s  %s", hit.Date, hit.Time, row)
+		}
 		row = truncateTo(row, width-2)
 		if i == m.searchAt {
 			out = append(out, selectedStyle.Render("> "+row))
@@ -3747,8 +3800,9 @@ func (m Model) searchLines(width, n int) []string {
 // The scroll is expressed the way the renderer already understands it - a number of lines above the
 // bottom - so there is one scrolling mechanism and not a second one for jumps.
 func (m Model) jumpToHit(hit SearchResult) Model {
-	// The window name the hit carries is a display name; SetActive resolves it.
-	m = m.SetActive(hit.Window)
+	// The window the hit belongs to is resolved from the wire's network when there is one; a
+	// display name alone cannot say which of two "status" windows a disk row came from.
+	m = m.SetActive(m.windowForHit(hit))
 
 	// Where the line is now. The hit carries a copy, and the same line can appear more than once;
 	// the search walks a window in order, so the hit's own position is recoverable by identity -
