@@ -628,10 +628,20 @@ func (t *Transport) handle(raw []byte) {
 
 	// Numerics and anything else are status. 001 also tells us our own nick,
 	// which the model shows in the status bar.
+	//
+	// The error range gets its own kind so it can be drawn as one. 401, 403 and
+	// 473 arrive here when a command was refused, and a refusal rendered in the
+	// same grey as the MOTD is a refusal the user never reads: the question they
+	// ask afterwards is "why did my message not send", and the answer was on
+	// screen. Numeric replies are 3 digits; anything else is a verb.
+	kind := LineSystem
+	if len(verb) == 3 && verb[0] >= '4' && verb[0] <= '5' {
+		kind = LineError
+	}
 	push(Line{
 		Window: "status",
 		Text:   strings.TrimSpace(verb + " " + params),
-		Kind:   LineSystem,
+		Kind:   kind,
 	})
 }
 

@@ -94,6 +94,13 @@ const (
 	// line, and putting it there means the SSH and PTY front ends get previews for
 	// free instead of the browser getting them alone.
 	LinePreview
+
+	// LineError is a numeric reply in the error range: 401 no such nick, 403 cannot
+	// send to channel, 404 too many channels, 473 invite only. It is separate from
+	// LineSystem because both used to be drawn the same grey, and an error that
+	// looks like a log line is an error people scroll past - "my message didn't
+	// send" is exactly the case where the reason was on screen the whole time.
+	LineError
 )
 
 // Incoming is the message a transport sends when a line arrives. It is a plain
@@ -987,9 +994,12 @@ var (
 	actionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("176")).Italic(true)
 	noticeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))
 	systemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	gapStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	inputStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
-	barStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
+	// errorStyle is red, and used for nothing else: a terminal has one channel for
+	// "this went wrong" and spending it on anything else is how it stops meaning it.
+	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	gapStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	inputStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("231"))
+	barStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 )
 
 // View renders the whole screen: a titled box with the scrollback and an input
@@ -1484,6 +1494,8 @@ func lineLinesStyled(l Line, width int, st Settings) []string {
 		return wrapStyled(gapStyle, l.Text, width, "")
 	case LineSystem:
 		return wrapStyled(systemStyle, l.Text, width, "")
+	case LineError:
+		return wrapStyled(errorStyle, l.Text, width, "")
 	case LineNotice:
 		if st.NickColors && l.Nick != "" {
 			return nickStyled(noticeStyle, l.Nick, "<", "> ", l.Text, width, "")

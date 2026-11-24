@@ -158,3 +158,59 @@ func TestNoTopicMeansNoTopicRow(t *testing.T) {
 		t.Fatalf("the topic row is not row 1:\n%s", strings.Join(rowsWith[:3], "\n"))
 	}
 }
+
+// TestARefusalIsNotJustAnotherStatusLine pins the difference between "the server said
+// something" and "the server refused you".
+//
+// Both used to be LineSystem and drawn in the same grey. A 403 after sending to a channel
+// therefore read as another log line, and the user's next question - "why did my message not
+// send" - had its answer already on screen, scrolled past. The error range gets its own kind so
+// it can be drawn as one; every other numeric stays a plain status line, because turning the
+// MOTD red would spend the one colour that means "this failed".
+func TestARefusalIsNotJustAnotherStatusLine(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		want LineKind
+	}{
+		{":srv 403 alice #chan :Cannot send to channel", LineError},
+		{":srv 401 alice nobody :No such nick", LineError},
+		{":srv 473 alice #chan :Cannot join channel (+i)", LineError},
+		{":srv 500 alice :Too many clients", LineError},
+		{":srv 001 alice :Welcome", LineSystem},
+		{":srv 372 alice :- a line of the motd", LineSystem},
+		// 366 is end-of-NAMES: it is membership, so it produces no line at all and is
+		// tested by the nicklist tests instead. This is a numeric that does fall
+		// through to status.
+		{":srv 375 alice :- server Message of the day -", LineSystem},
+	} {
+		t.Run(tc.line, func(t *testing.T) {
+			tr := newTestTransport(t)
+			tr.handle([]byte(tc.line))
+			line, ok := nextIncoming(t, tr)
+			if !ok {
+				t.Fatal("nothing came out of the transport")
+			}
+			if line.Window != "status" {
+				t.Fatalf("window = %q, want status", line.Window)
+			}
+			if line.Kind != tc.want {
+				t.Fatalf("kind = %v, want %v", line.Kind, tc.want)
+			}
+		})
+	}
+}
+
+// TestAnErrorIsDrawnInItsOwnColour asserts on the frame, not on the kind: the kind is the
+// plumbing, and what the user sees is the escape code. A test that stops at the kind would
+// pass with every error drawing grey.
+func TestAnErrorIsDrawnInItsOwnColour(t *testing.T) {
+	l := Line{Window: "status", Text: "403 #chan :Cannot send to channel", Kind: LineError}
+	got := strings.Join(lineLinesStyled(l, 60, DefaultSettings()), "\n")
+	if !strings.Contains(got, "38;5;203") {
+		t.Fatalf("an error is not drawn in the error colour: %q", got)
+	}
+	plain := Line{Window: "status", Text: "372 :- motd", Kind: LineSystem}
+	if s := strings.Join(lineLinesStyled(plain, 60, DefaultSettings()), "\n"); strings.Contains(s, "38;5;203") {
+		t.Fatalf("a plain status line was drawn as an error: %q", s)
+	}
+}
