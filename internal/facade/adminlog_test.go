@@ -122,7 +122,10 @@ func TestTheFileSinkActuallyWrites(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("%d lines in the audit file, want 2:\n%s", len(lines), text)
 	}
-	for _, want := range []string{"actor=alice", "action=TRAFFICCTL", "result=ok", "action=SHUTDOWN", "result=refused"} {
+	for _, want := range []string{
+		"actor=alice", "action=TRAFFICCTL", "result=ok",
+		"action=SHUTDOWN", "result=refused", "reason=no_admin_authentication_is_configured",
+	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("the audit file is missing %q:\n%s", want, text)
 		}

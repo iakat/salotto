@@ -48,7 +48,14 @@ func (e AdminEvent) String() string {
 	if target == "" {
 		target = "-"
 	}
-	return fmt.Sprintf("%s actor=%s action=%s target=%s result=%s %s",
+	// The reason is appended only when there is one: "result=ok -" is a field that says nothing,
+	// and a log full of them makes the lines that do say something harder to find.
+	if e.Result == "" {
+		return fmt.Sprintf("%s actor=%s action=%s target=%s result=%s",
+			e.At.UTC().Format(time.RFC3339), quoteField(e.Actor), e.Action,
+			quoteField(target), status)
+	}
+	return fmt.Sprintf("%s actor=%s action=%s target=%s result=%s reason=%s",
 		e.At.UTC().Format(time.RFC3339), quoteField(e.Actor), e.Action,
 		quoteField(target), status, quoteField(e.Result))
 }

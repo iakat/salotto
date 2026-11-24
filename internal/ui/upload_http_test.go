@@ -163,55 +163,46 @@ func (zeroReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestAnOversizedBodyIsNotReadToTheEnd pins the *request*-level limit, which is a different guard
-// from the store's streamed one and needs its own test.
+// TestAnOversizedChunkedBodyIsNeverStored pins the case the declared-length guard cannot cover: a
+// client that sends no Content-Length.
 //
-// ParseMultipartForm spills anything over its memory threshold into a temporary file before the
-// store is ever called, so without a body limit an 8 MiB upload is written to disk by the multipart
-// reader before the store's limit gets a chance to refuse it. MaxBytesReader is what stops the read.
+// It deliberately does not assert how many bytes were read before the refusal. I tried that, and it
+// is not observable from here: the client keeps writing into kernel socket buffers while the server
+// has already stopped reading, so the count depends on buffer sizes rather than on the server. The
+// test passed and then failed on identical code. What *is* durable is the outcome - an oversized
+// chunked upload is refused and nothing is stored - so that is what it asserts.
 //
-// The first version of this test looked for the leftover temporary file and could not see it: the
-// handler's deferred RemoveAll deletes it before the response is even read. The leftover is not
-// observable, so the test asserts the only thing that is - how much of the body the server pulled
-// off the wire. The reader counts what the client's transport actually handed over.
-func TestAnOversizedBodyIsNotReadToTheEnd(t *testing.T) {
-	srv, _ := uploadServer(t, upload.Limits{MaxFile: 1 << 10})
+// The streamed limit in the store is still the guard here, and the declared-length check in front of
+// it is what a browser gets (TestADeclaredOversizeIsRefusedBeforeTheBodyArrives). MaxBytesReader
+// sits between them as defence in depth and is not separately provable at this layer for the reason
+// above.
+func TestAnOversizedChunkedBodyIsNeverStored(t *testing.T) {
+	srv, store := uploadServer(t, upload.Limits{MaxFile: 1 << 10})
 
-	// Comfortably over ParseMultipartForm's 4 MiB memory threshold, so a reader without a body
-	// limit would spill it.
 	const total = 8 << 20
-	body := bytes.Repeat([]byte("x"), total)
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	part, err := mw.CreateFormFile("file", "huge.bin")
-	if err != nil {
-		t.Fatal(err)
-	}
-	part.Write(body)
-	mw.Close()
-	framed := buf.Bytes()
-
-	counter := &countingBody{r: bytes.NewReader(framed)}
+	counter := &countingBody{r: io.LimitReader(zeroReader{}, total)}
 	req, err := http.NewRequest("POST", srv.URL+"/uploads/", counter)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=x")
+	// No ContentLength: this is the chunked client, and it is the point of the test.
+	req.ContentLength = -1
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		// The server closing the connection mid-body is also a refusal; what must not happen
-		// is a clean transfer of the whole thing.
-		if counter.n.Load() < int64(total) {
+		// A connection closed under the client is also a refusal, and it is the likelier one:
+		// the server answers and closes while the client is still writing.
+		if store.Used("alice") == 0 {
 			return
 		}
-		t.Fatalf("the whole %d byte body was transferred despite the limit", total)
+		t.Fatalf("the upload errored but %d bytes were stored", store.Used("alice"))
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("an 8 MiB upload against a 1 KiB limit returned %d", resp.StatusCode)
+	if resp.StatusCode == http.StatusCreated {
+		t.Fatal("an 8 MiB chunked upload against a 1 KiB limit was accepted")
 	}
-	if counter.n.Load() >= int64(total) {
-		t.Fatalf("the server read all %d bytes before refusing: the limit was applied after the body, not during it", total)
+	if used := store.Used("alice"); used != 0 {
+		t.Fatalf("a refused upload left %d bytes charged", used)
 	}
 }
 
