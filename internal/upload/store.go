@@ -18,6 +18,7 @@
 package upload
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -244,10 +245,15 @@ func (s *Store) Save(r io.Reader, meta File) (File, error) {
 	}
 
 	contentHash := hex.EncodeToString(h.Sum(nil))
-	// The stored id namespaces the content hash by uploader. Editing the hash alone would give
-	// two users' identical files the same id, and then one deleting "their" file would delete
-	// the other's - a sharing bug that only shows when two people post the same screenshot.
-	sum := userTag(meta.Uploader) + "-" + contentHash
+	// Every upload gets its own id, even when the bytes are identical to a file the same user
+	// already posted.
+	//
+	// The first version used the content hash as the id, which is tidy and wrong: posting the
+	// same screenshot twice produced one file, so the second upload's name silently replaced the
+	// first's, and deleting either copy deleted both - breaking a link already pasted into a
+	// channel. Found by the live probe, which deleted one upload and then looked for the other.
+	// Users think in uploads, not in blobs, so the id counts uploads.
+	sum := userTag(meta.Uploader) + "-" + contentHash + "-" + randomTag()
 	mimeType := http.DetectContentType(sniffed)
 	if i := strings.IndexByte(mimeType, ';'); i >= 0 {
 		mimeType = strings.TrimSpace(mimeType[:i])
@@ -272,31 +278,19 @@ func (s *Store) Save(r io.Reader, meta File) (File, error) {
 	}
 
 	dataPath := s.dataPath(sum)
-	// Content addressing makes a re-upload of the same bytes a no-op: the path is the hash, so
-	// the file is already correct and only the sidecar needs updating.
-	newBytes := false
-	if _, err := os.Stat(dataPath); err != nil {
-		if err := os.Rename(tmpName, dataPath); err != nil {
-			cleanup()
-			return File{}, fmt.Errorf("upload: %w", err)
-		}
-		newBytes = true
-	} else {
-		os.Remove(tmpName)
+	if err := os.Rename(tmpName, dataPath); err != nil {
+		cleanup()
+		return File{}, fmt.Errorf("upload: %w", err)
 	}
 	if err := s.writeMeta(meta); err != nil {
 		return File{}, err
 	}
 
-	// Charge only for bytes that are new to the disk. Re-posting the same file is a thing
-	// people do, and charging for it would make the quota depend on how often something was
-	// posted rather than on how much is stored - and would eventually refuse an upload that
-	// occupies no space at all.
-	if newBytes {
-		s.mu.Lock()
-		s.used[meta.Uploader] += n
-		s.mu.Unlock()
-	}
+	// Every upload occupies its own space, so every upload is charged. Deduplicating would mean
+	// two uploads sharing one file and one delete breaking the other's link.
+	s.mu.Lock()
+	s.used[meta.Uploader] += n
+	s.mu.Unlock()
 	return meta, nil
 }
 
@@ -381,6 +375,19 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 		c.n += int64(written)
 	}
 	return written, err
+}
+
+// randomTag is the per-upload suffix that makes each upload distinct. It is random rather than a
+// counter because a counter has to be persisted, and a store that rebuilds its state from the
+// directory (as this one does after a restart) cannot rebuild a counter that is only in memory.
+func randomTag() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// A failure here would hand two uploads the same id; the timestamp is a worse but real
+		// fallback, and it is better than a zero constant.
+		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // userTag is the short per-uploader prefix of an upload id. Hashing rather than using the name
@@ -535,13 +542,13 @@ func (s *Store) Used(uploader string) int64 {
 // the id comes from the URL, so it is attacker-controlled, and the only safe ids are the ones
 // this package minted.
 func validID(id string) bool {
-	if len(id) != 73 { // 8 hex tag, "-", 64 hex hash
+	if len(id) != 82 { // 8 hex tag, "-", 64 hex hash, "-", 8 hex upload tag
 		return false
 	}
-	if id[8] != '-' {
+	if id[8] != '-' || id[73] != '-' {
 		return false
 	}
-	id = id[:8] + id[9:]
+	id = id[:8] + id[9:73] + id[74:]
 	for i := 0; i < len(id); i++ {
 		c := id[i]
 		if c >= '0' && c <= '9' || c >= 'a' && c <= 'f' {

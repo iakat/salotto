@@ -70,8 +70,7 @@ func TestARefusedUploadLeavesNothingBehind(t *testing.T) {
 // under the file limit and the third is refused anyway.
 func TestTheUserTotalCountsAcrossFiles(t *testing.T) {
 	s, _ := newStore(t, Limits{MaxFile: 100, MaxUser: 250})
-	// Distinct bodies: identical ones are content-addressed to one file and cost nothing,
-	// which is correct and is covered by its own test.
+	// Distinct bodies, because every upload is its own file and costs its own space.
 	for i := 0; i < 2; i++ {
 		body := strings.Repeat(string(rune('a'+i)), 100)
 		if _, err := s.Save(strings.NewReader(body), File{Uploader: "alice"}); err != nil {
@@ -91,29 +90,43 @@ func TestTheUserTotalCountsAcrossFiles(t *testing.T) {
 	}
 }
 
-// TestADuplicateUploadIsNotChargedTwice pins that re-posting the same file neither costs quota
-// nor creates a second copy. Charging for it would make the quota depend on how often something
-// was posted rather than on how much is stored.
-func TestADuplicateUploadIsNotChargedTwice(t *testing.T) {
+// TestEveryUploadIsItsOwnFile pins that posting the same bytes twice gives two files, not one.
+//
+// Content addressing made the id a hash of the contents, which is tidy and wrong: the second
+// upload's name silently replaced the first's, and deleting either deleted both - breaking a link
+// already pasted into a channel. The live probe found it by deleting one upload and looking for
+// the other. Users think in uploads, not in blobs.
+func TestEveryUploadIsItsOwnFile(t *testing.T) {
 	s, dir := newStore(t, Limits{MaxUser: 10 << 20})
 	body := strings.Repeat("hello", 100)
-	first, err := s.Save(strings.NewReader(body), File{Uploader: "alice", Name: "a.txt"})
+	first, err := s.Save(strings.NewReader(body), File{Uploader: "alice", Name: "first.txt"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	usedAfterFirst := s.Used("alice")
-	second, err := s.Save(strings.NewReader(body), File{Uploader: "alice", Name: "b.txt"})
+	second, err := s.Save(strings.NewReader(body), File{Uploader: "alice", Name: "second.txt"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.ID != first.ID {
-		t.Fatalf("the same bytes got two ids: %q and %q", first.ID, second.ID)
+	if first.ID == second.ID {
+		t.Fatalf("two uploads of the same bytes share the id %q", first.ID)
 	}
-	if got := s.Used("alice"); got != usedAfterFirst {
-		t.Fatalf("a duplicate upload was charged: %d then %d", usedAfterFirst, got)
+	// Each keeps its own name, which is what a user sees.
+	if f, err := s.Get(second.ID); err != nil || f.Name != "second.txt" {
+		t.Fatalf("the second upload's name is %q (%v)", f.Name, err)
+	}
+	// Deleting one leaves the other intact - the link in the channel still works.
+	if err := s.Delete("alice", first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get(second.ID); err != nil {
+		t.Fatalf("deleting the first upload removed the second: %v", err)
+	}
+	// Both are charged, because both occupy space.
+	if got, want := s.Used("alice"), int64(len(body)); got != want {
+		t.Fatalf("used = %d after deleting one of two copies, want %d", got, want)
 	}
 	if got := storeBytes(t, dir); got != int64(len(body)) {
-		t.Fatalf("the duplicate was written again: %d bytes on disk for a %d byte file", got, len(body))
+		t.Fatalf("%d bytes on disk, want one file's worth", got)
 	}
 }
 
