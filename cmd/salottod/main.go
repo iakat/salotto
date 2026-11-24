@@ -160,7 +160,14 @@ func run() int {
 	hub := facade.NewHub(maxClients)
 	// Notifications are off unless an endpoint is configured: the bouncer has no business
 	// knowing a web front end exists unless the deployment says so.
-	pushNotify = newNotifier(cfg.PushURL, cfg.PushToken)
+	//
+	// The token comes from the environment when the config does not name one, so it can live in
+	// a Secret while the ConfigMap stays readable. A token in a ConfigMap is a token in git.
+	pushToken := cfg.PushToken
+	if pushToken == "" {
+		pushToken = os.Getenv("SALOTTO_PUSH_TOKEN")
+	}
+	pushNotify = newNotifier(cfg.PushURL, pushToken)
 	if pushNotify != nil {
 		logger.Info("push notifications enabled", "endpoint", cfg.PushURL)
 	}

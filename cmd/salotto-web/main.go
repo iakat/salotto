@@ -55,6 +55,7 @@ func run() int {
 	vapidPath := flag.String("vapid", "", "path to the VAPID key file; enables push notifications")
 	pushSubject := flag.String("vapid-subject", "mailto:admin@localhost", "contact for the push service")
 	subsPath := flag.String("push-subscriptions", "", "path to the subscription store")
+	pushToken := flag.String("push-token", "", "bearer token /push/notify requires (default: $SALOTTO_PUSH_TOKEN)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -128,6 +129,20 @@ func run() int {
 			return 1
 		}
 		pushSrv = push.NewServer(vapid, store)
+		// A token from the environment as well as the flag, because an environment variable in a
+		// PodSpec can come from a Secret while a flag has to be written into the manifest. The
+		// token is the only thing standing between a stranger and "push to this device", so the
+		// path that keeps it out of git is the path worth having.
+		if *pushToken == "" {
+			*pushToken = os.Getenv("SALOTTO_PUSH_TOKEN")
+		}
+		pushSrv.Token = *pushToken
+		if pushSrv.Token == "" {
+			// Refusing to start beats starting a notify endpoint that accepts anyone. The
+			// operator asked for push, so they have to say who may trigger it.
+			slog.Error("push is configured but no /push/notify token: set -push-token or SALOTTO_PUSH_TOKEN")
+			return 1
+		}
 		slog.Info("push enabled", "key", vapid.PublicKey(), "subscriptions", store.Len())
 	}
 
