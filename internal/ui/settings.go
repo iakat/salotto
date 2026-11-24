@@ -133,6 +133,22 @@ func (s Settings) rows() []settingRow {
 	}
 }
 
+// dropWord removes a word from a list, case-insensitively. It reports whether the word was
+// there, so a caller can say "not in the list" instead of silently doing nothing - which is how
+// a rule a user believes they removed stays in effect.
+func dropWord(words []string, word string) ([]string, bool) {
+	word = strings.TrimSpace(word)
+	if word == "" {
+		return words, false
+	}
+	for i, w := range words {
+		if strings.EqualFold(w, word) {
+			return append(words[:i:i], words[i+1:]...), true
+		}
+	}
+	return words, false
+}
+
 // addWord adds a word to a list, case-insensitively and without duplicates. A settings
 // list that accumulates "ZNC" and "znc" would silently keep two rules that mean one thing,
 // and removing either would look like it did nothing.
@@ -241,12 +257,32 @@ func (s *Settings) set(key, value string) error {
 			s.Highlights = nil
 			return nil
 		}
+		// A leading "-" removes one word, because a list with no way to remove an entry is a
+		// list that only grows: the screen can add, and before this the only way to take a
+		// word out was to clear the whole list and type the others back. "none" still clears
+		// everything, which is a different statement and stays spelled differently.
+		if word, remove := strings.CutPrefix(value, "-"); remove {
+			next, ok := dropWord(s.Highlights, word)
+			if !ok {
+				return fmt.Errorf("%s is not in the highlights", word)
+			}
+			s.Highlights = next
+			return nil
+		}
 		s.Highlights = addWord(s.Highlights, value)
 		return nil
 	case "mute", "mutes":
 		switch strings.ToLower(value) {
 		case "", "none", "clear":
 			s.Mutes = nil
+			return nil
+		}
+		if word, remove := strings.CutPrefix(value, "-"); remove {
+			next, ok := dropWord(s.Mutes, word)
+			if !ok {
+				return fmt.Errorf("%s is not in the mutes", word)
+			}
+			s.Mutes = next
 			return nil
 		}
 		s.Mutes = addWord(s.Mutes, value)

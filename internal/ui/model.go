@@ -434,6 +434,16 @@ type Model struct {
 
 	// settingsRow is the selected row on the settings screen.
 	settingsRow int
+	// settingsEdit holds the text being typed into a rule row, and settingsEditing is whether
+	// the screen is in that state.
+	//
+	// Editing in place rather than sending the user to /fset is not decoration: the screen is
+	// the discoverable half of the settings (the command is the scriptable half), and a screen
+	// whose every text row says "use the command instead" teaches a user that the screen is a
+	// read-only summary. It also makes the destructive keystroke impossible by construction:
+	// while editing, a space is a space in a value rather than a command to clear the list.
+	settingsEditing bool
+	settingsEdit    []rune
 
 	// settingsPath is where this client's settings are persisted. Empty means "do not
 	// persist", which is what a test and the headless renderer want.
@@ -1932,6 +1942,47 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.settingsRow = 0
 	}
 	row := rows[m.settingsRow]
+	// While a value is being typed, the screen is a text field: every rune belongs to the
+	// value, and the only keys that mean anything else are the ones that end the edit. This is
+	// the branch that makes the old bug unrepresentable rather than merely unlikely.
+	if m.settingsEditing {
+		switch msg.Type {
+		case tea.KeyEsc, tea.KeyCtrlC:
+			m.settingsEditing = false
+			m.settingsEdit = nil
+			m.settingsHint = ""
+			return m, nil
+		case tea.KeyEnter:
+			text := strings.TrimSpace(string(m.settingsEdit))
+			m.settingsEditing = false
+			m.settingsEdit = nil
+			if text == "" {
+				m.settingsHint = "nothing typed; the list is unchanged"
+				return m, nil
+			}
+			// Through set(), not around it: one place decides what a value means, so the
+			// screen and "/fset" cannot drift into accepting different spellings.
+			if err := m.settings.set(row.key, text); err != nil {
+				m.settingsHint = err.Error()
+				return m, nil
+			}
+			m.settingsHint = ""
+			m.saveSettings()
+			return m.prefsCmd()
+		case tea.KeyBackspace:
+			if len(m.settingsEdit) > 0 {
+				m.settingsEdit = m.settingsEdit[:len(m.settingsEdit)-1]
+			}
+			return m, nil
+		case tea.KeySpace:
+			m.settingsEdit = append(m.settingsEdit, ' ')
+			return m, nil
+		case tea.KeyRunes:
+			m.settingsEdit = append(m.settingsEdit, msg.Runes...)
+			return m, nil
+		}
+		return m, nil
+	}
 	switch msg.Type {
 	case tea.KeyEsc, tea.KeyCtrlC:
 		m.showSettings = false
@@ -1968,9 +2019,12 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// to set() is the documented way to clear it - which is right for "/fset highlight
 		// none" and catastrophic for a keystroke. A user pressing space to "open" the row
 		// used to wipe every highlight they had, and now that settings are shared at the
-		// bouncer it wiped them on every client they own.
+		// bouncer it wiped them on every client they own. So a text row opens an editor
+		// instead, and inside it a space is a space.
 		if row.kind != "bool" {
-			m.settingsHint = "edit with /fset " + row.key + " <value>, or /fset " + row.key + " none to clear"
+			m.settingsEditing = true
+			m.settingsEdit = nil
+			m.settingsHint = "type a value and press enter, or esc to cancel"
 			return m, nil
 		}
 		_ = m.settings.set(row.key, "")
@@ -2358,7 +2412,12 @@ func (m Model) settingsView() string {
 			labelStyle = titleStyle
 		}
 		value := row.value
-		if row.kind == "bool" {
+		if i == m.settingsRow && m.settingsEditing {
+			// The row being typed into shows what has been typed plus a caret, so the user
+			// sees their text where the value lives rather than in a separate prompt they
+			// have to look away from.
+			value = string(m.settingsEdit) + "█"
+		} else if row.kind == "bool" {
 			if value == "on" {
 				value = "[on]"
 			} else {

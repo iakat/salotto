@@ -29,8 +29,9 @@ func settingsRowFor(t *testing.T, m Model, key string) Model {
 // also wiped them on every other client the user owns, which is the kind of bug that gets blamed
 // on "the sync" forever.
 //
-// The assertion is on both halves: the list survives, and the screen says how to edit the row
-// instead of silently doing nothing.
+// The assertion is on both halves: the list survives, and the screen opens an editor on the row
+// rather than doing nothing visible. (It used to point at "/fset" - the editor replaced that,
+// and the pointer would now be a worse answer than the one the screen can give itself.)
 func TestSpaceOnATextRowDoesNotWipeIt(t *testing.T) {
 	for _, key := range []string{"highlight", "mute"} {
 		t.Run(key, func(t *testing.T) {
@@ -53,8 +54,10 @@ func TestSpaceOnATextRowDoesNotWipeIt(t *testing.T) {
 				t.Fatalf("a keystroke on %q cleared a list: highlights %v -> %v, mutes %v -> %v",
 					key, before, m.settings.Highlights, beforeMutes, m.settings.Mutes)
 			}
-			if !strings.Contains(m.View(), "/fset "+key) {
-				t.Fatalf("the screen did not say how to edit %q; hint is %q", key, m.settingsHint)
+			// An empty edit says the list is unchanged, which is the honest answer now that the
+			// screen can edit in place.
+			if !strings.Contains(m.settingsHint, "unchanged") {
+				t.Fatalf("the screen said nothing useful after an empty edit on %q; hint is %q", key, m.settingsHint)
 			}
 		})
 	}
@@ -73,20 +76,56 @@ func TestABooleanRowStillToggles(t *testing.T) {
 	}
 }
 
-// TestTheHintDoesNotOutliveTheRow: the hint describes one row, so moving the cursor must clear
-// it. A stale "edit with /fset highlight" under the mutes row is a screen giving instructions
-// about something else.
+// TestTheHintDoesNotOutliveTheRow: a hint describes one row, so moving the cursor must clear it.
+// A stale "nothing typed; the list is unchanged" under the mutes row is a screen giving
+// instructions about something else.
+//
+// The hint is produced by an empty edit rather than by opening one: while the editor is open its
+// hint belongs to it and must stay (see TestMovingWhileEditingDoesNotLeaveTheField), so the
+// invariant being pinned here is the one for hints that live on the list.
 func TestTheHintDoesNotOutliveTheRow(t *testing.T) {
 	m := New("#test")
 	m.showSettings = true
 	m = settingsRowFor(t, m, "highlight")
-	m, _ = m.Step(tea.KeyMsg{Type: tea.KeySpace})
+	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyEnter}) // open
+	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyEnter}) // commit nothing
+	if m.settingsEditing {
+		t.Fatal("the editor is still open, so this test is not testing a list hint")
+	}
 	if m.settingsHint == "" {
 		t.Fatal("no hint was set to begin with")
 	}
 	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyDown})
 	if m.settingsHint != "" {
 		t.Fatalf("the hint survived a cursor move: %q", m.settingsHint)
+	}
+}
+
+// TestMovingWhileEditingDoesNotLeaveTheField.
+//
+// An arrow key while typing is either a cursor movement in the text or nothing at all - what it
+// must never be is a jump to another row, which would silently redirect the rest of the typing
+// into a different setting. This is the cost of making the screen editable, and it is worth
+// pinning because "the arrows stopped working" is a bug report either way round.
+func TestMovingWhileEditingDoesNotLeaveTheField(t *testing.T) {
+	m := New("#test")
+	m.showSettings = true
+	m = settingsRowFor(t, m, "highlight")
+	at := m.settingsRow
+	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyUp})
+	if !m.settingsEditing {
+		t.Fatal("an arrow key closed the editor")
+	}
+	if m.settingsRow != at {
+		t.Fatalf("the selection moved to %d while typing in row %d", m.settingsRow, at)
+	}
+	// And the keystrokes after it still go to the same value.
+	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyEnter})
+	if len(m.settings.Highlights) != 1 || m.settings.Highlights[0] != "x" {
+		t.Fatalf("highlights = %v, want [x] set on the row the editor was opened on", m.settings.Highlights)
 	}
 }
 

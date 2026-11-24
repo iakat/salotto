@@ -171,6 +171,27 @@ on live traffic: a live line is new by definition, and dropping one is exactly t
 this package refuses. The duplicate check searches only the last 512 lines of a window, which is
 bounded work per line and still correct, because a replay cannot be longer than the ring.
 
+## Settings you can edit where you read them
+
+The settings screen is a mode over the conversation, and for a while it was a read-only summary:
+booleans toggled, `scroll_step` stepped, and every other row said "edit with `/fset`". That is
+honest and it teaches the wrong thing - a user who opened the screen to change a highlight
+concluded the screen could not do it and that settings lived in a command they had to remember.
+
+A text row now opens an editor in place. Enter commits, escape abandons, and while it is open the
+row shows what is being typed with a caret where the value lives. The keystroke handling is a
+separate branch for exactly one reason: a space in the editor is a space in the value, which is
+the bug the old behaviour had - pressing space on a rule list called `set(key, "")`, and with the
+blob shared at the bouncer that wiped the list on every client the user owned. Arrows do nothing
+while typing rather than jumping rows, because a jump would redirect the rest of the typing into a
+different setting.
+
+Adding was the only operation the screen had, so a list could only grow: the single removal was
+`""` / `none` / `clear`, the whole list. A value with a leading `-` now removes one word
+(`-alice`), answers when the word was not there, and `none` still clears everything - two
+different statements, deliberately still spelled differently. Both go through `Settings.set`, so
+the screen and `/fset` cannot drift into accepting different spellings of the same thing.
+
 ## What is deliberately not here yet
 
 - **No WebSocket.** W1 replaces the request-per-page part; the render half in
