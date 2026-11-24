@@ -22,6 +22,7 @@ func main() {
 	bouncer := flag.String("bouncer", "", "bouncer address, host:port (empty for a local UI)")
 	nick := flag.String("nick", "", "nick to register with the bouncer")
 	window := flag.String("window", "", "initial window (default: the nick's own window, or status)")
+	settingsPath := flag.String("settings", "", "path to the client settings file (empty for defaults, or $SALOTTO_SETTINGS)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -69,7 +70,14 @@ func main() {
 		}
 	}
 
-	prog := ui.NewProgram(active, tr)
+	// Settings are the client's, so each front end loads its own file. $SALOTTO_SETTINGS
+	// lets the web bridge point every browser session at the same one without adding a flag
+	// to the command line it builds.
+	settings := *settingsPath
+	if settings == "" {
+		settings = os.Getenv("SALOTTO_SETTINGS")
+	}
+	prog := ui.NewProgram(active, tr).WithSettings(settings)
 	if tr != nil {
 		// The transport is pumped into the model from one goroutine, and bubbletea's
 		// update loop is what renders it: two writers to the model would interleave.

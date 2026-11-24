@@ -117,6 +117,17 @@ func NewProgram(window string, tr *Transport) *Program {
 	return p
 }
 
+// WithSettings gives the program a settings file. It is a method rather than a fourth
+// argument to NewProgram because every existing caller wants the defaults and does not care
+// where they are stored.
+func (p *Program) WithSettings(path string) *Program {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.model = p.model.WithSettings(path)
+	p.rev++
+	return p
+}
+
 // Model returns the current model, for a driver that needs to inspect it.
 //
 // The returned value shares its maps with the live model, so it is a snapshot only while

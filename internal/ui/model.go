@@ -10,6 +10,7 @@ package ui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -191,6 +192,25 @@ type Model struct {
 	scroll  int
 	focused bool
 
+	// settings is the client's own configuration, editable with /fset and shown on the
+	// settings screen. It is the client's, not the bouncer's: a bouncer setting changes
+	// what happens on the wire for every attached client, and these change what this
+	// terminal looks like. Mixing the two in one namespace is how a user ends up
+	// surprised that unchecking something in a browser changed their phone.
+	settings Settings
+
+	// showSettings draws the settings screen instead of the conversation. It is a mode,
+	// not a window: it has no buffer, nothing can arrive in it, and leaving it must
+	// return to exactly the window and scroll position it covered.
+	showSettings bool
+
+	// settingsRow is the selected row on the settings screen.
+	settingsRow int
+
+	// settingsPath is where this client's settings are persisted. Empty means "do not
+	// persist", which is what a test and the headless renderer want.
+	settingsPath string
+
 	// Connected is the transport's report, not a guess: the status bar must
 	// never claim a link the transport has not got.
 	connected bool
@@ -208,6 +228,15 @@ func New(window string) Model {
 		height:    24,
 		connected: true,
 		focused:   true,
+		// The defaults, not the zero value: a zero Settings is a client with timestamps,
+		// day rules and nick colours all off, which is a client nobody would recognise as
+		// the configurable one.
+		settings: DefaultSettings(),
+		unread:   make(map[string]int),
+		mention:  make(map[string]bool),
+		nicks:    make(map[string][]Nick),
+		topics:   make(map[string]string),
+		modes:    make(map[string]string),
 	}
 	m.windows[window] = nil
 	return m
@@ -377,11 +406,33 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 }
 
 func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
+	// The settings screen owns the keyboard while it is up. It is a mode, not a window: a
+	// keystroke meant for it must not reach the input box behind it, and returning to the
+	// conversation has to restore exactly what it covered.
+	if m.showSettings {
+		return m.updateSettingsKey(msg), nil
+	}
 	switch msg.Type {
 	case tea.KeyEnter:
 		text := strings.TrimSpace(string(m.input))
 		m.input = m.input[:0]
 		if text == "" {
+			return m, nil
+		}
+		// An alias is expanded before anything is parsed, so "/j #x" and "/join #x" are the
+		// same command with one implementation rather than two.
+		text = m.settings.expand(text, 0)
+		if name, rest, ok := slash(text, "fset", "set"); ok {
+			return m.handleFset(name, rest), nil
+		}
+		if _, rest, ok := slash(text, "alias"); ok {
+			return m.handleAlias(rest), nil
+		}
+		if _, _, ok := slash(text, "settings", "prefs"); ok {
+			// The screen, not the command: /fset sets one value, /settings shows them all
+			// and is the discoverable half.
+			m.showSettings = true
+			m.settingsRow = 0
 			return m, nil
 		}
 		// "/go pattern" switches windows. It is resolved here rather than sent, because the
@@ -437,6 +488,12 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.cycle(-1), nil
 
 	case tea.KeyRunes:
+		// Alt-A jumps to the next window with unread activity, which is what weechat calls
+		// the hotlist. On Alt rather than a bare key because it is a jump, and a jump on a
+		// bare letter would fight the input line.
+		if msg.Alt && len(msg.Runes) == 1 && (msg.Runes[0] == 'a' || msg.Runes[0] == 'A') {
+			return m.hotlistNext(), nil
+		}
 		m.input = append(m.input, msg.Runes...)
 		return m, nil
 
@@ -596,6 +653,186 @@ func (m Model) closeActive() Model {
 // "no window matches" and friends - which are not chat and must not be sent anywhere.
 func (m Model) appendSystem(text string) Model {
 	m.append(Line{Window: m.active, Text: text, Kind: LineSystem})
+	return m
+}
+
+// slash reports whether text is "/<name...>" with nothing else, and returns the remainder.
+// It is the one place a client-side command word is compared, so "/fset" and "/set" cannot
+// drift into two behaviours.
+func slash(text string, names ...string) (name, rest string, ok bool) {
+	if !strings.HasPrefix(text, "/") {
+		return "", "", false
+	}
+	body := strings.TrimPrefix(text, "/")
+	word, tail, _ := strings.Cut(body, " ")
+	for _, n := range names {
+		if strings.EqualFold(word, n) {
+			return word, strings.TrimSpace(tail), true
+		}
+	}
+	return "", "", false
+}
+
+// handleFset sets one client setting: "/fset timestamps off", "/fset scroll_step 5", and a
+// bare "/fset" to list them, which is what makes the command discoverable.
+func (m Model) handleFset(name, rest string) Model {
+	if rest == "" {
+		for _, row := range m.settings.rows() {
+			m.appendSystem(fmt.Sprintf("%-14s %s", row.label, row.value))
+		}
+		m.appendSystem("use /fset <name> <value>; /settings shows the full screen")
+		return m
+	}
+	key, value, hasValue := strings.Cut(rest, " ")
+	if !hasValue {
+		value = ""
+	}
+	if err := m.settings.set(key, value); err != nil {
+		return m.appendSystem(err.Error())
+	}
+	m.saveSettings()
+	return m.appendSystem(fmt.Sprintf("%s is now %s", key, valueOf(m.settings, key)))
+}
+
+// handleAlias adds an alias, or lists them. Listing on a bare invocation matters: an alias
+// nobody can remember is an alias nobody uses.
+func (m Model) handleAlias(rest string) Model {
+	if rest == "" {
+		for _, line := range m.settings.aliasList() {
+			m.appendSystem(line)
+		}
+		return m
+	}
+	if err := m.settings.applyAlias(rest); err != nil {
+		return m.appendSystem(err.Error())
+	}
+	m.saveSettings()
+	return m.appendSystem("alias set: " + rest)
+}
+
+// valueOf reads a setting back for the confirmation line. It is a second switch over the
+// same keys, which is the price of not making the settings table reflective; the test that
+// walks rows() is what keeps the two in step.
+func valueOf(s Settings, key string) string {
+	switch strings.ToLower(key) {
+	case "timestamps":
+		return onOff(s.Timestamps)
+	case "seconds":
+		return onOff(s.Seconds)
+	case "date_rule", "date_rules", "dates":
+		return onOff(s.DateRule)
+	case "nick_colors", "nick_colours", "colors", "colours":
+		return onOff(s.NickColors)
+	case "hotlist":
+		return onOff(s.Hotlist)
+	case "scroll_step", "scroll":
+		return strconv.Itoa(s.ScrollStep)
+	}
+	return "?"
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
+// hotlistNext jumps to the next window with unread activity, wrapping past the end. It is
+// the hotlist: the point is not to show what is unread but to take you there, and a jump that
+// stopped at the bottom would leave the user scrolling the sidebar by hand.
+func (m Model) hotlistNext() Model {
+	if !m.settings.Hotlist || len(m.order) < 2 {
+		return m
+	}
+	cur := 0
+	for i, name := range m.order {
+		if name == m.active {
+			cur = i
+			break
+		}
+	}
+	for step := 1; step <= len(m.order); step++ {
+		idx := (cur + step) % len(m.order)
+		name := m.order[idx]
+		if idx == cur {
+			continue
+		}
+		if m.unread[name] > 0 || m.mention[name] {
+			return m.SetActive(name)
+		}
+	}
+	return m
+}
+
+// updateSettingsKey drives the settings screen. Up and down move, space and enter toggle a
+// boolean, left and right change a number, and escape or q leaves.
+func (m Model) updateSettingsKey(msg tea.KeyMsg) Model {
+	rows := m.settings.rows()
+	if m.settingsRow >= len(rows) {
+		m.settingsRow = len(rows) - 1
+	}
+	if m.settingsRow < 0 {
+		m.settingsRow = 0
+	}
+	row := rows[m.settingsRow]
+	switch msg.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.showSettings = false
+		return m
+	case tea.KeyUp:
+		if m.settingsRow > 0 {
+			m.settingsRow--
+		}
+		return m
+	case tea.KeyDown:
+		if m.settingsRow < len(rows)-1 {
+			m.settingsRow++
+		}
+		return m
+	case tea.KeyLeft:
+		if row.kind == "int" {
+			_ = m.settings.set(row.key, strconv.Itoa(max(1, m.settings.ScrollStep-1)))
+			m.saveSettings()
+		}
+		return m
+	case tea.KeyRight:
+		if row.kind == "int" {
+			_ = m.settings.set(row.key, strconv.Itoa(m.settings.ScrollStep+1))
+			m.saveSettings()
+		}
+		return m
+	case tea.KeyEnter, tea.KeySpace:
+		_ = m.settings.set(row.key, "")
+		m.saveSettings()
+		return m
+	case tea.KeyRunes:
+		if len(msg.Runes) == 1 && (msg.Runes[0] == 'q' || msg.Runes[0] == 'Q') {
+			m.showSettings = false
+		}
+		return m
+	}
+	return m
+}
+
+// saveSettings persists the settings next to the client's other state. A failure is reported
+// in the window rather than ignored: a setting that looks saved and is not is worse than one
+// that refused.
+func (m Model) saveSettings() {
+	if m.settingsPath == "" {
+		return
+	}
+	if err := SaveSettings(m.settingsPath, m.settings); err != nil {
+		m.appendSystem("settings not saved: " + err.Error())
+	}
+}
+
+// WithSettings gives the model a settings file to load and save. It is a separate call rather
+// than a constructor argument because every existing caller - tests, the SSH server, the PTY
+// child - is entitled to the defaults without knowing where they live on disk.
+func (m Model) WithSettings(path string) Model {
+	m.settingsPath = path
+	m.settings = LoadSettings(path)
 	return m
 }
 
@@ -794,6 +1031,97 @@ func (m Model) layout() layout {
 	return l
 }
 
+// settingsView draws the settings screen: one row per setting, the selected row highlighted.
+//
+// It is drawn here rather than in the page for the same reason as everything else: the screen
+// and the command must agree about what a setting is, and two renderers drift. It is also the
+// honest place for it - a browser-only settings panel could not be reached from SSH or a real
+// terminal, and a setting you can only change on one of your three front ends is a bug.
+func (m Model) settingsView() string {
+	rows := m.settings.rows()
+	width := m.width
+	if width < 40 {
+		width = 40
+	}
+	height := m.height
+	if height < 10 {
+		height = 10
+	}
+
+	inner := width - 4
+	lines := make([]string, 0, len(rows))
+	for i, row := range rows {
+		marker := "  "
+		labelStyle := systemStyle
+		if i == m.settingsRow {
+			marker = "▸ "
+			labelStyle = titleStyle
+		}
+		value := row.value
+		if row.kind == "bool" {
+			if value == "on" {
+				value = "[on]"
+			} else {
+				value = "[off]"
+			}
+		}
+		label := labelStyle.Render(marker + row.label)
+		pad := inner - lipgloss.Width(label) - lipgloss.Width(value)
+		if pad < 1 {
+			pad = 1
+		}
+		lines = append(lines, label+strings.Repeat(" ", pad)+bodyStyle.Render(value))
+	}
+
+	// The alias list belongs on this screen too: aliases are settings, and a separate screen
+	// for five entries would be a screen nobody visits.
+	if len(m.settings.Aliases) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, topicStyle.Render("aliases"))
+		for _, a := range m.settings.aliasList() {
+			lines = append(lines, systemStyle.Render("  "+a))
+		}
+	}
+
+	var b strings.Builder
+	title := titleStyle.Render("settings")
+	b.WriteString(borderStyle.Render("╭─ ") + title)
+	m.closeTop(&b, width, "╮")
+	b.WriteString("\n")
+
+	// Top border, separator, input, bottom border, status bar: the conversation's own
+	// arithmetic, so the settings screen is the same size as the thing it covers.
+	room := height - 5
+	for i := 0; i < room; i++ {
+		b.WriteString(borderStyle.Render("│ "))
+		line := ""
+		if i < len(lines) {
+			line = lines[i]
+		}
+		b.WriteString(line)
+		if pad := inner - lipgloss.Width(line); pad > 0 {
+			b.WriteString(strings.Repeat(" ", pad))
+		}
+		b.WriteString(" " + borderStyle.Render("│") + "\n")
+	}
+
+	b.WriteString(borderStyle.Render("├" + strings.Repeat("─", width-2) + "┤"))
+	b.WriteString("\n")
+	b.WriteString(borderStyle.Render("│ "))
+	hint := systemStyle.Render("space toggles, ←/→ changes, esc leaves")
+	b.WriteString(hint)
+	if pad := inner - lipgloss.Width(hint); pad > 0 {
+		b.WriteString(strings.Repeat(" ", pad))
+	}
+	b.WriteString(" " + borderStyle.Render("│") + "\n")
+	b.WriteString(borderStyle.Render("╰"+strings.Repeat("─", width-2)+"╯") + "\n")
+	b.WriteString(barStyle.Render(" settings · client, not bouncer "))
+	if pad := width - lipgloss.Width(" settings · client, not bouncer ") - 2; pad > 0 {
+		b.WriteString(barStyle.Render(strings.Repeat(" ", pad)))
+	}
+	return b.String()
+}
+
 // View draws the whole screen: window list, conversation, member list, input line and
 // status bar.
 //
@@ -803,11 +1131,14 @@ func (m Model) layout() layout {
 // second one, and it drifted immediately - the nicks were drawn twice, once by the
 // renderer and once by the page.
 func (m Model) View() string {
+	if m.showSettings {
+		return m.settingsView()
+	}
 	l := m.layout()
 	nicks := m.nicks[m.active]
 	body := m.bodyLines(l.inner, l.contentRows)
 	winCol := m.windowColumn(l.winWidth, l.contentRows)
-	nickCol := nickColumn(nicks, l.nickWidth, l.contentRows)
+	nickCol := nickColumn(nicks, l.nickWidth, l.contentRows, m.settings)
 
 	var b strings.Builder
 
@@ -995,7 +1326,7 @@ func (m Model) WindowAt(x, y int) string {
 // their prefix; ordinary members are plain. It is truncated rather than wrapped: a
 // nicklist that runs off the bottom pushes the conversation out of view, which is the
 // wrong trade for a list you can refresh by asking NAMES again.
-func nickColumn(nicks []Nick, width, n int) []string {
+func nickColumn(nicks []Nick, width, n int, st Settings) []string {
 	if width <= 2 || n <= 0 {
 		return nil
 	}
@@ -1009,9 +1340,14 @@ func nickColumn(nicks []Nick, width, n int) []string {
 			label = nick.Prefix + nick.Name
 		}
 		label = truncateTo(label, width-2)
-		if nick.Prefix != "" {
+		switch {
+		case nick.Prefix != "":
+			// An operator is green whether or not nick colours are on: the prefix is
+			// channel state, not identity, and someone with ops should be findable.
 			out = append(out, opStyle.Render(label))
-		} else {
+		case st.NickColors:
+			out = append(out, nickColor(nick.Name).Render(label))
+		default:
 			out = append(out, nickStyle.Render(label))
 		}
 	}
@@ -1063,7 +1399,7 @@ func (m Model) bodyLines(width, n int) []string {
 	}
 	out := make([]string, 0, n)
 	for _, l := range lines[start:end] {
-		out = append(out, lineLines(l, width)...)
+		out = append(out, lineLines(l, width, m.settings)...)
 	}
 	if len(out) > n {
 		out = out[len(out)-n:]
@@ -1077,7 +1413,7 @@ func (m Model) bodyLines(width, n int) []string {
 // lineLines renders one line, wrapped to width. Each kind decides its own prefix and
 // style; continuation lines are indented under the text so a wrapped message still
 // reads as one message.
-func lineLines(l Line, width int) []string {
+func lineLines(l Line, width int, st Settings) []string {
 	// A timestamp is prefixed to every line that has one, and the wrap width shrinks by
 	// exactly the prefix: a line that is wrapped before its timestamp is added is a line
 	// that overflows the frame by six columns on every busy channel.
@@ -1096,7 +1432,7 @@ func lineLines(l Line, width int) []string {
 		}
 	}
 	if stamp != "" {
-		out := lineLinesStyled(l, width)
+		out := lineLinesStyled(l, width, st)
 		for i := range out {
 			if i == 0 {
 				out[i] = timeStyle.Render(stamp) + out[i]
@@ -1106,22 +1442,30 @@ func lineLines(l Line, width int) []string {
 		}
 		return out
 	}
-	return lineLinesStyled(l, width)
+	return lineLinesStyled(l, width, st)
 }
 
 // lineLinesStyled is the per-kind renderer, without the timestamp. It is separate so the
 // timestamp logic exists once: each kind already knows how to draw itself, and threading a
 // prefix through all of them would be thirteen chances to forget one.
-func lineLinesStyled(l Line, width int) []string {
+func lineLinesStyled(l Line, width int, st Settings) []string {
 	switch l.Kind {
 	case LineGap:
 		return wrapStyled(gapStyle, l.Text, width, "")
 	case LineSystem:
 		return wrapStyled(systemStyle, l.Text, width, "")
 	case LineNotice:
-		return wrapStyled(noticeStyle, "<"+l.Nick+"> "+l.Text, width, "")
+		n := l.Nick
+		if st.NickColors && n != "" {
+			n = nickColor(n).Render(n)
+		}
+		return wrapStyled(noticeStyle, "<"+n+"> "+l.Text, width, "")
 	case LineAction:
-		return wrapStyled(actionStyle, "* "+l.Nick+" "+l.Text, width, "")
+		n := l.Nick
+		if st.NickColors && n != "" {
+			n = nickColor(n).Render(n)
+		}
+		return wrapStyled(actionStyle, "* "+n+" "+l.Text, width, "")
 	case LineJoin, LineSelfJoin:
 		return wrapStyled(eventStyle, "→ "+l.Nick+" "+l.Text, width, "")
 	case LinePart:
@@ -1144,7 +1488,14 @@ func lineLinesStyled(l Line, width int) []string {
 		if l.Mention {
 			style = mentionStyle
 		}
-		return wrapStyled(style, prefix+l.Text, width, strings.Repeat(" ", lipgloss.Width(prefix)))
+		lines := wrapStyled(style, prefix+l.Text, width, strings.Repeat(" ", lipgloss.Width(prefix)))
+		// The nick is coloured, the text is not: a person is recognisable by their name, and
+		// colouring the body makes a busy channel unreadable and the mention highlight
+		// invisible.
+		if len(lines) > 0 && l.Nick != "" && st.NickColors {
+			lines[0] = strings.Replace(lines[0], "<"+l.Nick+">", "<"+nickColor(l.Nick).Render(l.Nick)+">", 1)
+		}
+		return lines
 	}
 }
 

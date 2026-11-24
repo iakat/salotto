@@ -117,8 +117,11 @@
     if (ev.type === "keydown" && copyKey && (ev.key === "c" || ev.key === "C")) {
       var sel = term.getSelection();
       if (sel) {
+        // The selection stays: clearing it makes the user who is not sure the copy worked
+        // unable to tell, and unable to copy again without re-selecting. The terminal
+        // convention of clearing on copy exists so a stale highlight does not follow you
+        // around, and a browser shows its own "copied" affordance instead.
         copyText(sel);
-        term.clearSelection();
         return false;
       }
     }
