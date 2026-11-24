@@ -18,6 +18,12 @@ import (
 // work only in the configuration where they happen to be co-located, which is the configuration
 // that never has to send a push because the user is looking at the screen.
 type notifier struct {
+	// log reports sends and failures. A notification path with no output is
+	// indistinguishable from one that never fires: found by trying to trigger a real push
+	// against the deployment and having nothing anywhere to say whether the bouncer asked,
+	// whether the front end sent, or whether the push service refused. Every branch below
+	// has something to say, and the failure branch is the one that matters most.
+	log   func(msg string, args ...any)
 	url   string
 	token string
 	cli   *http.Client
@@ -73,11 +79,13 @@ func (n *notifier) notify(msg push.Message) {
 
 	body, err := json.Marshal(msg)
 	if err != nil {
+		n.note("push: cannot encode the message", "err", err)
 		return
 	}
 	go func() {
 		req, err := http.NewRequest(http.MethodPost, n.url, bytes.NewReader(body))
 		if err != nil {
+			n.note("push: bad request for the notifier", "url", n.url, "err", err)
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -86,10 +94,28 @@ func (n *notifier) notify(msg push.Message) {
 		}
 		resp, err := n.cli.Do(req)
 		if err != nil {
+			n.note("push: the notifier did not answer", "url", n.url, "err", err)
 			return
 		}
-		_ = resp.Body.Close()
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			// A 403 here is a token mismatch, a 503 is push not configured on the front end:
+			// both look like "the phone is quiet" from outside, which is why the status is
+			// worth a line in the log.
+			n.note("push: the notifier refused the message", "url", n.url, "status", resp.StatusCode)
+			return
+		}
+		n.note("push: notification sent", "tag", msg.Tag, "title", msg.Title)
 	}()
+}
+
+// note writes a line if a logger is installed. Nil-safe, because a notifier built without one
+// is still a working notifier - the logging is for the operator, not for the send.
+func (n *notifier) note(msg string, args ...any) {
+	if n == nil || n.log == nil {
+		return
+	}
+	n.log(msg, args...)
 }
 
 // mentionMessage builds the notification for a line that addressed us.

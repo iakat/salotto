@@ -169,6 +169,7 @@ func run() int {
 	}
 	pushNotify = newNotifier(cfg.PushURL, pushToken)
 	if pushNotify != nil {
+		pushNotify.log = logger.Info
 		logger.Info("push notifications enabled", "endpoint", cfg.PushURL)
 	}
 

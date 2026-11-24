@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -400,4 +401,78 @@ func bareServerWith(t *testing.T, hub *facade.Hub) *facade.Server {
 		t.Fatal(err)
 	}
 	return srv
+}
+
+// TestTheNotifierReportsWhatHappened is the observability half, and it was missing: a send
+// endpoint that answers 403 and a mention that never fires both look exactly like "the phone is
+// quiet". Tried against the deployment, there was nothing anywhere to distinguish them.
+func TestTheNotifierReportsWhatHappened(t *testing.T) {
+	var mu sync.Mutex
+	var notes []string
+	record := func(msg string, args ...any) {
+		// The args are the whole point: "refused" without "403" is a line that cannot
+		// distinguish a bad token from a front end with push turned off.
+		mu.Lock()
+		notes = append(notes, msg+" "+fmt.Sprint(args...))
+		mu.Unlock()
+	}
+
+	refuse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer refuse.Close()
+
+	n := newNotifier(refuse.URL, "wrong-token")
+	n.log = record
+	n.onMention("libera", "#chan", ":alice!a@h PRIVMSG #chan :salotto: hi", "salotto", false)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := strings.Join(notes, "|")
+		mu.Unlock()
+		if strings.Contains(got, "refused") {
+			if !strings.Contains(got, "403") {
+				t.Fatalf("the refusal was reported without the status, so an operator cannot tell a bad token from an unconfigured front end: %q", got)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	t.Fatalf("a refused notification said nothing: %v", notes)
+}
+
+// TestASuccessfulSendIsAlsoReported: the success path needs a line too, because "no failure
+// logged" and "the feature is working" have to be distinguishable from a log.
+func TestASuccessfulSendIsAlsoReported(t *testing.T) {
+	var mu sync.Mutex
+	var notes []string
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ok.Close()
+
+	n := newNotifier(ok.URL, "tok")
+	n.log = func(msg string, args ...any) {
+		mu.Lock()
+		notes = append(notes, msg+" "+fmt.Sprint(args...))
+		mu.Unlock()
+	}
+	n.onMention("libera", "#chan", ":alice!a@h PRIVMSG #chan :salotto: hi", "salotto", false)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := strings.Join(notes, "|")
+		mu.Unlock()
+		if strings.Contains(got, "sent") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	t.Fatalf("a successful send said nothing: %v", notes)
 }
