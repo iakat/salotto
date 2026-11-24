@@ -21,6 +21,11 @@ import (
 
 // Config describes the client-facing IRC server.
 type Config struct {
+	// AdminLog is the file the audit trail is appended to. Empty keeps it in memory only, which
+	// is the honest default for a bouncer whose operator has not said where to write - a trail
+	// that silently goes to an unexpected place is worse than one that visibly ends at restart.
+	AdminLog string
+
 	Addr       string // listen address, e.g. "127.0.0.1:6667"
 	TLS        bool
 	CertFile   string
@@ -267,6 +272,11 @@ type Server struct {
 	logMu   sync.Mutex
 	logRing []string
 
+	// adminLog is the audit trail for operator actions: who did what, to what, and whether it
+	// worked. Separate from logRing, which is the daemon's own chatter - an audit line is about
+	// an act, not a message, and mixing them is how the trail becomes unreadable.
+	adminLog *adminLog
+
 	linePool sync.Pool
 }
 
@@ -323,9 +333,12 @@ func New(cfg Config) (*Server, error) {
 		log:          cfg.Log,
 		windows:      newWindowState(),
 		fingerprints: NewFingerprints(),
-		created:      time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 MST"),
-		scripts:      cfg.Scripts,
-		sdir:         cfg.ScriptDir,
+		// The audit trail always has its ring, so an operator can ask what happened with no
+		// configuration at all; the file sink is the optional part.
+		adminLog: newAdminLog(logRingCap, cfg.AdminLog),
+		created:  time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 MST"),
+		scripts:  cfg.Scripts,
+		sdir:     cfg.ScriptDir,
 	}
 	// One away policy for the process: every network is the same user, so an
 	// AWAY fans out over all of them exactly as simple_away's PutIRC does per

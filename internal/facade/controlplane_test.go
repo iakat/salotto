@@ -70,10 +70,13 @@ func TestTheAdminTablesMatchTheDispatch(t *testing.T) {
 	}
 	src := string(data)
 
-	// Only the handleControlplane switch: slice to the end of that function.
-	start := strings.Index(src, "func (c *client) handleControlplane(")
+	// Only the dispatch switch: slice to the end of that function. It is dispatchControlplane
+	// rather than handleControlplane because the audit trail records from the wrapper, so the
+	// table lives one level down - and a guard that looked at the wrapper would see no commands
+	// at all and fail for the wrong reason.
+	start := strings.Index(src, "func (c *client) dispatchControlplane(")
 	if start < 0 {
-		t.Fatal("handleControlplane not found")
+		t.Fatal("dispatchControlplane not found")
 	}
 	body := src[start:]
 	if end := strings.Index(body[1:], "\nfunc "); end >= 0 {

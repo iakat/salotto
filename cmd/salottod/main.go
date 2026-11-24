@@ -194,6 +194,7 @@ func run() int {
 		BindHosts:   bindState,
 		Log:         logger,
 		MaxClients:  maxClients,
+		AdminLog:    cfg.AdminLog,
 		MOTDBlocked: cfg.MOTDBlocked,
 		MOTDMissing: cfg.MOTDMissing,
 		// clearbufferonmsg is a per-network knob in ZNC; here it is process-wide

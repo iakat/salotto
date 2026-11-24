@@ -67,6 +67,7 @@ type Config struct {
 	TLSCert         string
 	TLSKey          string
 	ServerName      string
+	AdminLog        string
 	StatsListen     string
 	LogDir          string
 	LogQueue        int
@@ -332,6 +333,11 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.TLSKey, err = parseString(value)
 	case "server_name":
 		c.ServerName, err = parseString(value)
+	case "admin_log":
+		// Where the operator audit trail is appended. Distinct from log_dir, which is the
+		// conversation logging an IRC client's user configures: an audit line is about an act,
+		// not a message, and the two files answer different questions.
+		c.AdminLog, err = parseString(value)
 	case "push_url":
 		c.PushURL, err = parseString(value)
 	case "push_token":

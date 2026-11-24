@@ -32,6 +32,7 @@ import (
 // source for both dispatch and HELP, and the same test walks the dispatch to prove it.
 var controlplaneCommands = []commandDoc{
 	{"ADMINHELP", "[command]", "this list, or what one admin command does"},
+	{"ADMINLOG", "[n]", "the last n operator actions, with actor, target and outcome"},
 	{"CLIENTS", "", "every client attached, with its address and idle time"},
 	{"CONFIG", "", "the effective configuration, secrets withheld"},
 	{"JOINUSER", "<user> <#chan>", "refused: salotto is single-user"},
@@ -69,40 +70,109 @@ func controlplanePrivmsg(rest []byte) (text string, ok bool) {
 // handleControlplane dispatches one admin command. The target is a parameter, not a flag on
 // the client, so the reply goes to the window the operator asked from and a client that is
 // not an operator never sees a difference between "refused" and "does not exist".
+//
+// Every command is audited from here, once, rather than in each handler. A handler that has to
+// remember to log its own action is a handler that will eventually forget, and the action missing
+// from the trail is exactly the one somebody will ask about. The audit records the refusal as well
+// as the success: "SHUTDOWN was attempted" is the line an operator wants after an incident, and a
+// trail of successes only cannot answer it.
 func (c *client) handleControlplane(rest []byte) bool {
 	verb, params, _ := strings.Cut(string(rest), " ")
+	verb = strings.TrimSpace(verb)
+	sent, refusal := c.dispatchControlplane(verb, params)
+	c.srv.adminLog.auditAction(c.nick, verb, strings.TrimSpace(params), refusal == "", refusal)
+	return sent
+}
+
+// dispatchControlplane is the command table.
+//
+// It returns two separate things and they are not the same question:
+//
+//   - sent: did the reply reach the client. Every handler returns c.status(...), which is a
+//     write, so this is the value the caller has to propagate.
+//   - refusal: empty when the command did something, otherwise why it did not.
+//
+// The distinction matters for the audit trail. A log that recorded "sent" as "accepted" would
+// claim SHUTDOWN succeeded, because a refusal is also a message that gets written. So each arm
+// that refuses says so explicitly, and the trail records the refusal as a refusal. Deriving it
+// from the reply text instead would mean the audit's meaning could be changed by editing prose.
+func (c *client) dispatchControlplane(verb, params string) (sent bool, refusal string) {
 	switch strings.ToUpper(verb) {
 	case "ADMINHELP", "HELP":
-		return c.handleAdminHelp(params)
+		return c.handleAdminHelp(params), ""
 	case "VERSION":
-		return c.controlplaneVersion()
+		return c.controlplaneVersion(), ""
 	case "RUNTIME":
-		return c.controlplaneRuntime()
+		return c.controlplaneRuntime(), ""
+	case "ADMINLOG":
+		return c.controlplaneAdminLog(params), ""
 	case "CLIENTS":
-		return c.controlplaneClients()
+		return c.controlplaneClients(), ""
 	case "NETWORKS":
-		return c.handleListNetworks()
+		return c.handleListNetworks(), ""
 	case "USERS":
-		return c.controlplaneUsers()
+		return c.controlplaneUsers(), ""
 	case "CONFIG":
-		return c.controlplaneConfig()
+		return c.controlplaneConfig(), ""
 	case "TRAFFICCTL":
-		return c.handleTraffic()
+		return c.handleTraffic(), ""
 	case "JOINUSER":
-		return c.status("JOINUSER refused: salotto is single-user; a client of this bouncer *is* the user")
+		return c.status("JOINUSER refused: salotto is single-user; a client of this bouncer *is* the user"),
+			"single-user bouncer: a client is the user"
 	case "SCRIPTS":
-		return c.cpScripts()
+		return c.cpScripts(), ""
 	case "SCRIPTLOG":
-		return c.cpScriptLog()
+		return c.cpScriptLog(), ""
 	case "SCRIPTRELOAD":
-		return c.cpScriptReload()
+		return c.cpScriptReload(), ""
 	case "SHUTDOWN":
 		// Deliberately not implemented here. A shutdown command on an unauthenticated
 		// surface is a denial of service with a friendly name, and the honest state of that
 		// is "there is no auth yet". It says so instead of pretending.
-		return c.status("SHUTDOWN refused: no admin authentication is configured, and a shutdown command without it is a remote off switch")
+		return c.status("SHUTDOWN refused: no admin authentication is configured, and a shutdown command without it is a remote off switch"),
+			"no admin authentication is configured"
 	}
-	return c.status("Unknown controlplane command: " + verb + ". Try ADMINHELP.")
+	return c.status("Unknown controlplane command: " + verb + ". Try ADMINHELP."),
+		"unknown command"
+}
+
+// controlplaneAdminLog prints the audit trail.
+//
+// The default is deliberately small: an admin command that can return an unbounded slice is a way
+// for the wire to allocate the operator's memory, so n is clamped to what the ring holds anyway.
+func (c *client) controlplaneAdminLog(arg string) bool {
+	n := 20
+	if arg = strings.TrimSpace(arg); arg != "" {
+		if v, err := strconv.Atoi(arg); err == nil {
+			n = v
+		}
+	}
+	if n <= 0 || n > logRingCap {
+		n = logRingCap
+	}
+	events := c.srv.adminLog.Recent(n)
+	if len(events) == 0 {
+		return c.status("No operator actions recorded yet.")
+	}
+	if !c.status(fmt.Sprintf("The last %d operator action(s), oldest first:", len(events))) {
+		return false
+	}
+	for _, e := range events {
+		status := "ok"
+		if !e.OK {
+			status = "REFUSED"
+		}
+		if !c.status(fmt.Sprintf("  %s  %-8s %-12s %s  %s",
+			e.At.UTC().Format("2006-01-02 15:04:05"), status, e.Actor, e.Action, e.Result)) {
+			return false
+		}
+	}
+	// A sink that has stopped writing is the failure worth surfacing: a trail that silently
+	// stops is worse than none, because it is the one people trust.
+	if err := c.srv.adminLog.Err(); err != nil {
+		return c.status("WARNING: the audit file sink is failing: " + err.Error())
+	}
+	return true
 }
 
 func (c *client) handleAdminHelp(arg string) bool {
