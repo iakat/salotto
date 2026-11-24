@@ -547,6 +547,10 @@ func (s *Server) BroadcastWindows(netName string, windows []string, seq uint64, 
 // unconditionally (Client.cpp:1138). source is that author; nil means the line
 // came from the network, where nobody is the author and everyone sees it.
 func (s *Server) BroadcastWindowsFrom(netName string, windows []string, seq uint64, line []byte, ts int64, source *Subscriber) {
+	ne := s.network(netName)
+	if ne != nil {
+		ne.observeTopic(line)
+	}
 	if len(windows) == 0 {
 		return
 	}
@@ -566,7 +570,7 @@ func (s *Server) BroadcastWindowsFrom(netName string, windows []string, seq uint
 	}
 
 	var un string
-	if ne := s.network(netName); ne != nil {
+	if ne != nil {
 		forLine, _ := ne.advanceNick(ne.knownNick(), line)
 		un = forLine
 	}

@@ -617,6 +617,35 @@ parentheses. Twelve mutations were confirmed red, including the four that surviv
 pass: ambiguous-name guessing, the title leaking the key, the sidebar row leaking the key, and
 `CHATHISTORY` carrying the key.
 
+### 2.1.2 A channel topic outlives the client that first saw it — **fixed**
+
+The open note said "no topic row shows up, it should". The renderer was never
+broken: `TestTheTopicRowIsDrawn` already proved the row, and a real PTY against
+a bouncer with a fake upstream already painted `TOPIC FROM THE WIRE`. What was
+missing was on the daemon side. The upstream `332` was relayed once into the
+network's **status** ring, so a client that attached after that ring had aged out
+saw no topic at all, forever, until somebody changed it. A long-running bouncer
+makes that "always, eventually".
+
+The fix is state, not drawing. The facade keeps one topic string per channel
+window beside its nick cache, learned from `332`, cleared by `331`, and replaced
+by a `TOPIC` change; it is in memory only and is not persisted. On attach, after
+each network's replay batches close, the daemon sends the standard `332 <client>
+<#chan> :<topic>` once per channel it holds a topic for. A channel with no topic
+gets nothing: an empty `332` would claim one exists, and a `331` for every window
+on every attach is noise. The `332` is also now routed to its channel instead of
+being treated like every other server numeric, so the live line lands where the
+topic belongs.
+
+This survives a reconnect because the value is on the network, not on the client
+that happened to be attached when it arrived: `TestATopicSurvivesAReconnect`,
+`TestTheBouncerRemembersATopic`, `TestATopicChangeReplacesTheRememberedOne`,
+`TestTheTopicArrivesAfterTheReplay`, `TestNoTopicIsSentForAChannelWithoutOne` and
+`TestTheTopicIsNotFiledUnderStatus`. Routing `332`, the attach ordering and the
+in-memory limit are written down in `docs/SPEC.md` §6.2. Persistence across a
+daemon restart is deliberately still open, and so is clearing a topic on `KICK`
+or a channel the client has left; the map holds the last thing the network said.
+
 ### 2.2 The three things we do differently from The Lounge, by design
 
 1. **Link previews fetch server-side, on demand, with an explicit allowlist and a

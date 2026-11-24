@@ -36,7 +36,7 @@ Naming is a proposal: `salotto` (the parlour next to `stanze`). Binaries
   adapter (same frames over a binary WebSocket, §13).
 - No shared channel access between users. One user, many sessions, many
   clients. Multi-tenant means many users, each in their own box.
-- No bouncer-side IRC state in the *facade*: the facade keeps no IRC state. A read-only tracker inside the logging subsystem (`internal/logfile`) keeps membership and topic solely to reproduce ZNC's fan-out; it is never exposed to clients, runs on the log drain goroutine, and is cleared on disconnect. This is a narrowing of the rule, not its removal.
+- No bouncer-side IRC state in the *facade*: the facade keeps no IRC state. A read-only tracker inside the logging subsystem (`internal/logfile`) keeps membership and topic solely to reproduce ZNC's fan-out; it is never exposed to clients, runs on the log drain goroutine, and is cleared on disconnect. This is a narrowing of the rule, not its removal. The one exception is the current topic per channel: the facade keeps it in memory beside the network's nick cache, because a client attaching later has to be told the topic after the status ring that carried the original `332` has been overwritten. It stores the text only, never the topic setter or time (`333`), is not persisted, and is exposed only as the standard `332` reply on attach (§6.2).
 - No history older than the ring. Backfill beyond the ring is the network's
   job via `chathistory` (§11), from the client.
 
@@ -275,6 +275,20 @@ will never see. Because the ring is per window, a `GAP` now means **this window
 really overflowed**: a busy window can no longer evict a quiet window's lines,
 and the quiet window's client sees no `GAP` at all. Each window's sequences are
 independent; two windows holding the same line number it differently.
+
+A client's attach order is fixed: the registration burst, then one replay batch
+per window for each network, then the current topic of every channel that
+network remembers. The topic is sent as the standard `332 <client> <channel>
+:<topic>` reply addressed to that client, after the network's `BATCH -replay`
+closes and never inside the batch. A batch is history and a client may treat a
+line in it as old; a topic is current state, and a client that builds windows
+from replayed `JOIN`s does not have the channel window yet when a batch opens.
+A channel with no known topic gets no `331`: the omission is deliberate, because
+`331` for every window on every attach is noise, and a fresh client showing no
+topic row is the truth. The topic comes from the `332`, `331` and `TOPIC` lines
+the upstream stream carries; `KICK` and a channel disappearing do not clear it,
+so the map can hold the last topic of a channel the client is no longer in until
+the next `332` or `TOPIC` replaces it.
 
 `Attach`/`Detach` state lives next to the cursors: a window can be detached
 (delivery stops, the cursor freezes) or muted (delivery stops, replay still

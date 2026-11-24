@@ -167,6 +167,27 @@ type networkEntry struct {
 	name string
 	net  Network
 	nick *nickCache
+
+	// topics is the current topic of each channel window, keyed by the channel
+	// name as the server spells it. It lives here, beside the nick cache,
+	// because it is per-network state learned from the upstream stream that has
+	// to outlive every client: a 332 used to be relayed once into whichever
+	// window the router picked and then existed only in that ring, so a client
+	// attaching after the status ring had aged out saw no topic at all, forever,
+	// until somebody changed it.
+	//
+	// It is deliberately in memory only. Persisting it in state_dir would make a
+	// restart keep a topic the network may have changed while the daemon was
+	// down, which is a separate decision from "a client that attaches later can
+	// see the topic the daemon knows".
+	//
+	// KICK and a channel disappearing are not handled: the map keeps the last
+	// topic it was told, because a stale topic is only ever sent for a channel
+	// the daemon still remembers and the next 332 or TOPIC replaces it. Faking
+	// the rest of the missing lifecycle here would be a second, partial channel
+	// tracker, not a topic store.
+	topicsMu sync.RWMutex
+	topics   map[string]string
 }
 
 type nickCache struct {
@@ -262,6 +283,101 @@ func (ne *networkEntry) advanceNick(un string, line []byte) (forLine, next strin
 		return un, v
 	}
 	return un, un
+}
+
+// observeTopic is observe-by-relay: it takes a line that is about to be written
+// to attached clients and remembers a topic if the line carries one. The daemon
+// also feeds lines through NoteTopic on the callback that learns the other
+// per-channel facts, so a line a plugin hides from the live relay still updates
+// the state; this path exists because Broadcast and BroadcastWindowsFrom are the
+// points every relayed line goes through, including lines from an embedded
+// server that has no daemon wiring.
+func (ne *networkEntry) observeTopic(line []byte) {
+	_, rest := ircline.Tags(line)
+	_, rest = ircline.Prefix(rest)
+	switch {
+	case ircline.IsVerb(rest, "332"), ircline.IsVerb(rest, "331"), ircline.IsVerb(rest, "TOPIC"):
+		ne.noteTopic(rest)
+	}
+}
+
+// noteTopic records a topic the upstream server just told us about. rest is the
+// line after its tags and prefix, so the caller has already done the parsing
+// that can be done without allocating.
+//
+// Only the three verbs that carry a topic are looked at: 332 is the reply "the
+// topic of this channel is", 331 says there is none, and a TOPIC message is a
+// change (a topic change is a verb, not a numeric). Everything else returns
+// before touching the map, so the relay path pays no allocation for ordinary
+// traffic.
+//
+// The text is stored exactly as it arrived. The daemon does not parse a topic,
+// split it, or truncate it; the ring already caps the line and the client
+// decides how much of it fits on screen. An empty trailing parameter (a TOPIC
+// with no text is how a channel clears its topic) removes the entry rather
+// than storing "", so the attach pass has one representation of "no topic".
+func (ne *networkEntry) noteTopic(rest []byte) {
+	var (
+		channel string
+		topic   string
+	)
+	switch {
+	case ircline.IsVerb(rest, "332"), ircline.IsVerb(rest, "331"):
+		// "332 <client> <channel> :<topic>" and "331 <client> <channel>".
+		fields := bytes.Fields(ircline.Params(rest))
+		if len(fields) < 2 {
+			return
+		}
+		channel = string(fields[1])
+		if ircline.IsVerb(rest, "332") {
+			topic = topicText(ircline.Params(rest))
+		}
+	case ircline.IsVerb(rest, "TOPIC"):
+		// "TOPIC <channel> :<topic>".
+		channel = string(ircline.FirstParam(ircline.Params(rest)))
+		topic = topicText(ircline.Params(rest))
+	default:
+		return
+	}
+	if channel == "" {
+		return
+	}
+
+	ne.topicsMu.Lock()
+	defer ne.topicsMu.Unlock()
+	if topic == "" {
+		delete(ne.topics, channel)
+		return
+	}
+	if ne.topics == nil {
+		ne.topics = make(map[string]string, 4)
+	}
+	ne.topics[channel] = topic
+}
+
+// topicText returns the trailing parameter exactly as it arrived, without its
+// leading colon. A topic is free text and may contain anything except CR/LF, so
+// there is nothing to unescape or normalise.
+func topicText(params []byte) string {
+	if i := bytes.IndexByte(params, ':'); i >= 0 {
+		return string(params[i+1:])
+	}
+	return ""
+}
+
+// topicSnapshot returns a copy of the remembered topics so a caller can write to
+// a client without holding the lock, which would block the upstream relay.
+func (ne *networkEntry) topicSnapshot() map[string]string {
+	ne.topicsMu.RLock()
+	defer ne.topicsMu.RUnlock()
+	if len(ne.topics) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(ne.topics))
+	for channel, topic := range ne.topics {
+		out[channel] = topic
+	}
+	return out
 }
 
 // Server is the client-facing IRC facade.
@@ -437,6 +553,27 @@ func (s *Server) noteLog(line string) {
 // NoteLog is the exported form, for the daemon's log handler.
 func (s *Server) NoteLog(line string) { s.noteLog(line) }
 
+// NoteTopic feeds one upstream line to the per-network topic state. The daemon
+// calls it for every line in the same callback that learns the other
+// per-channel facts (a self-kick, a self join or part, an inbound private
+// message), so the topic a client gets on attach is the one the network last
+// said regardless of whether any client was attached to hear it.
+//
+// The verb is checked before the network is looked up, so a line that cannot
+// carry a topic costs one case-insensitive comparison and no lock.
+func (s *Server) NoteTopic(netName string, line []byte) {
+	_, rest := ircline.Tags(line)
+	_, rest = ircline.Prefix(rest)
+	switch {
+	case ircline.IsVerb(rest, "332"), ircline.IsVerb(rest, "331"), ircline.IsVerb(rest, "TOPIC"):
+	default:
+		return
+	}
+	if ne := s.network(netName); ne != nil {
+		ne.noteTopic(rest)
+	}
+}
+
 func (s *Server) Serve(l net.Listener) error {
 	if s.started.IsZero() {
 		s.started = time.Now()
@@ -485,6 +622,7 @@ func (s *Server) Broadcast(netName string, seq uint64, line []byte, ts int64) {
 
 	var un string
 	if ne := s.network(netName); ne != nil {
+		ne.observeTopic(line)
 		forLine, _ := ne.advanceNick(ne.knownNick(), line)
 		un = forLine
 	}
@@ -1292,6 +1430,47 @@ func (c *client) replayNetwork(ne *networkEntry) bool {
 			return false
 		}
 	}
+	// Current topics come after every replay batch of this network, never inside
+	// one. A batch is history: a client may treat a line in it as old and file it
+	// as scrollback, while a topic is current state that belongs in the channel's
+	// header. Sending it in the replay loop looked tidier and was wrong for that
+	// reason, and it also put the topic before the window existed for a client
+	// that builds windows from replayed JOINs.
+	return c.sendTopics(ne)
+}
+
+// sendTopics sends the current topic of every channel this network remembers, as
+// the standard 332 reply addressed to the client. It runs once per attach, after
+// replayNetwork's batches, so the channel windows exist by the time a client
+// files the line.
+//
+// A channel the daemon has no topic for gets nothing. 331 ("no topic") would be
+// a correct answer and is cheap, but sending it for every window on every attach
+// is noise: a client that already has no topic keeps whatever it had, and a
+// fresh client shows no row, which is the truth. An empty 332 would be worse
+// still: it claims a topic exists and then shows nothing.
+func (c *client) sendTopics(ne *networkEntry) bool {
+	topics := ne.topicSnapshot()
+	if len(topics) == 0 {
+		return true
+	}
+	channels := make([]string, 0, len(topics))
+	for channel := range topics {
+		channels = append(channels, channel)
+	}
+	sort.Strings(channels)
+	for _, channel := range channels {
+		topic := topics[channel]
+		if topic == "" {
+			continue
+		}
+		// The network tag has to be this channel's network, not the first
+		// network the status stream would use: with two networks the client
+		// would file the topic under the wrong server.
+		if !c.sendOn(ne.name, ":", c.srv.cfg.ServerName, " 332 ", c.nick, " ", channel, " :", topic) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -1447,6 +1626,15 @@ func (c *client) send(parts ...string) bool {
 	return c.sendTagged("", "", parts...)
 }
 
+// sendOn is send for a line that is about one specific network rather than the
+// connection as a whole. The network tag is what a client files the line under,
+// so the per-channel topic of the second network has to carry the second
+// network's name; statusNetwork's "first network" answer is right for a PONG and
+// wrong here.
+func (c *client) sendOn(network string, parts ...string) bool {
+	return c.sendTaggedOn(network, "", "", parts...)
+}
+
 // sendTagged is send with one extra vendor tag, and it exists so a SEARCH reply can carry the
 // client's request id without a second implementation of the tag block.
 //
@@ -1455,6 +1643,10 @@ func (c *client) send(parts ...string) bool {
 // PONG. The request id rides in the same block under ircline.TagSearch. An empty key means no
 // extra tag, which is every ordinary line.
 func (c *client) sendTagged(key, value string, parts ...string) bool {
+	return c.sendTaggedOn(c.statusNetwork(), key, value, parts...)
+}
+
+func (c *client) sendTaggedOn(network, key, value string, parts ...string) bool {
 	b := c.scratch[:0]
 	// One tag block, written once, holding whatever this line needs to carry.
 	//
@@ -1480,11 +1672,11 @@ func (c *client) sendTagged(key, value string, parts ...string) bool {
 		b = append(b, c.label...)
 		needSep = true
 	}
-	if net := c.statusNetwork(); net != "" {
+	if network != "" {
 		if !needSep {
 			b = append(b, '@')
 		}
-		b = appendNetworkTag(b, nil, net, needSep)
+		b = appendNetworkTag(b, nil, network, needSep)
 		needSep = true
 	}
 	if key != "" {

@@ -163,6 +163,11 @@ func (m *netmgr) Start(nc config.Network) error {
 			dispatchRouted(m.srv, netName, windows, line)
 			w.OnRouted(entries, line, false)
 			noteSelfKick(m.srv, netName, line)
+			// The topic is current state and has to outlive the ring, so it is
+			// learned on the line that carries it, not on attach from replayed
+			// history. A 332 or a TOPIC change that arrives while nobody is
+			// attached is exactly the case this exists for.
+			m.srv.NoteTopic(netName, line)
 			// chansaver: our own JOIN/PART/KICK decides what gets re-joined on
 			// the next connect, which is what makes the list follow reality
 			// instead of the config file.

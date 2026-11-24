@@ -295,6 +295,28 @@ func Format(tr *Tracker, now interface{}, line []byte, outbound bool, hasEcho bo
 		channel := firstField(params)
 		topic := trailingField(params)
 		entries = append(entries, Entry{Window: sanitizeWindow(channel), Body: fmt.Sprintf("*** %s changes topic to '%s'", nick, topic)})
+	case "332":
+		// 332 is the topic reply: "<client> <channel> :<topic>". It is about the
+		// channel it names, not about the server, so it belongs in that
+		// channel's window. Treating it like every other numeric filed it under
+		// status, which meant a client attaching after that status ring had
+		// dropped the line had no topic at all until somebody changed it. The
+		// channel is the second parameter because the first is the client.
+		channel := secondField(params)
+		window := "status"
+		if isChannelTarget(channel) {
+			window = sanitizeWindow(channel)
+		}
+		entries = append(entries, Entry{Window: window, Body: fmt.Sprintf("*** Topic: %s", trailingField(params))})
+	case "331":
+		// 331 says a channel has no topic. It is the same kind of state as 332 and
+		// belongs in the same channel window; an unaddressed 331 stays status.
+		channel := secondField(params)
+		window := "status"
+		if isChannelTarget(channel) {
+			window = sanitizeWindow(channel)
+		}
+		entries = append(entries, Entry{Window: window, Body: "*** No topic"})
 	case "KICK":
 		channel := firstField(params)
 		kicked := secondField(params)
