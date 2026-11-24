@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -215,4 +217,84 @@ def on_line(network, line):
 	if _, ok, _ := s.Engine().State().Get(starlark.String("seen")); !ok {
 		t.Fatal("on_line did not run with the hook switched on")
 	}
+}
+
+// TestTheReloaderSeesThroughASymlink is the deployment this feature was written for, and the
+// bug it had: a ConfigMap volume is a set of symlinks into a timestamped directory that is
+// swapped wholesale. DirEntry.Info() is an lstat, so it reports the *symlink's* modification
+// time - which never changes - while the file the link points at has been replaced. The poll
+// then never fires, hot reload silently does nothing, and the only visible symptom is that
+// editing the file has no effect. os.Stat follows the link, which is what an operator means by
+// "the file changed".
+func TestTheReloaderSeesThroughASymlink(t *testing.T) {
+	root := t.TempDir()
+	// The shape a ConfigMap mount has: script -> ..data/script, ..data -> ..2026_11_24_03_00_00
+	dir := filepath.Join(root, "scripts")
+	writeVersion := func(version, body string) {
+		vdir := filepath.Join(root, ".."+version)
+		if err := os.MkdirAll(vdir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(vdir, "one.star"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Repoint the file and the ..data link, exactly as the kubelet does.
+		_ = os.Remove(filepath.Join(dir, "..data"))
+		if err := os.Symlink(vdir, filepath.Join(dir, "..data")); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Remove(filepath.Join(dir, "one.star"))
+		if err := os.Symlink(filepath.Join(dir, "..data", "one.star"), filepath.Join(dir, "one.star")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Same length, different bytes: "two" is what version 2 logs and it is exactly as long as
+	// "one". A reload that compares size instead of content would see no change, which is the
+	// bug this test is for, so the fixture has to be able to catch it.
+	writeVersion("1", "def on_line(network, line):\n    log(\"one\")\n")
+	sc := newScripting(dir, 0, 0, nil)
+	if sc == nil {
+		t.Fatal("no scripting")
+	}
+	defer sc.Stop()
+	// Positive control: the first version loaded, so a later failure is about the reload and
+	// not about a script that never compiled.
+	var first bytes.Buffer
+	sc.Engine().SetLog(func(m string) { first.WriteString(m) })
+	sc.Engine().RunAllHooks("on_line", starlark.String("n"), starlark.String("line"))
+	if !strings.Contains(first.String(), "one") {
+		t.Fatalf("the first version did not load: %q", first.String())
+	}
+	before := sc.fingerprint()
+
+	writeVersion("2", "def on_line(network, line):\n    log(\"twa\")\n")
+
+	if after := sc.fingerprint(); after == before {
+		t.Fatalf("the fingerprint did not change when the ConfigMap was swapped, so no reload would ever run (before=%q after=%q)", before, after)
+	}
+
+	// And the poll actually reloads when it sees a change. The timer is started while the
+	// directory still holds version 2, so its baseline is version 2 and version 3 is a change
+	// it has to notice on its own.
+	var changes int
+	sc.StartHotReload(50*time.Millisecond, func(n int) {
+		changes++
+		t.Logf("reload fired: %d scripts, fp=%s", n, sc.fingerprint())
+	})
+	writeVersion("3", "def on_line(network, line):\n    log(\"thr\")\n")
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		var buf bytes.Buffer
+		sc.Engine().SetLog(func(m string) { buf.WriteString(m) })
+		sc.Engine().RunAllHooks("on_line", starlark.String("n"), starlark.String("line"))
+		if strings.Contains(buf.String(), "thr") {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the reload timer never picked up the new version")
 }

@@ -22,6 +22,7 @@
 package script
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -240,14 +241,25 @@ func (e *Engine) Reload() (loaded int) {
 			continue
 		}
 		seen[ent.Name()] = true
-		info, ierr := ent.Info()
-		if ierr != nil {
+		// Compare content, not timestamps. On a ConfigMap volume the files are symlinks into a
+		// directory that is swapped wholesale, and ent.Info() is an lstat: it reports the
+		// symlink's time, which never changes, so a reload compared by mtime is a reload that
+		// never happens. os.Stat fixes that but a swap can still land in the same clock tick.
+		// The bytes are the only thing that means "the script changed", and these files are a
+		// few hundred bytes each.
+		body, rerr := os.ReadFile(filepath.Join(e.dir, ent.Name()))
+		if rerr != nil {
+			e.scripts[ent.Name()] = &Script{Name: ent.Name(), Err: rerr}
 			continue
 		}
-		if old, ok := e.scripts[ent.Name()]; ok && old.ModTime.Equal(info.ModTime()) {
+		if old, ok := e.scripts[ent.Name()]; ok && old.Err == nil && bytes.Equal(old.source, body) {
 			continue
 		}
-		e.scripts[ent.Name()] = e.compileLocked(ent.Name(), filepath.Join(e.dir, ent.Name()), info.ModTime())
+		var mod time.Time
+		if info, ierr := os.Stat(filepath.Join(e.dir, ent.Name())); ierr == nil {
+			mod = info.ModTime()
+		}
+		e.scripts[ent.Name()] = e.compileLocked(ent.Name(), filepath.Join(e.dir, ent.Name()), body, mod)
 	}
 
 	// A script that was deleted is removed: the file is the source of truth, and a script the
@@ -269,15 +281,10 @@ func (e *Engine) Reload() (loaded int) {
 
 // compileLocked compiles and runs one file. It runs the file's top level, which is where a
 // script builds its state; function definitions land in the globals but are not called.
-func (e *Engine) compileLocked(name, path string, mod time.Time) *Script {
+func (e *Engine) compileLocked(name, path string, src []byte, mod time.Time) *Script {
 	s := &Script{Name: name, ModTime: mod}
-
-	src, err := os.ReadFile(path)
-	if err != nil {
-		s.Err = err
-		return s
-	}
 	s.source = src
+	var err error
 
 	thread := &starlark.Thread{
 		Name: name,

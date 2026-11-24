@@ -1,10 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -79,10 +80,15 @@ func (s *scripting) StartHotReload(every time.Duration, onChange func(int)) {
 	if every <= 0 {
 		every = 2 * time.Second
 	}
+	// The baseline is taken here, on the caller's goroutine, before the timer exists. Inside
+	// the goroutine it raced the caller: a change made between StartHotReload returning and the
+	// goroutine being scheduled became the baseline, so that change was never seen. In the test
+	// that race is the difference between "hot reload works" and "hot reload never fires", and
+	// the same window exists in production for anyone who edits at the moment of start.
+	last := s.fingerprint()
 	go func() {
 		t := time.NewTicker(every)
 		defer t.Stop()
-		last := s.fingerprint()
 		for {
 			select {
 			case <-s.stop:
@@ -114,33 +120,42 @@ func (s *scripting) Stop() {
 	}
 }
 
-// fingerprint is a cheap change detector: the name and modification time of every loaded file.
+// fingerprint detects a change to the script directory by hashing what the files contain.
 //
-// Not fsnotify: the script directory is a volume that may be a ConfigMap, whose files are
-// swapped by renaming a symlinked directory. An inotify watch follows the inode it was given,
-// so it ends up watching something nothing writes to any more - which looks exactly like "hot
-// reload does not work". A stat cannot be fooled that way.
-// It stats the directory rather than reading the engine's list, and that distinction was a
-// real bug: keyed on the loaded scripts' modification times, the fingerprint could only change
-// after a reload, so a reload never ran. The change has to be detected on disk, where the
-// operator's edit actually is.
+// Three detectors were tried, and the first two were wrong in the deployment this exists for.
+//
+// mtime of the loaded scripts: could only change after a reload, so a reload never ran.
+// mtime and size from the directory entry: DirEntry.Info is an lstat, and on a ConfigMap volume
+// every file is a symlink into a timestamped directory swapped wholesale, so it reports the
+// symlink's time, which never changes. os.Stat follows the link and fixed that, but a swap can
+// still land in the same mtime tick as the previous write and leave the fingerprint identical -
+// observed, not theorised.
+//
+// Content is the only thing that means what "the script changed" means. The directory holds a
+// handful of small files, so hashing them every two seconds costs nothing measurable, and it is
+// also correct in two cases the timestamps got wrong anyway: a file restored from a backup with
+// its old mtime, and an edit that puts back the exact bytes that were there before (no reload
+// needed, and none happens).
 func (s *scripting) fingerprint() string {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return "err:" + err.Error()
 	}
-	var b strings.Builder
+	h := sha256.New()
 	for _, ent := range entries {
 		if ent.IsDir() || filepath.Ext(ent.Name()) != ".star" {
 			continue
 		}
-		info, ierr := ent.Info()
-		if ierr != nil {
+		body, rerr := os.ReadFile(filepath.Join(s.dir, ent.Name()))
+		if rerr != nil {
+			fmt.Fprintf(h, "%s:err:%v;", ent.Name(), rerr)
 			continue
 		}
-		fmt.Fprintf(&b, "%s:%d:%d;", ent.Name(), info.ModTime().UnixNano(), info.Size())
+		fmt.Fprintf(h, "%s:%d:", ent.Name(), len(body))
+		h.Write(body)
+		h.Write([]byte{0})
 	}
-	return b.String()
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // ScriptList implements facade.Scripts.
