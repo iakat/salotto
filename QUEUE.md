@@ -549,6 +549,24 @@ only place a JS toolchain appears, and it is a build artifact — no runtime JS
 dependency in the served app beyond what we ship. That is the opposite of The
 Lounge's 23 runtime deps in the server.
 
+### 2.1.1 Two networks, one channel name: the window namespace
+
+Found live while testing highlights: alice joins `#salotto` on both of her networks, and the
+client shows **one** window for it. The bouncer gets this right - windows are keyed by
+`(network, name)` upstream and each network's ring is separate - but the client's model keys
+windows by name alone, so the two channels collide. The visible consequences are small and
+confusing, which is the worst kind: a line can arrive in the network the client is not attached
+to, and the window looks merely quiet.
+
+This is not a display problem, it is a namespace problem, and the fix has to be a qualifier on
+the window identity all the way through the model: the sidebar entry, `/go` matching, unread and
+mention keys, the settings screen's "current window", and click hit-testing. Half of that is a
+worse bug than none of it (a window that is sometimes the right one), so it is written down here
+rather than patched in the renderer.
+
+Until then: one channel name per deployment, or the client attaches to the first network that
+answered. The bouncer side needs nothing.
+
 ### 2.2 The three things we do differently from The Lounge, by design
 
 1. **Link previews fetch server-side, on demand, with an explicit allowlist and a
