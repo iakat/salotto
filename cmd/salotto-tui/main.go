@@ -112,7 +112,10 @@ func main() {
 // server. The transport closes its channel on shutdown, so a closed stream ends the pump.
 func pump(p *tea.Program, tr *ui.Transport) {
 	for msg := range tr.Msgs() {
-		slog.Warn("pump forwarding", "type", fmt.Sprintf("%T", msg))
+		// No logging here, deliberately. This runs once per line the bouncer sends, and anything
+		// written to stderr lands on the terminal inside bubbletea's alternate screen - it paints
+		// over the frame and the next repaint does not clean it up. A debug line left here is a
+		// client that scrambles its own display once per message.
 		p.Send(msg)
 	}
 }
