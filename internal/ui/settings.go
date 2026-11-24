@@ -38,6 +38,17 @@ type Settings struct {
 	// Aliases are command shortcuts: an alias is expanded before the line is parsed, so
 	// "/j #chan" and "/join #chan" are the same command rather than two implementations.
 	Aliases map[string]string `json:"aliases"`
+
+	// Mutes are nicks whose lines do not light a window up. A muted line is still
+	// drawn: hiding it would mean a channel that looks idle while someone is talking to
+	// you, and "why did nobody answer" is a worse failure than "that person is noisy".
+	// Mute suppresses the signal, not the text.
+	Mutes []string `json:"mutes"`
+	// Highlights are extra words that light a window up as if they were our nick. The
+	// use is a project name, a nickname you answer to, a word you are waiting for - not
+	// a second mention system, which is why it shares the mention colour rather than
+	// getting a colour of its own.
+	Highlights []string `json:"highlights"`
 }
 
 // DefaultSettings is what a new installation gets. The defaults are the ones that make a
@@ -83,13 +94,72 @@ func (s Settings) rows() []settingRow {
 		{"nick_colors", "nick colours", onOff(s.NickColors), "bool"},
 		{"hotlist", "hotlist", onOff(s.Hotlist), "bool"},
 		{"scroll_step", "scroll step", strconv.Itoa(s.ScrollStep), "int"},
+		{"highlight", "highlights", listOrNone(s.Highlights), "text"},
+		{"mute", "mutes", listOrNone(s.Mutes), "text"},
 	}
+}
+
+// addWord adds a word to a list, case-insensitively and without duplicates. A settings
+// list that accumulates "ZNC" and "znc" would silently keep two rules that mean one thing,
+// and removing either would look like it did nothing.
+func addWord(words []string, word string) []string {
+	word = strings.TrimSpace(word)
+	if word == "" {
+		return words
+	}
+	for _, w := range words {
+		if strings.EqualFold(w, word) {
+			return words
+		}
+	}
+	return append(words, word)
+}
+
+// matchedBy reports whether text contains any of words as a whole word. It is the same
+// rule mentions use, so a highlight and a mention cannot disagree about whether "alice"
+// inside "malice" counts.
+func matchedBy(text string, words []string) bool {
+	for _, w := range words {
+		if wordIn(text, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// listOrNone renders a word list for the settings screen. An empty list says "none"
+// rather than showing a blank column, because a blank cell reads as "this setting is
+// broken" and an empty highlight list is the normal state of a new client.
+func listOrNone(words []string) string {
+	if len(words) == 0 {
+		return "none"
+	}
+	return strings.Join(words, " ")
+}
+
+// canonical maps every accepted spelling to the one name a row uses. It is the single place
+// an alias like "dates" or "colours" becomes a setting name, so /fset, the settings screen
+// and the read-back cannot disagree about what a key is called.
+func canonical(key string) string {
+	switch key = strings.ToLower(strings.TrimSpace(key)); key {
+	case "date_rules", "dates":
+		return "date_rule"
+	case "nick_colours", "colors", "colours":
+		return "nick_colors"
+	case "scroll":
+		return "scroll_step"
+	case "highlights":
+		return "highlight"
+	case "mutes":
+		return "mute"
+	}
+	return key
 }
 
 // set applies one key. It returns an error rather than ignoring an unknown name, because a
 // typo that silently does nothing is indistinguishable from a setting that does not work.
 func (s *Settings) set(key, value string) error {
-	key = strings.ToLower(strings.TrimSpace(key))
+	key = canonical(key)
 	value = strings.TrimSpace(value)
 	boolean := func(dst *bool) error {
 		switch strings.ToLower(value) {
@@ -122,6 +192,22 @@ func (s *Settings) set(key, value string) error {
 			return fmt.Errorf("scroll_step takes a number between 1 and 50")
 		}
 		s.ScrollStep = n
+		return nil
+	case "highlight", "highlights":
+		switch strings.ToLower(value) {
+		case "", "none", "clear":
+			s.Highlights = nil
+			return nil
+		}
+		s.Highlights = addWord(s.Highlights, value)
+		return nil
+	case "mute", "mutes":
+		switch strings.ToLower(value) {
+		case "", "none", "clear":
+			s.Mutes = nil
+			return nil
+		}
+		s.Mutes = addWord(s.Mutes, value)
 		return nil
 	default:
 		return fmt.Errorf("no setting called %s", key)

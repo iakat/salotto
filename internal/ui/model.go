@@ -373,6 +373,13 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 			m.scroll = 0
 			return m, nil
 		}
+		// A highlight word is a mention. It is decided here rather than in the transport
+		// because the words are this client's settings: the transport is shared by every
+		// front end of this account, and a highlight set in a browser must not silently
+		// change what a phone considers interesting.
+		if !line.Mention && !line.Own && m.highlighted(line.Text) {
+			line.Mention = true
+		}
 		if !line.Pending {
 			if m.confirmPending(line) {
 				if line.Mention {
@@ -656,6 +663,24 @@ func (m Model) appendSystem(text string) Model {
 	return m
 }
 
+// muted reports whether a nick is on this client's mute list.
+func (m Model) muted(nick string) bool {
+	if nick == "" {
+		return false
+	}
+	for _, w := range m.settings.Mutes {
+		if strings.EqualFold(w, nick) {
+			return true
+		}
+	}
+	return false
+}
+
+// highlighted reports whether text contains one of this client's highlight words.
+func (m Model) highlighted(text string) bool {
+	return matchedBy(text, m.settings.Highlights)
+}
+
 // slash reports whether text is "/<name...>" with nothing else, and returns the remainder.
 // It is the one place a client-side command word is compared, so "/fset" and "/set" cannot
 // drift into two behaviours.
@@ -713,20 +738,20 @@ func (m Model) handleAlias(rest string) Model {
 // valueOf reads a setting back for the confirmation line. It is a second switch over the
 // same keys, which is the price of not making the settings table reflective; the test that
 // walks rows() is what keeps the two in step.
+// valueOf reads a setting back for the confirmation line /fset prints.
+//
+// It reads the one table instead of switching on keys a second time. The copy this
+// replaced had fallen behind the newer keys, so "/fset highlight salotto" answered
+// "highlight is now ?" - and a confirmation that lies is worse than none, because it
+// teaches the user to stop reading it. A test caught the drift; having two tables is what
+// made the drift possible, so there is now one, and canonical() is the only place an
+// alias is resolved.
 func valueOf(s Settings, key string) string {
-	switch strings.ToLower(key) {
-	case "timestamps":
-		return onOff(s.Timestamps)
-	case "seconds":
-		return onOff(s.Seconds)
-	case "date_rule", "date_rules", "dates":
-		return onOff(s.DateRule)
-	case "nick_colors", "nick_colours", "colors", "colours":
-		return onOff(s.NickColors)
-	case "hotlist":
-		return onOff(s.Hotlist)
-	case "scroll_step", "scroll":
-		return strconv.Itoa(s.ScrollStep)
+	want := canonical(key)
+	for _, row := range s.rows() {
+		if row.key == want {
+			return row.value
+		}
 	}
 	return "?"
 }
@@ -891,7 +916,12 @@ func (m *Model) append(l Line) {
 	// A preview never counts. It is decoration attached to a message that already
 	// counted, and a channel lighting up because a stranger's title tag loaded slowly
 	// is the cheapest way to make the number untrustworthy.
-	if l.Window != m.active && l.Kind != LineGap && l.Kind != LinePreview {
+	//
+	// A muted nick does not count. The line is still drawn, because hiding it would leave
+	// a channel that looks idle while somebody is addressing you - "why did nobody answer"
+	// is a worse failure than "that person is noisy". Mute suppresses the signal, never
+	// the text.
+	if l.Window != m.active && l.Kind != LineGap && l.Kind != LinePreview && !m.muted(l.Nick) {
 		if m.unread == nil {
 			m.unread = make(map[string]int)
 		}
