@@ -539,10 +539,10 @@ message.
 | W4 | **Search**: cross-channel, with jump-to-context | **in-client half done**: `Model.Search` crosses every window and each hit carries its window, which the browser uses to jump. Linear scan on purpose — in-memory scrollback is bounded by the window caps, so an index has nothing to buy and can disagree with the lines it indexes. The server half (`/v1/log/search`) exists for "find this from last month". Verified live by `probe_public_features.py`. |
 | W5 | **Link previews, done safely** | **done, and now a line rather than a card.** `internal/ui/preview.go` + `preview_ip.go`. Server-side, once per link, only for recent lines in the active window. Refuses private/loopback/link-local/reserved addresses including 169.254.169.254, re-vets every redirect hop, http(s) only, 4 s timeout, 96 KiB cap. A fetched preview arrives as `PreviewReady` and is appended to the window as a `LinePreview`: a terminal has no panels, and putting the card in the scrollback is what gives the SSH and terminal front ends previews too. It never counts as unread and never switches the active window. Mutation-tested: forcing `publicIP` to true fails eight addresses; dropping the fetch fails the delivery test. |
 | W6 | **File uploads** | a separate concern with its own storage, quota and content-type policy; not an IRC feature |
-| W7 | **Push notifications** via Web Push | optional, off by default; requires HTTPS + VAPID keys |
+| W7 | **Push notifications** via Web Push | **done, and verified end to end on the deployment.** PWA manifest + service worker (`internal/ui/assets/`), VAPID keys generated on first boot, subscription store on the front end's own volume, `aes128gcm` encryption written in-repo and pinned to RFC 8291's published test vector (a self-consistent scheme can be wrong in a way that answers 201 and shows nothing), ES256 JWT with `aud` = the push service origin. `/push/notify` requires a bearer token and a missing token is a refusal. The trigger lives in `dispatchRouted`: a mention while **nobody is attached** - a mention with a client watching is a line on screen. Verified live: bob mentioned alice with no client attached, the bouncer logged `push: notification sent`, the front end accepted it. Two bugs found only by running it: `parseMention` insisted on a leading `:` so the notifier was blind on every network that sends message-tags, and the notifier dropped every error silently so a 403 looked like a quiet phone. |
 | W8 | **Typing indicators, mentions, mute, highlight rules** | **mentions done**: word-boundary match on our own nicks, in the transport because it is the only place that knows them. Unread and mention are separate signals (a mention wins in the sidebar; a count would compete with it for the same glance). Verified live. Typing/mute/highlight rules open. |
 | W9 | **Themes, keybinds, per-window settings** | **keybinds done; themes are now the terminal's.** The old browser theme toggle set CSS variables on a page that drew its own panels; with the page reduced to a terminal there are no panels to theme, and colour belongs to the program (lipgloss, 8-bit SGR) and the emulator's palette. Alt-T/J/I/K/C binds still work because bubbletea handles them. Per-window settings open. |
-| W10 | **Admin panel** (see 2.3) | our own, inside the Web UI, not a `webadmin` clone |
+| W10 | **Admin panel** (see 2.3) | **the command surface is done; the panel is not.** `*controlplane` is a second namespace alongside `*status` - client-scoped vs operator-scoped, so the access check that does not exist yet has exactly one place to go: VERSION, RUNTIME, CLIENTS, NETWORKS, USERS, CONFIG, TRAFFICCTL, SCRIPTS, SCRIPTRELOAD, SCRIPTLOG, ADMINHELP, plus deliberate refusals (`SHUTDOWN`: a remote off switch with a friendly name). The OIDC session and the HTML panel remain, blocked on §2.0.2. |
 
 Dependency discipline: the daemon stays Go + `vellum`. The browser client is the
 only place a JS toolchain appears, and it is a build artifact — no runtime JS
@@ -594,6 +594,45 @@ Scope, deliberately small:
   separate cookie domain. That is the whole point of Part 0.3.
 
 ---
+
+## Part 2.4 — Scripting (not in the original queue; asked for and built)
+
+A sandboxed scripting layer, hot-loaded, no restart.
+
+**Starlark, not Python-in-Go.** A Python-in-Go worth the name would have `import os` working
+unless someone remembered to break it, and "someone remembered" is not a sandbox. Starlark has
+no imports, no filesystem, no network, no clock, no `os`, no goroutines - the reachable world is
+exactly what the daemon predeclares, which is `state` and `log`. That list is enumerable in one
+file, and the file is `internal/script/engine.go`.
+
+**Three guarantees, in order of how bad it is to lose them**, each proved by mutating the guard:
+
+1. **No crash.** Every entry into script code is recovered, including a Go-level panic from a
+   buggy builtin - a different failure from a Starlark error, and the one the recover above the
+   call exists for. Removing the inner recover takes the test binary down.
+2. **No hang.** A step budget checked inside Starlark's own interpreter loop stops `while True:
+   pass` in milliseconds, plus a wall-clock deadline that cancels a hook which never reaches a
+   step check. The cost of a wedged hook is one abandoned goroutine, not a wedged daemon.
+3. **No silent failure.** Load errors stay in the list with their message; hook errors go into
+   the same ring `log()` writes to. This one was broken in production and fixed: the error
+   counter was incremented and no command printed it, so `SCRIPTLOG` said "no script output yet"
+   while a hook failed on every seventh line.
+
+**Hot reload is a content hash, polled every two seconds.** Three detectors were wrong before it
+worked, all in the same deployment: the mtime of the *loaded* scripts (can only change after a
+reload), `DirEntry.Info` on a ConfigMap volume (an lstat - it reports the symlink, which never
+changes, while the file behind it is replaced), and mtime+size after `os.Stat` (a swap can land
+in the same clock tick). The bytes are the only thing that means "the script changed", and these
+files are a few hundred bytes. Polling rather than fsnotify for the same ConfigMap reason: an
+inotify watch can end up on a dead inode and then look exactly like "hot reload does not work".
+
+**Verified live**, not just in tests: the demo script was edited in the Flux repo, the ConfigMap
+was swapped by the kubelet, the running daemon reloaded at 03:30:41 with **zero restarts** and
+no dropped upstream, and the new log line appeared. A deliberate `fail()` and then a `while
+True: pass` were both injected, both reported, and the daemon served lines throughout.
+
+Hooks cannot change traffic yet: they are given values and their return value is discarded. A
+first version that can rewrite traffic is a first version whose first bug rewrites traffic.
 
 ## Part 3 — Explicitly refused, with citations
 
