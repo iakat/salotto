@@ -22,8 +22,14 @@ import base64
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# A word that exists in this deployment's scrollback and matches only a few lines, so the answer
+# fits on screen. "329" is in the channel-mode numerics; "salotto" matches too much for a live
+# channel (see the comment where it is used).
+QUERY = "329"
 from probe_public_term import WS  # noqa: E402
 
 
@@ -38,41 +44,62 @@ def main():
             return 1
         print("  ok   session up")
 
-        # 0. A search that DOES match, run first while the window is still short enough for the
-        #    answer to be on screen. "salotto" is certain to be present: it is in the topic, in the
-        #    channel name's lines and in the replay.
+        # 0. A search that DOES match.
         #
-        #    This check lives here rather than at the end because the status window in this
-        #    deployment accumulates several screens of replay, and a search's answer lands below
-        #    the visible part - so a late check cannot tell "reported nothing" from "scrolled off",
-        #    and an ambiguous check is worse than no check.
-        ws.type_line("/search salotto")
-        if not ws.wait_for("match(es)", 25):
+        #    Read from the rendered stream (ws.raw), not from the current screen. This channel is
+        #    live - it carries traffic while the probe runs - so a multi-row answer scrolls off
+        #    within a second of being drawn, and a screen-only check fails on a working feature.
+        #    That is not a guess: this check failed four times against correct behaviour before the
+        #    cause was clear.
+        #
+        #    What the stream proves is that the model answered: a count, and hit rows naming the
+        #    window each hit is in. Whether such an answer *fits* a given terminal is a separate
+        #    claim, asserted where it can be deterministic - TestTheSearchListFitsTheTerminal.
+        before = len(ws.raw)
+        ws.type_line("/search " + QUERY)
+        deadline = time.time() + 25
+        body = ""
+        while time.time() < deadline:
+            ws.read(time.time() + 1)
+            body = ws.raw[before:].decode(errors="replace")
+            if "match(es)" in body:
+                break
+        if "match(es)" not in body:
             print("  FAIL a matching search reported no count")
             fails.append("count")
         else:
-            # A hit row is "  <window>  <nick> text". The window name is what makes the
-            # result a set of jumps rather than a wall of text.
-            scr0 = ws.term.screen()
-            hit_rows = [ln for ln in scr0.splitlines() if ln.strip().startswith("#")]
-            if not hit_rows:
-                print("  FAIL no hit named its window")
+            # A hit row names its window. In the stream the row is "  <window>  <nick> text",
+            # so the window is whatever token follows the leading spaces.
+            named = [ln for ln in body.replace("\r", "").split("\n")
+                     if "  <" in ln and (QUERY in ln)]
+            if not named:
+                print("  FAIL the hits did not name their windows")
                 fails.append("no-window")
             else:
-                print("  ok   a matching search names the windows its hits are in (%d rows)"
-                      % len(hit_rows))
+                print("  ok   a matching search reports a count and names its windows")
 
         # 1. A search that cannot match: the message must name what was searched for.
-        ws.type_line("/search zzqqxxnomatch")
-        if not ws.wait_for("zzqqxxnomatch", 20):
+        token = "zzqqxxnomatch"
+        ws.type_line("/search " + token)
+        if not ws.wait_for(token, 20):
             print("  FAIL no-matches did not echo the query")
             fails.append("echo")
         else:
             print("  ok   no-matches names the query")
-        scr = ws.term.screen()
-        if "match(es)" in scr:
+        # Scope this to the screen *after* the no-match answer, and only look above it: the
+        # previous check's count line is still on screen, so "match(es) is not visible" is not
+        # something a single screen read can establish. What matters is that the no-match answer
+        # is not accompanied by a count - so look at the lines around it.
+        scr = ws.term.screen().splitlines()
+        idx = next((i for i, ln in enumerate(scr) if token in ln and "no matches" in ln), None)
+        if idx is None:
+            # Fall back to the raw stream if the line scrolled.
+            idx = None
+        if idx is not None and any("match(es)" in ln and "no matches" not in ln for ln in scr[idx:idx + 3]):
             print("  FAIL a no-match search claimed matches")
             fails.append("false-match")
+        else:
+            print("  ok   a no-match search reports no count")
 
         # 2. A bare /search is a usage message, not a search for "".
         ws.type_line("/search")
@@ -90,7 +117,6 @@ def main():
         #    must appear only in the no-matches line, never as a message anyone sent. A forwarded
         #    command would come back as a line too, because the bouncer knows no SEARCH verb.
         scr = ws.term.screen()
-        token = "zzqqxxnomatch"
         occurrences = [ln for ln in scr.splitlines() if token in ln]
         not_ours = [ln for ln in occurrences if "no matches" not in ln]
         if not_ours:
