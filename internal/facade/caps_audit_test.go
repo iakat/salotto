@@ -303,3 +303,35 @@ func TestChatHistoryBatchesEvenWhenEmpty(t *testing.T) {
 		t.Fatalf("an empty history produced no batch, so the client cannot tell empty from unheard:\n%q", out)
 	}
 }
+
+// TestChatHistoryFindsAWindowOnTheSecondNetwork is the live bug this test exists for.
+//
+// A bouncer multiplexes, so a bare window name is ambiguous: #salotto can exist on two
+// networks, and the first version of CHATHISTORY looked only at the first network in sorted
+// order. On the real deployment alice's only channel lives on her *second* network, so asking
+// about a window that plainly existed answered 421 - which a client reads as "this bouncer has
+// no history", not "that window is on another network".
+func TestChatHistoryFindsAWindowOnTheSecondNetwork(t *testing.T) {
+	first := newFakeNet("aaa-first")
+	first.add("status", ":srv 001 up :Welcome", time.Now().UnixNano())
+	second := newFakeNet("zzz-second")
+	second.add("#only", ":alice!a@h PRIVMSG #only :second network line", time.Now().UnixNano())
+
+	s, addr := startServer(t, testConfig(first, second))
+	conn, br := dialClient(t, addr)
+	registerWithCaps(t, conn, br, "me", "server-time batch chathistory")
+	collectReplay(t, conn, br)
+	waitFor(t, 3*time.Second, func() bool { return s.Attached() == 1 }, "client attached")
+
+	conn.Write([]byte("CHATHISTORY LATEST #only * 10\r\n"))
+	out := drainFor(t, conn, br, 400*time.Millisecond)
+	if strings.Contains(out, "421") {
+		t.Fatalf("a window on the second network was refused:\n%q", out)
+	}
+	if !strings.Contains(out, "second network line") {
+		t.Fatalf("no history came back for a window that exists on the second network:\n%q", out)
+	}
+	if !strings.Contains(out, "BATCH +chathistory-#only") || !strings.Contains(out, "BATCH -chathistory-#only") {
+		t.Fatalf("the answer was not inside a batch:\n%q", out)
+	}
+}

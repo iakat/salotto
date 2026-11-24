@@ -71,20 +71,23 @@ func (c *client) handleChatHistory(rest []byte) bool {
 		}
 	}
 
-	// Which network: the first in sorted order, the same rule forward() uses. A plain IRC
-	// client has no in-band way to name a network on this connection, and inventing a second
-	// rule for history would mean a client asking for #chan got a different #chan than the
-	// one it sends to.
+	// Which network: the first one that actually holds this window. A bouncer multiplexes,
+	// so a window name alone is ambiguous - two networks can both have #salotto - and the
+	// answer is to serve the one the client asked about rather than to refuse the question.
+	// Refusing was the first version's answer and it was wrong in the common case: a user
+	// whose only channel is on their second network asked about a window that existed and
+	// got 421, which reads as "this bouncer has no history" rather than "that name is on
+	// another network". forward() keeps its first-network rule because a sent line has to
+	// pick one; a read is free to look.
 	var ne *networkEntry
+	var r WindowRing
 	for _, cand := range c.srv.netSnapshot() {
-		ne = cand
-		break
+		if w, ok := cand.net.Window(window); ok {
+			ne, r = cand, w
+			break
+		}
 	}
 	if ne == nil {
-		return c.numeric421("CHATHISTORY")
-	}
-	r, ok := ne.net.Window(window)
-	if !ok {
 		return c.numeric421("CHATHISTORY")
 	}
 
