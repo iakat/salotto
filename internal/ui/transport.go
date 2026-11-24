@@ -933,13 +933,24 @@ func (t *Transport) windowFor(target, from string) string {
 		t.note(target)
 		return target
 	}
-	// A message to us: the window is the other party. Without knowing our own nick
-	// a NOTICE from the server to us and a PM look identical, so anything that is
-	// not a channel is treated as a query window named after the sender.
-	// A server NOTICE never reaches here: handle() routes it to the status window before
-	// this point, which is what keeps "/msg *status help" answering where the user asked.
+	// A private message belongs in the window of the party we are not.
+	//
+	// When the sender is us - our own PM relayed back, which every server does - the window is
+	// the target, not the sender. Filing it under the sender put our own message to alice in a
+	// window named after ourselves: a query window we had never opened, containing our own
+	// half of a conversation with someone else. Seen live, not in a test: the tests drove
+	// incoming messages, and an incoming message is the easy half.
+	//
+	// A server NOTICE never reaches here: handle() routes it to the status window before this
+	// point, which is what keeps "/msg *status help" answering where the user asked.
 	if from == "" {
 		return "status"
+	}
+	if t.isSelf(from) {
+		// The target is a nick and not a channel here, because a channel would have been
+		// answered by the branch above.
+		t.note(target)
+		return target
 	}
 	t.note(from)
 	return from

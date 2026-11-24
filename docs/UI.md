@@ -300,6 +300,46 @@ Adding was the only operation the screen had, so a list could only grow: the sin
 different statements, deliberately still spelled differently. Both go through `Settings.set`, so
 the screen and `/fset` cannot drift into accepting different spellings of the same thing.
 
+## A command is not a message, but a message can be spelled as a command
+
+Two bugs with one cause, both found by driving the real binary rather than by a test.
+
+The first: every submitted line that went to the wire was echoed into the window as a line of
+ours. `/topic a new topic` therefore appeared as the literal text `/topic a new topic`, and a
+moment later the server's confirmation appeared beside it - the command drawn as if it were
+conversation, and the effect reported twice. What a command does is the server's to report; the
+client has no business showing you your own syntax.
+
+The second, found while fixing the first: `/msg alice are you there` drew *nothing at all*. No
+query window opened, no line appeared. The line went out and the only evidence was the relayed
+copy arriving later, in a window nobody had opened. Silence after pressing enter is the worst of
+the available failures - worse than a duplicate, because a duplicate at least tells you what the
+client thinks it did.
+
+So the rule is not "commands are not echoed". It is:
+
+- **A command that changes state is not drawn.** `/topic`, `/mode`, `/kick`: the server reports
+  the effect itself, and drawing the instruction too means seeing it twice.
+- **A command that carries a body is drawn, as its body, in the window it is addressed to.** `/me`
+  is a CTCP ACTION; `/msg` and `/query` open the window of the person being addressed and switch
+  to it, because the next bare line belongs to that person; `/msg #chan hi` draws `hi` in the
+  channel, not the command. What separates them from `/topic` is that they have an addressee and
+  a body, not that they start with a slash.
+- **`/notice` follows the message rule but does not open a window.** A notice addressed to a
+  person is a system line, and a query window containing one timestamp and an OTR handshake is
+  the annoyance ZNC users complain about.
+- **`*status` is never a query.** `/msg *status help` is a request to the bouncer, and
+  retargeting it would both open a bogus window and eat the answer.
+
+`carriesBody` and `retargetWindow` in `internal/ui/model.go` are those last two rules; the echo
+itself still goes through `echoParts`, so a long `/msg` is drawn as the marked parts it will
+become.
+
+The second bug also existed one layer down: the transport filed a private message under its
+*sender*, so our own PM to alice - relayed back by the server, as every server does - landed in a
+window named after ourselves. It is filed under the other party now: when the sender is us, the
+window is the target.
+
 ## What is deliberately not here yet
 
 - **No WebSocket.** W1 replaces the request-per-page part; the render half in

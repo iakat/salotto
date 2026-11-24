@@ -1179,6 +1179,62 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		if text == "" {
 			return m, nil
 		}
+		// A command is not conversation, so it is not drawn as a line of ours.
+		//
+		// Everything that reaches here used to be echoed, which included every command that goes
+		// to the wire: live, "/topic a new topic" appeared in the window as the literal text
+		// "/topic a new topic" and then the server's own confirmation arrived beside it, so the
+		// user saw their command once as noise and the effect twice. What a command does is the
+		// server's to report.
+		//
+		// /me is the exception that proves it: syntactically a command, in fact a message with a
+		// body, sent as a CTCP ACTION and relayed back. Drawing it optimistically is the same
+		// bargain every other message gets; not drawing it would make an action appear a round
+		// trip later than the sentence it belongs to.
+		// /msg is not a command that happens elsewhere: it is a sentence addressed to someone,
+		// so it opens their window and is drawn there. Without this the line went to the wire
+		// and nothing appeared anywhere - silence after pressing enter, which is worse than a
+		// duplicate because there is no wrong line to look at, only an empty window.
+		//
+		// Switching there is what every client does, and it is what makes the next bare line go
+		// to the same person instead of to the channel the user has already left behind.
+		if target, ok := retargetWindow(text); ok && !isStatusTarget(target) {
+			m.append(Line{Window: target, Nick: "me", Text: messageBody(text),
+				Kind: LineMessage, Pending: true, Time: time.Now()})
+			m = m.SetActive(target)
+			m.input = m.input[:0]
+			return m, nil
+		}
+		// A command that is not a message is not drawn as one. This is the rule the duplicate
+		// came from: every command used to be echoed, so "/topic x" showed the command as text
+		// and then the server's confirmation beside it.
+		//
+		// The commands that carry a body are the exception, because they are conversation that
+		// happens to be spelled as a command: /me is a CTCP ACTION, /msg to a channel is a
+		// PRIVMSG to that channel, /notice is a line the user wants to see they sent. What
+		// separates them from /topic is that they have an addressee and a body, not that they
+		// happen to start with a slash.
+		if strings.HasPrefix(text, "/") && !carriesBody(text) {
+			return m, nil
+		}
+		// A command with a body is drawn as the body, because the body is what the addressee
+		// will read. "/msg #chan hello all" puts "hello all" in the channel, not the command:
+		// the command is how the line got there, and nobody wants to read their own syntax
+		// echoed back at them.
+		//
+		// This also covers /notice, whose window is the active one but whose text is still the
+		// message rather than the verb. A bare "/query alice" has no body and draws nothing in
+		// its window, which is right: the request was for the window itself.
+		echo := text
+		if b := actionBody(text); b != "" {
+			// /me takes the whole rest as its body: "/me (waves) at you" is an action about
+			// parentheses, not an action called "(waves)".
+			echo = b
+		} else if carriesBody(text) {
+			if body := messageBody(text); body != "" {
+				echo = body
+			}
+		}
 		// A submitted line is echoed as a line of our own: the model is not the
 		// place that decides whether the transport accepted it, so this is a
 		// local echo and nothing more.
@@ -1206,7 +1262,7 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		if actionBody(text) != "" {
 			kind = LineAction
 		}
-		for _, part := range m.echoParts(text) {
+		for _, part := range m.echoParts(echo) {
 			m.append(Line{Window: m.active, Nick: "me", Text: part, Kind: kind, Pending: true, Time: time.Now()})
 		}
 		m.input = m.input[:0]
@@ -2243,6 +2299,58 @@ func actionBody(text string) string {
 		return ""
 	}
 	return rest
+}
+
+// retargetWindow reports the window a line is addressed to when that is not the active one.
+//
+// Only /msg and /query qualify. /notice has the same shape but a notice addressed to a person is a
+// system line, not a conversation: opening a window for it leaves a query containing a timestamp
+// and an OTR handshake, which is the thing ZNC users complain about and the reason notices stay
+// where they were sent.
+//
+// A channel target is already a window, so it is not retargeted: "/msg #chan hi" behaves like a
+// message to the channel, which is what the person typing it means.
+func retargetWindow(text string) (string, bool) {
+	if !strings.HasPrefix(text, "/") {
+		return "", false
+	}
+	verb, rest, _ := strings.Cut(text[1:], " ")
+	if !strings.EqualFold(verb, "msg") && !strings.EqualFold(verb, "query") {
+		return "", false
+	}
+	target, _, _ := strings.Cut(rest, " ")
+	target = strings.TrimSpace(target)
+	if target == "" || strings.HasPrefix(target, "#") || strings.HasPrefix(target, "&") {
+		return "", false
+	}
+	return target, true
+}
+
+// carriesBody reports whether a command is a message that happens to be spelled as a command,
+// which is a different thing from a command that changes state.
+//
+// /me, /msg and /notice carry text someone will read; /topic, /mode, /kick and the rest carry
+// instructions whose effect the server reports back itself. Drawing the first optimistically is
+// what makes the client feel immediate; drawing the second is what made "/topic x" appear twice.
+func carriesBody(text string) bool {
+	if !strings.HasPrefix(text, "/") {
+		return false
+	}
+	verb, _, _ := strings.Cut(text[1:], " ")
+	switch strings.ToLower(verb) {
+	case "me", "msg", "query", "notice":
+		return true
+	}
+	return false
+}
+
+// messageBody returns what was said in a /msg or /query, which is the text after the target and is
+// what the addressee will see. A bare "/query alice" has no body: the window is the whole request,
+// and drawing an empty line in it would be a message that was never sent.
+func messageBody(text string) string {
+	_, rest, _ := strings.Cut(text[1:], " ")
+	_, body, _ := strings.Cut(rest, " ")
+	return body
 }
 
 // stripAction removes the CTCP wrapper the wire carries, so the window shows the text the
