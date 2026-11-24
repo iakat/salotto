@@ -38,6 +38,7 @@ import (
 
 	"github.com/iakat/salotto/internal/push"
 	"github.com/iakat/salotto/internal/ui"
+	"github.com/iakat/salotto/internal/upload"
 )
 
 var version = "dev"
@@ -56,6 +57,10 @@ func run() int {
 	pushSubject := flag.String("vapid-subject", "mailto:admin@localhost", "contact for the push service")
 	subsPath := flag.String("push-subscriptions", "", "path to the subscription store")
 	pushToken := flag.String("push-token", "", "bearer token /push/notify requires (default: $SALOTTO_PUSH_TOKEN)")
+	uploadDir := flag.String("upload-dir", "", "directory for uploaded files; empty disables uploads")
+	uploadMaxFile := flag.String("upload-max-file", "25MiB", "largest single upload")
+	uploadMaxUser := flag.String("upload-max-user", "500MiB", "total bytes one user may store; 0 for unbounded")
+	uploadTTL := flag.String("upload-ttl", "720h", "how long an upload lives; 0 for never")
 	settingsPath := flag.String("settings", "", "path to the client settings file shared by every browser session (default: $SALOTTO_SETTINGS)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -168,6 +173,30 @@ func run() int {
 
 	term := ui.NewTermServer(cmdFor)
 	handler := ui.TermHandler(term)
+
+	if *uploadDir != "" {
+		limits, err := ui.ParseUploadLimits(*uploadMaxFile, *uploadMaxUser, *uploadTTL)
+		if err != nil {
+			slog.Error("upload limits", "err", err)
+			return 1
+		}
+		uploads, err := upload.New(*uploadDir, limits)
+		if err != nil {
+			slog.Error("upload store", "err", err)
+			return 1
+		}
+		ui.SweepUploads(uploads, time.Hour)
+		// The identity is the nick this front end registers with the bouncer: that is the one
+		// identity the deployment has, and putting it in one place is what lets OIDC replace
+		// it here later without touching the handler.
+		uploadHandler := ui.UploadHandler(uploads, func(*http.Request) string { return *nick })
+		mux := http.NewServeMux()
+		mux.Handle("/uploads/", http.StripPrefix("/uploads", uploadHandler))
+		mux.Handle("/", handler)
+		handler = mux
+		slog.Info("uploads enabled", "dir", *uploadDir,
+			"max_file", limits.MaxFile, "max_user", limits.MaxUser, "ttl", limits.TTL.String())
+	}
 	if pushSrv != nil {
 		// One mux, so /push and the terminal are one origin. A service worker registered from
 		// this page can only control this origin, which is exactly the scope it needs.
