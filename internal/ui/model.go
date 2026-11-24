@@ -10,6 +10,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,17 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// completionState remembers which cycle Tab is on. The key is the word the cycle started from, so
+// that growing the word ("/jo" then "/join") starts a fresh cycle instead of continuing the old one.
+type completionState struct {
+	// prefix is what the user had typed when the cycle started, and cands is the set that prefix
+	// matched. Both are kept because the word on screen changes on every Tab: keying the cycle on
+	// the word would restart it after each completion, and Tab would then appear stuck.
+	prefix string
+	cands  []string
+	idx    int
+}
 
 // Line is one rendered piece of scrollback: a sender and its text, already
 // plain (no ANSI) so the model can style it per front end.
@@ -166,6 +178,17 @@ type Sent struct{ Text string }
 type Model struct {
 	width  int
 	height int
+	// history is every line this client has sent, oldest first, and histPos is where the
+	// up/down arrows are in it. histPos == len(history) means "not browsing": the input line is
+	// whatever the user typed. A saved draft is kept for that state so pressing Up and then Down
+	// again returns the half-typed message rather than erasing it - losing what you were writing
+	// because you looked for an earlier line is the classic way a history feature earns hate.
+	history []string
+	histPos int
+	draft   string
+
+	// completion is where Tab is in its cycle.
+	completion completionState
 
 	windows map[string][]Line
 	active  string
@@ -433,6 +456,10 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if text == "" {
 			return m, nil
 		}
+		// Remember it for the up arrow. Recorded at submit rather than at send, because the
+		// model is where the user's intent exists: a line that then fails to reach the wire is
+		// still a line they typed and will want back to fix.
+		m = m.rememberInput(text)
 		// An alias is expanded before anything is parsed, so "/j #x" and "/join #x" are the
 		// same command with one implementation rather than two.
 		text = m.settings.expand(text, 0)
@@ -492,16 +519,32 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyUp:
+		// Up recalls the last thing you sent in this window, which is what every client does
+		// and what a thumb expects. Scrolling moved to PgUp/PgDn for exactly that reason: the
+		// two cannot share a key, and between "scroll the buffer" and "get my last message
+		// back" only one of them is something a user does a hundred times a session.
+		return m.historyPrev(), nil
+
+	case tea.KeyDown:
+		return m.historyNext(), nil
+
+	case tea.KeyPgUp:
 		if m.scroll < len(m.windows[m.active]) {
-			m.scroll++
+			m.scroll += m.settings.ScrollStep
 		}
 		return m, nil
 
-	case tea.KeyDown:
+	case tea.KeyPgDown:
 		if m.scroll > 0 {
-			m.scroll--
+			m.scroll -= m.settings.ScrollStep
+		}
+		if m.scroll < 0 {
+			m.scroll = 0
 		}
 		return m, nil
+
+	case tea.KeyTab:
+		return m.complete(), nil
 
 	case tea.KeyCtrlC:
 		return m, tea.Quit
@@ -546,6 +589,218 @@ func (m Model) cycle(delta int) Model {
 	}
 	idx = (idx + delta + len(m.order)) % len(m.order)
 	m.active = m.order[idx]
+	m.scroll = 0
+	return m
+}
+
+// complete is Tab: it completes what the cursor is on, cycling through candidates on repeat.
+//
+// Three things can be completed, decided by where the word is rather than by asking the user:
+//
+//   - the first word, if it starts with "/", is a command name (and then a channel for /join);
+//   - a word starting with "#" is a channel;
+//   - anything else after a command's argument position is a nick, because that is the only thing
+//     an argument is likely to be. For a PRIVMSG the first argument is the target (nick or
+//     channel) and the rest is the message, which must never be completed - completing the body of
+//     a sentence would rewrite what the user is saying.
+//
+// Cycles rather than guesses: a second Tab with the same prefix advances to the next candidate,
+// and the cycle is keyed on the word it started from so it cannot drift as the word grows.
+func (m Model) complete() Model {
+	text := string(m.input)
+	// The word under the cursor: from the last space before the cursor to the cursor.
+	start := strings.LastIndexByte(text, ' ') + 1
+	word := text[start:]
+	atStart := start == 0
+
+	if atStart && strings.HasPrefix(word, "/") {
+		cands := m.commandCandidates(word)
+		return m.applyCompletion(text, start, word, cands, word)
+	}
+	if strings.HasPrefix(word, "#") {
+		cands := m.channelCandidates(word)
+		return m.applyCompletion(text, start, word, cands, word)
+	}
+	if atStart {
+		// A bare first word with no slash is a nick to talk to (/query is the explicit form),
+		// but completing it would silently turn "hello" into a nick. Left alone.
+		return m
+	}
+	if !m.completesNicks(text[:start]) {
+		return m
+	}
+	cands := m.nickCandidates(word)
+	return m.applyCompletion(text, start, word, cands, word)
+}
+
+// applyCompletion replaces the word with the next candidate. key identifies the cycle, so that
+// repeated Tab with the same prefix advances while a changed prefix starts over.
+func (m Model) applyCompletion(text string, start int, word string, cands []string, key string) Model {
+	if len(cands) == 0 {
+		m.completion = completionState{}
+		return m
+	}
+	idx := 0
+	// Continuing a cycle is decided by what is on screen, not by what the user has typed since:
+	// after a completion the word *is* the candidate that was just chosen. So a word that is one
+	// of the last cycle's candidates continues that cycle, wherever the cursor is now.
+	if len(m.completion.cands) > 0 && contains(m.completion.cands, word) {
+		cands = m.completion.cands
+		idx = (m.completion.idx + 1) % len(cands)
+	}
+	choice := cands[idx]
+	// Replace the whole token, and swallow anything after the cursor within the word, so a
+	// completion never leaves a tail behind.
+	rest := text[start+len(word):]
+	m.input = []rune(text[:start] + choice + rest)
+	m.completion = completionState{prefix: key, cands: cands, idx: idx}
+	return m
+}
+
+// completesNicks reports whether the word at the cursor is in a nick position for the command
+// already typed. The message body of a PRIVMSG is not, and neither is the text after /msg <target>.
+func (m Model) completesNicks(prefix string) bool {
+	fields := strings.Fields(prefix)
+	if len(fields) == 0 {
+		return false
+	}
+	// A bare word with no command is being typed as a message to the active channel.
+	if !strings.HasPrefix(fields[0], "/") {
+		return false
+	}
+	switch strings.ToLower(fields[0]) {
+	case "/msg", "/query", "/notice", "/whois", "/kick", "/op", "/deop", "/voice", "/invite":
+		// The first argument is a nick or channel; after that it is text.
+		return len(fields) == 1
+	case "/join", "/part", "/topic", "/mode":
+		return false
+	}
+	return false
+}
+
+// modelCommands are the commands this client resolves itself. They are listed here rather than
+// derived from the dispatch because the dispatch is a chain of ifs, not a table, and inventing a
+// table for the benefit of Tab would mean two lists to keep in step - the failure mode the /fset
+// screen already had once.
+var modelCommands = []string{
+	"/alias", "/close", "/fset", "/find", "/go", "/help", "/query", "/search", "/settings",
+}
+
+// wireCommands are passed through to the bouncer with the leading slash stripped. They are listed
+// for completion only: the client does not implement them and must not pretend to.
+var wireCommands = []string{
+	"/adminlog", "/away", "/back", "/cap", "/chathistory", "/deop", "/devoice", "/invite",
+	"/join", "/kick", "/list", "/me", "/mode", "/msg", "/nick", "/notice", "/op", "/part",
+	"/quit", "/topic", "/voice", "/who", "/whois",
+}
+
+func contains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// commandCandidates lists command names starting with the given prefix.
+func (m Model) commandCandidates(prefix string) []string {
+	prefix = strings.ToLower(prefix)
+	var out []string
+	for _, c := range append(append([]string{}, modelCommands...), wireCommands...) {
+		if strings.HasPrefix(c, prefix) {
+			out = append(out, c)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// channelCandidates lists windows whose name starts with the prefix, plus "#" itself so a bare
+// hash can grow into the list.
+func (m Model) channelCandidates(prefix string) []string {
+	var out []string
+	for name := range m.windows {
+		if strings.HasPrefix(name, prefix) {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// nickCandidates lists the nicks known in the active window.
+func (m Model) nickCandidates(prefix string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, n := range m.nicks[m.active] {
+		if n.Name != "" && strings.HasPrefix(n.Name, prefix) && !seen[n.Name] {
+			seen[n.Name] = true
+			out = append(out, n.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// rememberInput appends a submitted line to the history and resets the browse position.
+//
+// A repeat of the line before it is not stored twice: the up arrow doing nothing is a better
+// answer than it producing the same message twice, which reads as a broken key.
+func (m Model) rememberInput(text string) Model {
+	if len(m.history) > 0 && m.history[len(m.history)-1] == text {
+		m.histPos = len(m.history)
+		m.draft = ""
+		return m
+	}
+	m.history = append(m.history, text)
+	// The history is unbounded by design in the sense that it is the client's session, but an
+	// unbounded slice is still a leak on a long-lived session, so it is capped the way the
+	// scrollback is.
+	const maxHistory = 500
+	if len(m.history) > maxHistory {
+		m.history = m.history[len(m.history)-maxHistory:]
+	}
+	m.histPos = len(m.history)
+	m.draft = ""
+	return m
+}
+
+// historyPrev walks back through what was sent. histPos == len(history) is the live input line; the
+// text there is saved as a draft on the way in so historyNext can restore it.
+//
+// The draft is the reason this is not a one-line slice index: a user who types half a message, taps
+// up to check something, and taps down again expects their half-message back, not an empty box.
+func (m Model) historyPrev() Model {
+	if len(m.history) == 0 {
+		return m
+	}
+	if m.histPos == len(m.history) {
+		m.draft = string(m.input)
+	}
+	if m.histPos > 0 {
+		m.histPos--
+	}
+	m.input = []rune(m.history[m.histPos])
+	m.scroll = 0
+	return m
+}
+
+// historyNext walks forward, and past the newest line it restores the draft.
+func (m Model) historyNext() Model {
+	if len(m.history) == 0 {
+		return m
+	}
+	if m.histPos >= len(m.history) {
+		return m
+	}
+	m.histPos++
+	if m.histPos >= len(m.history) {
+		m.input = []rune(m.draft)
+		m.draft = ""
+		return m
+	}
+	m.input = []rune(m.history[m.histPos])
 	m.scroll = 0
 	return m
 }

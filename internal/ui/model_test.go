@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -149,20 +150,25 @@ func TestSubmitEmitsSent(t *testing.T) {
 
 // TestScrollPinsToBottom: a new line must not scroll a reading user, and the
 // status bar must say so.
+//
+// The keys are PgUp/PgDn, not the arrow keys: the arrows now recall what you sent, because a thumb
+// reaching up on a phone means "my last message" far more often than "scroll". The property this
+// test guards is unchanged - reading back through the buffer is stable against new lines, and the
+// offset is stated rather than implied.
 func TestScrollPinsToBottom(t *testing.T) {
 	m := New("status")
 	m, _ = m.Step(tea.WindowSizeMsg{Width: 40, Height: 10})
 	for i := 0; i < 20; i++ {
 		m, _ = m.Step(Incoming{Window: "status", Text: "line"})
 	}
-	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyUp})
-	if m.scroll != 1 {
-		t.Fatalf("scroll = %d, want 1", m.scroll)
+	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyPgUp})
+	if m.scroll != m.settings.ScrollStep {
+		t.Fatalf("scroll = %d, want one step (%d)", m.scroll, m.settings.ScrollStep)
 	}
-	if !strings.Contains(Plain(m.View()), "scroll 1") {
+	if !strings.Contains(Plain(m.View()), "scroll "+strconv.Itoa(m.settings.ScrollStep)) {
 		t.Fatal("status bar does not report the scroll offset")
 	}
-	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyDown})
+	m, _ = m.Step(tea.KeyMsg{Type: tea.KeyPgDown})
 	if m.scroll != 0 {
 		t.Fatalf("scroll = %d, want 0", m.scroll)
 	}

@@ -122,33 +122,40 @@ func TestAnOversizedUploadIsRefusedOverHTTP(t *testing.T) {
 
 // TestADeclaredOversizeIsRefusedBeforeTheBodyArrives pins the clean refusal.
 //
-// Cutting a stream off mid-body protects the disk but punishes the client: the answer arrives
-// while the client is still writing, the connection closes under it, and what the user sees is a
-// network error rather than "file too large". When the client declares its length - which every
-// browser does for a form upload - the refusal can be sent before the body is read, so this asserts
-// that the server answers 413 *without consuming the body*.
+// Cutting a stream off mid-body protects the disk but punishes the client: the answer arrives while
+// the client is still writing, the connection closes under it, and what the user sees is a network
+// error rather than "file too large". When the client declares its length - which every browser does
+// for a form upload - the refusal can be sent before the body is read, so this asserts that the
+// handler answers 413 *without consuming the body*.
+//
+// The handler is called directly rather than through a real socket, and that is deliberate. The
+// first version of this test wrapped the body in a counting reader and let http.Client drive it; the
+// counter then measured the *client transport* pumping bytes into a socket the server had already
+// answered on, so it reported between 1 and 2.8 MB read before a refusal that had in fact happened
+// immediately, and failed intermittently against correct code. A witness that is not the thing you
+// claim to be measuring is not a witness. Here the counting reader is wrapped around a body the
+// handler is handed, so what it records is what the handler asked for and nothing else.
 func TestADeclaredOversizeIsRefusedBeforeTheBodyArrives(t *testing.T) {
-	srv, _ := uploadServer(t, upload.Limits{MaxFile: 1 << 10})
-
-	const total = 8 << 20
-	counter := &countingBody{r: io.LimitReader(zeroReader{}, total)}
-	req, err := http.NewRequest("POST", srv.URL+"/uploads/", counter)
+	store, err := upload.New(t.TempDir(), upload.Limits{MaxFile: 1 << 10})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A form content type, so the handler gets past the method check and reaches the length
-	// guard. The boundary is irrelevant because the body must never be parsed.
-	req.Header.Set("Content-Type", "multipart/form-data; boundary=x")
+	h := UploadHandler(store, func(*http.Request) string { return "alice" })
+
+	const total = 8 << 20
+	counter := &countingBody{r: zeroReader{}}
+	req := httptest.NewRequest("POST", "/uploads/", counter)
 	req.ContentLength = total
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("a declared oversize produced a transport error instead of a refusal: %v", err)
+	// A form content type, so the handler gets past the method check and reaches the length guard.
+	// The boundary is irrelevant because the body must never be parsed.
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=x")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a declared %d byte upload against a 1 KiB limit returned %d, want 413", total, rec.Code)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("a declared %d byte upload against a 1 KiB limit returned %d, want 413", total, resp.StatusCode)
-	}
-	if got := counter.n.Load(); got > 64<<10 {
+	if got := counter.n.Load(); got != 0 {
 		t.Fatalf("%d bytes of the body were read before the refusal; the point is to refuse first", got)
 	}
 }
