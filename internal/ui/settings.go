@@ -1,11 +1,13 @@
 package ui
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,6 +65,18 @@ type Settings struct {
 	// argument to /b. On by default: the numbers are the only stable name a buffer has, and
 	// they cost one column.
 	BufferNumbers bool `json:"buffer_numbers"`
+
+	// unknown holds every key in the document that this build has no field for. It exists
+	// because the settings document is shared: one bouncer blob is fanned out to every client
+	// attached to the account, and those clients are not necessarily the same build. A client
+	// that dropped the keys it did not recognise would delete a newer client's settings the
+	// first time the user pressed a key in the older one - and the older client would look
+	// innocent, because it only ever wrote what it could see.
+	//
+	// Kept as raw JSON rather than as a map of strings so a value of any shape (an object, a
+	// list, a number) round-trips byte for byte: reformatting someone else's key is a change
+	// to it, however faithful the intent.
+	unknown map[string]json.RawMessage
 }
 
 // DefaultSettings is what a new installation gets. The defaults are the ones that make a
@@ -300,13 +314,19 @@ func (s Settings) aliasList() []string {
 //
 // Decoding over the defaults is what makes an older document usable: a client that predates a
 // key keeps the default for it instead of zeroing it, so a setting added by a newer client
-// cannot make an older client's file unreadable and an older blob cannot silently clear a
-// newer client's keys.
+// cannot make an older client's file unreadable.
+//
+// Decoding over defaults was NOT enough to keep a newer client's keys, and this comment used to
+// claim it was. A field the struct does not have is not kept by the decoder - it is dropped by
+// the next marshal - so an older client read a newer blob, changed one boolean, and pushed back
+// a document with every unfamiliar key gone. The keys live in s.unknown now, and token() splices
+// them back.
 func decodeSettings(data []byte) Settings {
 	s := DefaultSettings()
 	if err := json.Unmarshal(data, &s); err != nil {
 		return DefaultSettings()
 	}
+	s.unknown = unknownKeys(data)
 	if s.ScrollStep < 1 {
 		s.ScrollStep = DefaultSettings().ScrollStep
 	}
@@ -344,11 +364,98 @@ func LoadSettings(path string) Settings {
 const maxPrefsToken = (ircline.MaxPrefsBytes+2)/3*4 + 1024
 
 func (s Settings) token() (string, error) {
+	// Marshal the struct, then splice back the keys this build does not know. Doing it this way
+	// round - marshalling our own fields and merging - rather than "marshal the original
+	// document and overwrite what changed" keeps one source of truth for our own keys: the
+	// struct. The merge only ever adds keys, so it cannot resurrect a value we deliberately
+	// wrote as null or empty.
 	data, err := json.Marshal(s)
 	if err != nil {
 		return "", err
 	}
+	if len(s.unknown) > 0 {
+		data, err = withUnknown(data, s.unknown)
+		if err != nil {
+			return "", err
+		}
+	}
 	return base64.StdEncoding.EncodeToString(data), nil
+}
+
+// knownKeys is the set of JSON names this build understands, read off the struct tags.
+//
+// Derived by reflection rather than written out, because a hand-kept list is a second place to
+// update when a field is added and the failure mode of forgetting is invisible: the new field's
+// key would be treated as foreign and round-tripped as opaque, which works until two clients of
+// the same build disagree about which one owns it.
+func knownKeys() map[string]bool {
+	keys := make(map[string]bool)
+	t := reflect.TypeOf(Settings{})
+	for i := 0; i < t.NumField(); i++ {
+		// strings.Cut reports ok=false when there is no comma, which is the ordinary case: a
+		// plain `json:"timestamps"` has no options. Testing ok here instead of the name read
+		// every plain field as untagged and every one of its keys as foreign - which showed up
+		// immediately, as a saved document with "timestamps" and "highlights" in it twice.
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		// A field with no tag, one the tag hides with "-", or an unexported field (which has no
+		// tag at all) is not on the wire.
+		if name == "" || name == "-" || !t.Field(i).IsExported() {
+			continue
+		}
+		keys[name] = true
+	}
+	return keys
+}
+
+// unknownKeys returns the entries of a settings document that this build has no field for.
+func unknownKeys(data []byte) map[string]json.RawMessage {
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return nil
+	}
+	known := knownKeys()
+	out := make(map[string]json.RawMessage)
+	for k, v := range all {
+		if !known[k] {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// withUnknown appends the foreign keys to an encoded document.
+//
+// The splice is textual because json.Marshal returns a single-line object ending in "}": drop
+// that brace, add a comma and the preserved entries, close it again. Going through a generic
+// map instead would re-order and re-indent every key on every save, so a client that only
+// changed one boolean would rewrite the whole document in a different shape - noise in every
+// diff, and a value that changes representation when nobody asked it to.
+func withUnknown(data []byte, unknown map[string]json.RawMessage) ([]byte, error) {
+	keys := make([]string, 0, len(unknown))
+	for k := range unknown {
+		keys = append(keys, k)
+	}
+	// Sorted so the output is stable: two saves of the same settings produce the same bytes,
+	// which is what makes the file difffable and the tests deterministic.
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.Write(data[:len(data)-1]) // the closing brace
+	for _, k := range keys {
+		name, err := json.Marshal(k)
+		if err != nil {
+			return nil, err
+		}
+		b.WriteByte(',')
+		b.Write(name)
+		b.WriteByte(':')
+		b.Write(unknown[k])
+	}
+	b.WriteByte('}')
+	return []byte(b.String()), nil
 }
 
 // SaveSettings writes the settings file. It writes a temporary file and renames it, so a
@@ -357,9 +464,33 @@ func SaveSettings(path string, s Settings) error {
 	if path == "" {
 		return nil
 	}
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return err
+	// The file is the offline copy of the same shared document, so it needs the same forward
+	// preservation the wire does: someone running without a bouncer - a plain IRCd, or a client
+	// that has not connected yet - is exactly who upgrades a build and finds the file written by
+	// the newer one.
+	var data []byte
+	var err error
+	if len(s.unknown) > 0 {
+		// Merge into the compact form first, then indent: indenting a textual splice would
+		// leave the foreign values on one line inside an otherwise indented document.
+		compact, cerr := s.token()
+		if cerr != nil {
+			return cerr
+		}
+		raw, derr := base64.StdEncoding.DecodeString(compact)
+		if derr != nil {
+			return derr
+		}
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, raw, "", "  "); err != nil {
+			return err
+		}
+		data = buf.Bytes()
+	} else {
+		data, err = json.MarshalIndent(s, "", "  ")
+		if err != nil {
+			return err
+		}
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
