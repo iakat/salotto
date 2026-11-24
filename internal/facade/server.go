@@ -1456,7 +1456,7 @@ func (c *client) send(parts ...string) bool {
 		b = append(b, c.label...)
 		needSep = true
 	}
-	if net := c.srv.networkName(); net != "" {
+	if net := c.statusNetwork(); net != "" {
 		if !needSep {
 			b = append(b, '@')
 		}
@@ -1472,6 +1472,27 @@ func (c *client) send(parts ...string) bool {
 	b = append(b, '\r', '\n')
 	c.scratch = b
 	return c.sub.Write(b)
+}
+
+// statusNetwork is the network a line the bouncer writes about itself belongs to.
+//
+// It is the same answer targetNetwork gives for a line that names no window: the first network.
+// Everything the bouncer says on its own behalf - the registration burst, PONG, "not connected
+// upstream" - is about the connection as a whole, not about a channel on one of them, and the
+// first network is where a client is already looking when it starts.
+//
+// networkName() is NOT this: it answers "what do I call the server in 001", and with several
+// networks configured it falls back to the server hostname. Tagging a line with that would file
+// it under a network that does not exist - a heading named after the bouncer, holding the motd.
+//
+// An empty answer means there is no network to attribute the line to, and the line goes out
+// untagged rather than under a fabricated name.
+func (c *client) statusNetwork() string {
+	nets := c.srv.netSnapshot()
+	if len(nets) == 0 {
+		return ""
+	}
+	return nets[0].name
 }
 
 func (c *client) sendBytes(prefix []string, tail []byte) bool {

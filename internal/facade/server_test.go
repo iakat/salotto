@@ -348,6 +348,45 @@ func TestTheRegistrationBurstCarriesTheNetwork(t *testing.T) {
 	}
 }
 
+// TestASelfWrittenLineIsNeverTaggedWithTheServerName: networkName() answers "what do I call this
+// server in 001", and with several networks configured it falls back to the server hostname. Using
+// that for the tag produced a heading named after the bouncer - a network that does not exist -
+// holding the motd, while the real status buffers sat beside it. Seen live, on the deployed client,
+// as "1 salotto-alice..." in a sidebar of ch-test and freebnc.
+//
+// The line is attributed to the first network, the same answer the bouncer already gives for a
+// relayed line that names no window.
+func TestASelfWrittenLineIsNeverTaggedWithTheServerName(t *testing.T) {
+	fn := newFakeNet("libera")
+	_, addr := startServer(t, testConfig(fn))
+	conn, br := dialClient(t, addr)
+
+	lines := register(t, conn, br, "test")
+	if len(lines) == 0 {
+		t.Fatal("registration produced no lines")
+	}
+	serverName := ""
+	for _, line := range lines {
+		if i := strings.Index(line, " 004 "); i >= 0 {
+			serverName = strings.Fields(line[i:])[2]
+		}
+	}
+	if serverName == "" {
+		t.Fatalf("could not read the server name from the 004:\n%s", strings.Join(lines, "\n"))
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "salotto.network="+serverName) {
+			t.Errorf("a line the bouncer wrote about itself is tagged with the server name %q, "+
+				"which is not a network: %q", serverName, line)
+		}
+	}
+	// And the lines are not simply untagged now: that was the bug this replaced.
+	if !strings.Contains(strings.Join(lines, "\n"), "salotto.network=libera") {
+		t.Errorf("no registration line names the network, so a client still cannot file them:\n%s",
+			strings.Join(lines, "\n"))
+	}
+}
+
 func TestReplay(t *testing.T) {
 	fn := newFakeNet("libera")
 	ts := time.Date(2024, 1, 2, 3, 4, 5, 678000000, time.UTC).UnixNano()
