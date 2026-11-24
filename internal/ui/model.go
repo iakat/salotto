@@ -909,7 +909,16 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// A submitted line is echoed as a line of our own: the model is not the
 		// place that decides whether the transport accepted it, so this is a
 		// local echo and nothing more.
-		m.append(Line{Window: m.active, Nick: "me", Text: text, Kind: LineMessage, Pending: true, Time: time.Now()})
+		//
+		// A message long enough to be split on the wire is echoed as the parts it
+		// will become, marked the same way. Echoing it as one line and then watching
+		// three arrive is the client disagreeing with itself about what was said, and
+		// the pending-confirmation match below compares text - so one unmarked echo
+		// would also fail to match any of the echoes coming back and leave the
+		// optimistic line on screen forever beside the real ones.
+		for _, part := range m.echoParts(text) {
+			m.append(Line{Window: m.active, Nick: "me", Text: part, Kind: LineMessage, Pending: true, Time: time.Now()})
+		}
 		m.input = m.input[:0]
 		return m, nil
 
@@ -1815,6 +1824,21 @@ func (m Model) WithSettings(path string) Model {
 	m.settingsPath = path
 	m.settings = LoadSettings(path)
 	return m
+}
+
+// echoParts returns the text of each line the echo should draw, which is one for an ordinary
+// message and the marked parts for one the wire will split.
+//
+// It deliberately mirrors Transport.Send rather than sharing an implementation: the model must
+// not depend on the transport (a local-only Program has none), and the shared piece - the split
+// function and the limit - is what actually has to agree. A test asserts the two produce the
+// same strings so the mirroring cannot drift.
+func (m Model) echoParts(text string) []string {
+	head, body, ok := splitMessage("PRIVMSG " + m.active + " :" + text)
+	if !ok {
+		return []string{text}
+	}
+	return messageParts(head, body, MaxSendBytes)
 }
 
 // confirmPending finds the local echo this line confirms and rewrites it in place.

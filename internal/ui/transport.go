@@ -136,7 +136,48 @@ func (t *Transport) Register(nick, pass string) {
 // Send queues a line for the bouncer. It never blocks the UI: a full queue drops
 // the line and reports it, because a keystroke that freezes the screen is worse
 // than a lost command, and the box is not a place to hide that.
+//
+// A PRIVMSG longer than the wire allows is split here rather than refused, because
+// the alternative is the bouncer cutting it at its line limit and the tail
+// disappearing with no error - QUEUE.md Part 3 item 11 says that is a constraint on
+// us, not an inherited defect. Splitting lives in Send because this is the one
+// function every outgoing line passes through: doing it in Command would miss the
+// lines the model produces, and doing it in both is how they drift.
+//
+// Only PRIVMSG and its CTCP ACTION form are split. A command with a long parameter
+// (a MODE list, a JOIN list) is not a message and has no continuation to mark: the
+// server either takes it or answers with an error, which is information the user
+// needs rather than a split to hide.
 func (t *Transport) Send(line string) {
+	// The continuation marker is a prefix, "(1/3) ", so a reader sees what this is
+	// before reading the text rather than after it. It is part of the message body
+	// because that is the only thing a PRIVMSG carries - there is no out-of-band slot
+	// the other end would render - which is why mIRC and The Lounge both do it this way.
+	// A marker in the text is also why the split must be marked at all: a receiver
+	// seeing "(2/3) " knows a part arrived before it and does not read the sentence as
+	// starting mid-thought.
+	head, body, ok := splitMessage(line)
+	if !ok {
+		t.queue(line)
+		return
+	}
+	// The marker belongs to the body, after "PRIVMSG <target> :", not in front of the
+	// verb: "(1/3) PRIVMSG #c :hi" is not a message with a marker, it is a command called
+	// "(1/3)" that every server rejects. The model/transport agreement test caught exactly
+	// that, and would otherwise have agreed with itself about a wire line no server parses.
+	parts := messageParts(head, body, MaxSendBytes)
+	if len(parts) == 1 {
+		t.queue(line)
+		return
+	}
+	for _, part := range parts {
+		t.queue(head + part)
+	}
+}
+
+// queue is Send without the split, so the split path and the plain path cannot grow
+// different back-pressure behaviour.
+func (t *Transport) queue(line string) {
 	select {
 	case t.outq <- line:
 	default:
