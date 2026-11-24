@@ -1245,12 +1245,47 @@ func (c *client) forward(line []byte) bool {
 	if len(nets) == 0 {
 		return c.notConnected()
 	}
-	if err := nets[0].net.Send(line); err != nil {
+	if err := c.targetNetwork(nets, line).net.Send(line); err != nil {
 		return c.notConnected()
 	}
 	c.attachJoined(line)
 	c.clearOnSpeak(line)
 	return true
+}
+
+// targetNetwork picks the network a line belongs on.
+//
+// The first network is right for anything the bouncer itself answers - a PRIVMSG to a nick,
+// a MODE, a WHOIS - because there is one namespace for those per client. It is wrong for a
+// channel: this bouncer serves several networks, and "#salotto" exists on exactly one of
+// them. Sending to the first network regardless produced "403 No such channel" from the
+// wrong server, live, for a channel the client was looking at.
+//
+// The rule is the mirror of the one CHATHISTORY learned: a line that names a window goes to
+// the network that has the window, and only a line that does not goes to the first one.
+func (c *client) targetNetwork(nets []*networkEntry, line []byte) *networkEntry {
+	_, rest := ircline.Tags(line)
+	_, rest = ircline.Prefix(rest)
+	withWindow := false
+	for _, v := range []string{"PRIVMSG", "NOTICE", "JOIN", "PART", "TOPIC", "MODE", "KICK", "INVITE"} {
+		if ircline.IsVerb(rest, v) {
+			withWindow = true
+			break
+		}
+	}
+	if !withWindow {
+		return nets[0]
+	}
+	name := string(ircline.FirstParam(ircline.Params(rest)))
+	if !strings.HasPrefix(name, "#") && !strings.HasPrefix(name, "&") {
+		return nets[0]
+	}
+	for _, n := range nets {
+		if _, ok := n.net.Window(name); ok {
+			return n
+		}
+	}
+	return nets[0]
 }
 
 // attachJoined attaches a client to the windows a JOIN it sent will create.
