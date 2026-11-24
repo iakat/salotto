@@ -66,6 +66,20 @@ type Settings struct {
 	// they cost one column.
 	BufferNumbers bool `json:"buffer_numbers"`
 
+	// LastWindow is the window this client was looking at, as a window key, empty when it has
+	// no opinion.
+	//
+	// It travels in the settings blob because that is the channel the bouncer already fans out
+	// to every client, and QUEUE item 13 is exactly this: a client that reconnects should land
+	// where it was, not on whatever the model defaults to. It is state rather than a setting,
+	// and it is in here deliberately: the alternative is a second protocol for one string, and
+	// the bouncer is not supposed to parse either.
+	//
+	// It is a hint, not a claim. Two clients attached at once disagree about it by definition -
+	// one is looking at #a and one at #b - so the last client to move wins, and a client that
+	// restores it must tolerate the window no longer existing.
+	LastWindow string `json:"last_window"`
+
 	// unknown holds every key in the document that this build has no field for. It exists
 	// because the settings document is shared: one bouncer blob is fanned out to every client
 	// attached to the account, and those clients are not necessarily the same build. A client

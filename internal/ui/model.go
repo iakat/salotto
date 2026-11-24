@@ -458,6 +458,11 @@ type Model struct {
 
 	// settingsRow is the selected row on the settings screen.
 	settingsRow int
+	// windowChosen is whether anything has moved this client off its opening window - the user
+	// switching, a click, or our own JOIN. It is what lets an adopted blob put a fresh client
+	// where the last one left off without dragging a client that is already somewhere else.
+	windowChosen bool
+
 	// settingsEdit holds the text being typed into a rule row, and settingsEditing is whether
 	// the screen is in that state.
 	//
@@ -728,12 +733,34 @@ func (m Model) SetActive(name string) Model {
 	// a number: leaving this unset would give a clickable buffer no /b number.
 	m.assignBuffer(name)
 	m.active = name
+	m.windowChosen = true
 	m.scroll = 0
 	// Looking at a window is the only thing that clears it: not reading it, not
 	// scrolling it, just having it open.
 	delete(m.unread, name)
 	delete(m.mention, name)
+	m.rememberWindow()
 	return m
+}
+
+// rememberWindow records the window being looked at in the settings blob, so a client that
+// reconnects - or a second client that connects - opens where the last one left off.
+//
+// It writes the model's own state and pushes nothing: SetActive is called by /go, by /b, by a
+// click and by the arrival of our own JOIN, and pushing from here would put a PREF SET on the
+// wire for every window switch. The push happens with the next real settings change, which is
+// the granularity a user can reason about - "my settings sync" rather than "my scrolling syncs".
+func (m *Model) rememberWindow() {
+	// Called only from SetActive, which is the act of choosing: a client sitting on the window it
+	// started on never gets here, so its startup window is never written over where a real user
+	// was. The empty check is the case of a model built before any window is known.
+	if m.active == "" || m.settings.LastWindow == m.active {
+		return
+	}
+	m.settings.LastWindow = m.active
+	if m.settingsPath != "" {
+		m.saveSettings()
+	}
 }
 
 // noteNetwork records which network a window is on, ignoring an empty answer.
@@ -1115,6 +1142,20 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.settings = decodeSettings(msg.Data)
+		// The window the last client was looking at, restored now that the blob is known.
+		// It is resolved through SetActive, which means a window that no longer exists is
+		// created rather than guessed at, and an empty value simply leaves the model where it
+		// is - the honest behaviour for a bouncer that holds no opinion.
+		//
+		// Deliberately not adopted sideways: if this client is already looking at something,
+		// that is the user's current intent and it wins. The blob describes where someone was,
+		// not where this one must go.
+		if m.settings.LastWindow != "" && !m.windowChosen {
+			// The key, not winName(key): the key is what carries the network, and stripping it
+			// would restore the window into the ungrouped section. SetActive accepts a key as
+			// well as a name for exactly this case.
+			m = m.SetActive(m.settings.LastWindow)
+		}
 		return m, nil
 
 	case Sent:

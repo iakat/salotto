@@ -178,6 +178,28 @@ saying the same thing twice, and dropping it is the silent loss this package ref
 covers the last 512 lines of a window, which is bounded work per line and still correct, because a
 replay cannot be longer than the ring.
 
+## The window you were in is a setting
+
+A refresh should not land you on `status`. The window a client is looking at travels in the
+settings blob as `last_window`, a window key, so the bouncer carries it the way it carries every
+other setting - opaquely, fanning it out and persisting it - and no second protocol is needed for
+one string.
+
+Three rules make it safe with more than one client attached:
+
+- **Only a client that has not chosen a window adopts it.** A fresh client opens on its default
+  window, which is an artefact of startup. If being restored counted as a choice, a second tab or a
+  phone connecting would write its default over where the user actually was, and "resume where you
+  left off" would become "resume wherever the last thing to connect happened to default to".
+- **A client already somewhere is not dragged back.** Two clients attached at once disagree about
+  the active window by definition; moving the other one would yank the tab the user is reading.
+- **An empty value is an opinion too**, and it means the bouncer holds none: the client stays
+  where it is rather than guessing.
+
+The stored value is a key, so it carries its network and a window on a second network restores into
+the right group. A key this client has never seen a line in is created rather than refused - the
+blob and the replay arrive in either order, and the lines are about to land in it.
+
 ## Settings you can edit where you read them
 
 The settings screen is a mode over the conversation, and for a while it was a read-only summary:
