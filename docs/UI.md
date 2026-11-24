@@ -152,24 +152,31 @@ registration, so a naive reconnect re-receives everything the client already hol
 scrollback grows by the size of the ring on every reconnect - measured: 3 lines in, 3 replayed,
 6 on screen.
 
-The honest fix is a per-line sequence number. The daemon already computes one per window
-(`winring.Set.Append`) and does not put it on the wire yet, so until it does the client
-reconciles the replay against the tail of the window. Two properties are load-bearing:
+The marker is the bouncer's own tag: a replayed line arrives inside a `BATCH +/-replay` group and
+carries `batch=<id>`, and no live line does. That is a fact about the line, which is the only
+kind of fact that survives here. Two earlier versions of this were wrong in ways worth recording:
 
-- **The timestamp is not part of a line's identity.** A live line's `time` tag is stamped when
-  the bouncer fans it out; a replayed line's comes out of the ring where it was stamped when
-  buffered. Two clock reads. Measured against the real daemon: `17.242` live, `17.241` replayed,
-  *same message*. A time-based comparison fails for every line, and it fails invisibly in unit
-  tests whose fixture reuses one timestamp - a live probe is what found it.
-- **It is a multiset, not a set.** If the window holds two `ok` from alice and the replay
-  delivers three, the third is drawn, because alice did say it three times and the client lost
-  one while it was away. A plain set silently eats a message the user never saw, which is worse
-  than repeating one they did.
+- **Ordering is not the marker.** The first version turned suppression on at a reconnect and off
+  at 376, assuming the registration burst ends after the replay. A probe against a built daemon
+  read `376` at line 8 and the first `BATCH +replay` at line 9, so the window was shut before a
+  single replayed line arrived - deduplication was dead code in production and green in tests
+  that placed `ReplayFinished` wherever they liked.
+- **The timestamp is not the marker.** A live line's `time` tag is stamped when the bouncer fans
+  it out; a replayed line's comes out of the ring where it was stamped when buffered. Two clock
+  reads: `17.242` live against `17.241` replayed for the *same message*. A time-based comparison
+  fails for every line, invisibly, whenever the fixture reuses one timestamp.
 
-Suppression is on only between the reconnect and the end of the registration burst (376), never
-on live traffic: a live line is new by definition, and dropping one is exactly the silent loss
-this package refuses. The duplicate check searches only the last 512 lines of a window, which is
-bounded work per line and still correct, because a replay cannot be longer than the ring.
+Identity within a batch is nick, verb and text in one window, and it is a multiset: the first
+`baseline` copies a batch delivers are the ones already on screen, and anything past that count is
+news the client missed while it was away. The baseline is fixed when the batch starts and not
+recomputed per line - recomputing counts the copies the batch itself has drawn, which measured as
+"a batch of three over a window holding one left two". The counter is per batch, so a second
+replay reconciles from scratch instead of drawing one extra copy of everything.
+
+A live line is never compared, because the bouncer never tags one: an untagged repeat is a server
+saying the same thing twice, and dropping it is the silent loss this package refuses. The search
+covers the last 512 lines of a window, which is bounded work per line and still correct, because a
+replay cannot be longer than the ring.
 
 ## Settings you can edit where you read them
 

@@ -529,12 +529,22 @@ func (t *Transport) handle(raw []byte) {
 	// server's hostname) would put every such window under a heading that means nothing. The
 	// model treats "" as "not told" and draws those windows ungrouped.
 	network := ircline.TagText(ircline.TagValue(tags, []byte(ircline.TagNetwork)))
+	// A batch tag is how the bouncer says "this is history, not news": every replayed line is
+	// delivered inside `BATCH +/-replay ...` and carries `batch=<id>`, and no live line does.
+	// This is a fact on the wire rather than an inference from ordering, which the live probe
+	// proved matters: the bouncer sends 376 *before* the replay, so a client that decided "the
+	// replay is over at 376" closed its duplicate check before a single replayed line arrived.
+	batch := ircline.TagText(ircline.TagValue(tags, []byte("batch")))
 	push := func(l Line) {
 		if l.Time.IsZero() {
 			l.Time = stamp
 		}
 		if l.Network == "" {
 			l.Network = network
+		}
+		if batch != "" {
+			l.Replayed = true
+			l.Batch = batch
 		}
 		t.noteNetwork(l.Window, l.Network)
 		t.push(Incoming(l))
@@ -871,9 +881,6 @@ func (t *Transport) handle(raw []byte) {
 	// replay window the model opened on Reconnecting has to close here rather than on a timer.
 	// A timer would either cut a slow replay short (dropping lines as "seen" that are not) or
 	// keep the window open into live traffic (dropping the first repeated sentence).
-	if verb == "376" {
-		t.push(ReplayFinished{})
-	}
 	if verb == "001" && !t.prefsAsked {
 		t.prefsAsked = true
 		t.Send("PREF GET")

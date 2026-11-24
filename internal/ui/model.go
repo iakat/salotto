@@ -59,6 +59,24 @@ type Line struct {
 	// set by the transport, which is the only place that knows which nicks are ours.
 	Own bool
 
+	// Replayed marks a line the bouncer replayed out of a buffer rather than delivered live,
+	// which it says with a `batch` tag.
+	//
+	// Without it the client has to guess, and every guess is wrong: the time tag differs by a
+	// millisecond between the live copy and the replayed one (two clock reads), and the
+	// registration burst does not end before the replay - the live probe against the real
+	// daemon found 376 arriving at line 8 with the first replay batch at line 9. A line that
+	// says so itself is the only version of this that survives contact with the daemon.
+	Replayed bool
+
+	// Batch is the id of the replay batch this line arrived in, empty for a live line.
+	//
+	// The duplicate counter is per batch, because a batch is exactly the set of lines the
+	// bouncer decided to re-deliver in one go: two batches replaying the same message are two
+	// separate statements about it, while within one batch the second copy of a line the client
+	// did not hold before is the bouncer saying "you missed this".
+	Batch string
+
 	// Pending marks a local echo: the line the user just typed, shown before the
 	// bouncer has confirmed it. The bouncer echoes our own PRIVMSG back (that is what
 	// a bouncer is for - a second client must see it), so without this flag every
@@ -220,15 +238,6 @@ type Reconnecting struct{}
 // disconnected forever, because nothing else ever set that flag back.
 type Registered struct{}
 
-// ReplayFinished reports that the bouncer has sent everything it held: the end of the
-// registration burst, which is 376 (end of MOTD) on this bouncer because it sends its ring
-// before the MOTD ends.
-//
-// After it, duplicate suppression stops. Keeping it on would compare every live line against
-// the buffer, and the first person to repeat a sentence someone said a minute ago would have
-// their line silently dropped - the exact class of bug this package exists to avoid.
-type ReplayFinished struct{}
-
 // ReconnectFailed reports an attempt that could not even open a socket.
 //
 // It is separate from Reconnecting because the two mean different things to a user: "trying
@@ -252,10 +261,19 @@ type ReconnectFailed struct {
 // What is left is what a reader would call "the same line written twice": the same person, the
 // same words, the same kind of line, in the same window.
 type replayKey struct {
+	batch  string
 	window string
 	nick   string
 	text   string
 	kind   LineKind
+}
+
+// replayCount is how a batch is reconciled against what the window already held.
+type replayCount struct {
+	// baseline is the number of copies the window held when the batch started.
+	baseline int
+	// seen is how many copies the batch has delivered so far.
+	seen int
 }
 
 // replaySeenWindow is how many trailing lines of a window a replayed line is looked for in.
@@ -275,27 +293,37 @@ const replaySeenWindow = 512
 // did.
 func (m *Model) replayDuplicate(window string, l Line) bool {
 	lines := m.windows[window]
-	key := replayKey{window: window, nick: l.Nick, text: l.Text, kind: l.Kind}
+	key := replayKey{batch: l.Batch, window: window, nick: l.Nick, text: l.Text, kind: l.Kind}
+	if m.replaySeen == nil {
+		m.replaySeen = make(map[replayKey]replayCount)
+	}
 
-	// How many copies of this line the window already holds, considering only the tail a replay
-	// can possibly reach.
-	held := 0
-	for i := len(lines) - 1; i >= 0 && i >= len(lines)-replaySeenWindow; i-- {
-		have := lines[i]
-		if have.Nick == l.Nick && have.Text == l.Text && have.Kind == l.Kind {
-			held++
+	// The baseline is how many copies the window held *when this batch started*, and it has to
+	// be recorded on the first line of the batch rather than recomputed per line: every copy the
+	// batch draws becomes part of the window, so a recount would measure the second copy against
+	// a window that now contains the first and suppress the third. That was a real bug - a batch
+	// of three over a window holding one left two.
+	c, started := m.replaySeen[key]
+	if !started {
+		held := 0
+		for i := len(lines) - 1; i >= 0 && i >= len(lines)-replaySeenWindow; i-- {
+			have := lines[i]
+			if have.Nick == l.Nick && have.Text == l.Text && have.Kind == l.Kind {
+				held++
+			}
 		}
+		c.baseline = held
 	}
-	if held == 0 {
+	if c.baseline == 0 {
 		return false
 	}
-	// Copies this replay has already delivered. The first `held` of them are the ones that were
-	// already on screen; anything past that count is new information.
-	seen := m.replaySeen[key]
-	if seen >= held {
+	// The first `baseline` copies this batch delivers are the ones already on screen; anything
+	// past that count is news the client missed while it was away.
+	if c.seen >= c.baseline {
 		return false
 	}
-	m.replaySeen[key] = seen + 1
+	c.seen++
+	m.replaySeen[key] = c
 	return true
 }
 
@@ -349,14 +377,10 @@ type Model struct {
 	// reconnectAt is when the last failed attempt was reported, for the same reason: an outage
 	// of a minute is a handful of attempts and only the first needs saying.
 	reconnectAt time.Time
-	// replaying is true while the bouncer is replaying its ring after a reconnect. Only then
-	// are duplicate lines suppressed: a live line is new by definition, and dropping one would
-	// be the silent loss this whole package refuses.
-	replaying bool
 	// replaySeen counts, per line identity, how many copies the current replay has delivered.
 	// It is how a multiset reconciliation stays honest when the same line legitimately appears
 	// more than once - see replayDuplicate.
-	replaySeen map[replayKey]int
+	replaySeen map[replayKey]replayCount
 
 	// historyAsked is set once a request for older history is outstanding, so holding the
 	// PgUp key does not send one CHATHISTORY per repeat to an empty log.
@@ -891,20 +915,14 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		m.status = ""
 		return m, nil
 
-	case ReplayFinished:
-		m.replaying = false
-		return m, nil
-
 	case Reconnecting:
 		// After a disconnect the transport retries on its own; say so once, in place of the
 		// disconnect notice, so the user knows the line was not dropped for good.
 		//
-		// The replay window opens here and closes when the bouncer says it is done replaying
-		// (376, end of MOTD, which the bouncer sends after its replay): everything the server
-		// says on registration is either the ring it is re-showing us or genuine news, and the
-		// duplicate check is what tells them apart.
-		m.replaying = true
-		m.replaySeen = make(map[replayKey]int)
+		// A fresh replay counter, because a new connection is a new conversation about what the
+		// client holds. What marks a line as replayed is the bouncer's batch tag, not this
+		// counter - see Line.Replayed.
+		m.replaySeen = make(map[replayKey]replayCount)
 		if !m.reconnectShown {
 			m.reconnectShown = true
 			m.append(Line{Window: "status", Text: "reconnecting...", Kind: LineSystem, Time: time.Now()})
@@ -1042,7 +1060,10 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// A reconnect makes the bouncer replay its ring, and the client already holds those
 		// lines. Dropping the ones it already has is what keeps a reconnect from doubling the
 		// scrollback - see replayDuplicate for why the comparison is exact and bounded.
-		if m.replaying && m.replayDuplicate(line.Window, line) {
+		// A replayed line is compared against what the window already holds; a live line never
+		// is. The flag comes from the wire (the bouncer's batch tag), not from a guess about
+		// where in the registration burst the client is - see Line.Replayed.
+		if line.Replayed && m.replayDuplicate(line.Window, line) {
 			return m, nil
 		}
 		// Our own line coming back from the bouncer confirms the pending echo instead of

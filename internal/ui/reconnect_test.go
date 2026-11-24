@@ -43,18 +43,20 @@ func TestAReplayedLineIsNotDrawnTwice(t *testing.T) {
 	}
 
 	// The connection drops and comes back: the bouncer replays the ring, which is the same
-	// line with the same timestamp, because the daemon stamped it when it buffered it.
+	// line, tagged as part of a batch because that is how the bouncer says "this is history".
 	m = step(t, m, Disconnected{})
 	m = step(t, m, Reconnecting{})
 
-	m = step(t, m, Incoming(first))
+	replay := first
+	replay.Replayed = true
+	replay.Batch = "testnet-#salotto-replay"
+	m = step(t, m, Incoming(replay))
 	if got := lineCount(m, "#salotto"); got != 1 {
 		t.Fatalf("a replayed line was drawn again: the window holds %d line(s), want 1", got)
 	}
 
-	// And a line that arrives after the replay is still drawn: suppression must not leak into
-	// live traffic, or the client would silently eat messages.
-	m = step(t, m, ReplayFinished{})
+	// And a live line is still drawn: the bouncer does not tag live lines, so the check cannot
+	// leak into live traffic and eat a message.
 	m = step(t, m, Incoming(Line{Window: "#salotto", Nick: "alice", Text: "hello", Kind: LineMessage, Time: at.Add(time.Second)}))
 	if got := lineCount(m, "#salotto"); got != 2 {
 		t.Fatalf("a live line after the replay was dropped: the window holds %d line(s), want 2", got)
@@ -95,7 +97,7 @@ func TestATimestampIsNotPartOfALineIdentity(t *testing.T) {
 
 	// The replay carries the ring's stamp, which is a millisecond earlier than the fan-out
 	// stamp the first copy got.
-	m = step(t, m, Incoming(Line{Window: "#salotto", Nick: "alice", Text: "hello", Kind: LineMessage, Time: at.Add(-time.Millisecond)}))
+	m = step(t, m, Incoming(Line{Window: "#salotto", Nick: "alice", Text: "hello", Kind: LineMessage, Time: at.Add(-time.Millisecond), Replayed: true, Batch: "b1"}))
 	if n := lineCount(m, "#salotto"); n != 1 {
 		t.Fatalf("the window holds %d line(s); a replay with the ring's timestamp was drawn again", n)
 	}
@@ -116,9 +118,11 @@ func TestAReplayNeverEatsARealRepeat(t *testing.T) {
 	m = step(t, m, Disconnected{})
 	m = step(t, m, Reconnecting{})
 
-	// Three copies arrive; the client held two, so exactly one is new.
+	// Three copies arrive in one batch; the client held two, so exactly one is new.
 	for i := 1; i <= 3; i++ {
-		m = step(t, m, Incoming(ln(i*10))) // different timestamps: the ring restamped them
+		l := ln(i * 10) // different timestamps: the ring restamped them
+		l.Replayed, l.Batch = true, "b1"
+		m = step(t, m, Incoming(l))
 	}
 	if n := lineCount(m, "#salotto"); n != 3 {
 		t.Fatalf("the window holds %d line(s) after replaying three copies over two held, want 3", n)
@@ -147,7 +151,9 @@ func TestAReplayOfADifferentLineIsKept(t *testing.T) {
 	// itself. The question that matters here is the branch, not the arithmetic.
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := step(t, m, Incoming(tc.line))
+			in := tc.line
+			in.Replayed, in.Batch = true, "b1"
+			got := step(t, m, Incoming(in))
 			if !holdsLine(got, "#salotto", tc.line) {
 				t.Fatalf("a replayed line that differs was dropped as a duplicate")
 			}
@@ -155,28 +161,65 @@ func TestAReplayOfADifferentLineIsKept(t *testing.T) {
 	}
 }
 
-// TestTheReplayWindowClosesOnEndOfRegistration.
+// TestALiveLineIsNeverComparedWithoutTheBouncerSayingSo.
 //
-// If ReplayFinished did nothing, the duplicate check would stay on for the life of the
-// connection and eat live lines. If it closed on the first line instead, a slow replay would
-// be cut short and its tail duplicated.
-func TestTheReplayWindowClosesOnEndOfRegistration(t *testing.T) {
+// The suppression used to key on a window opened at reconnect and closed at 376. The live probe
+// against the real daemon showed 376 arriving at line 8 with the first replay batch at line 9 -
+// so the window was already shut when the replay landed and the deduplication did nothing in
+// production while its unit tests passed. The marker is now the bouncer's own batch tag, and
+// this test is the guard: an untagged line identical to one already held is drawn, every time.
+func TestALiveLineIsNeverComparedWithoutTheBouncerSayingSo(t *testing.T) {
 	m := replayModel(t)
 	at := time.Now()
 	ln := Line{Window: "#salotto", Nick: "alice", Text: "hi", Kind: LineMessage, Time: at}
 	m = step(t, m, Incoming(ln))
 	m = step(t, m, Reconnecting{})
-	if !m.replaying {
-		t.Fatal("a reconnect did not open the replay window")
-	}
-	m = step(t, m, ReplayFinished{})
-	if m.replaying {
-		t.Fatal("end of registration did not close the replay window")
-	}
-	// After it closes, an identical line is drawn: it is a real repeat, not a replay.
+	// Untagged: the bouncer is delivering news, not history.
 	m = step(t, m, Incoming(ln))
 	if got := lineCount(m, "#salotto"); got != 2 {
-		t.Fatalf("the window holds %d line(s) after a genuine repeat, want 2", got)
+		t.Fatalf("the window holds %d line(s); an untagged line was suppressed as a replay", got)
+	}
+}
+
+// TestABatchReconcilesTheWindowToWhatTheBouncerHolds.
+//
+// The point of the whole mechanism, stated as one property: after a batch, the window holds as
+// many copies of a line as the larger of (what the client held, what the batch delivered).
+// Fewer is silent loss of something the user never saw; more is the doubled scrollback the
+// reconnect was supposed to fix.
+//
+// The counter is per batch, and that is load-bearing rather than tidy: without the batch in the
+// key, a second replay of the same lines would see its predecessor's counts and draw one extra
+// copy of a line the client already had.
+func TestABatchReconcilesTheWindowToWhatTheBouncerHolds(t *testing.T) {
+	// A batch of one over a window holding one: nothing to add.
+	m := replayModel(t)
+	at := time.Now()
+	one := Line{Window: "#salotto", Nick: "alice", Text: "hi", Kind: LineMessage, Time: at, Replayed: true, Batch: "b1"}
+	m = step(t, m, Incoming(one))
+	if got := lineCount(m, "#salotto"); got != 1 {
+		t.Fatalf("a batch of one over an empty window drew %d line(s), want 1", got)
+	}
+	again := one
+	again.Batch = "b2"
+	m = step(t, m, Incoming(again))
+	if got := lineCount(m, "#salotto"); got != 1 {
+		t.Fatalf("a second batch replaying the same line drew %d line(s), want 1", got)
+	}
+
+	// A batch of three over a window holding one: two of them are news.
+	m2 := replayModel(t)
+	at2 := time.Now()
+	base := Line{Window: "#other", Nick: "alice", Text: "ok", Kind: LineMessage, Time: at2}
+	m2 = step(t, m2, Incoming(base))
+	for i := 0; i < 3; i++ {
+		l := base
+		l.Time = at2.Add(time.Duration(i) * time.Millisecond)
+		l.Replayed, l.Batch = true, "b1"
+		m2 = step(t, m2, Incoming(l))
+	}
+	if got := lineCount(m2, "#other"); got != 3 {
+		t.Fatalf("a batch of three over a window holding one left %d line(s), want 3", got)
 	}
 }
 
@@ -360,5 +403,55 @@ func TestAnAttemptThatCannotOpenASocketIsAnnounced(t *testing.T) {
 		case <-deadline:
 			t.Fatal("a refused attempt was never reported")
 		}
+	}
+}
+
+// TestTheReplayIsRecognisedEvenThoughTheBouncerEndsTheMotdFirst.
+//
+// This is the live probe's finding, kept as a test. The client used to turn its duplicate
+// suppression on at a reconnect and off at 376, on the assumption that the registration burst
+// ends after the replay. The real daemon does the opposite: a probe against a built salottod read
+// `376` at line 8 and the first `BATCH +replay` at line 9, so the window was already closed when
+// every replayed line arrived. Deduplication was dead code in production and green in unit tests,
+// because the tests put ReplayFinished wherever they wanted it.
+//
+// Nothing here mentions 376 or ordering: the marker is the bouncer's batch tag, which is a fact
+// about the line rather than an inference about the stream.
+func TestTheReplayIsRecognisedEvenThoughTheBouncerEndsTheMotdFirst(t *testing.T) {
+	m := replayModel(t)
+	at := time.Now()
+	ln := Line{Window: "#salotto", Nick: "alice", Text: "hello", Kind: LineMessage, Time: at}
+	m = step(t, m, Incoming(ln))
+
+	// The registration burst, in the order the real daemon sends it: 001, 376, then the replay.
+	m = step(t, m, Disconnected{})
+	m = step(t, m, Reconnecting{})
+	m = step(t, m, Registered{})
+
+	replay := ln
+	replay.Time = at.Add(-time.Millisecond) // the ring's stamp, not the fan-out one
+	replay.Replayed = true
+	replay.Batch = "testnet-#salotto-replay"
+	m = step(t, m, Incoming(replay))
+
+	if got := lineCount(m, "#salotto"); got != 1 {
+		t.Fatalf("the window holds %d line(s); a replayed line arriving after 376 was drawn again", got)
+	}
+}
+
+// TestAPlainServerSReplayIsStillLiveTraffic.
+//
+// A client attached to a plain IRCd sees no batch tags at all, and must behave exactly as before
+// this code existed: every line drawn. This is the negative control that keeps the feature from
+// turning into "suppress lines that look familiar", which would lose messages on a server that
+// has no idea what a replay is.
+func TestAPlainServerSReplayIsStillLiveTraffic(t *testing.T) {
+	m := replayModel(t)
+	at := time.Now()
+	ln := Line{Window: "#salotto", Nick: "alice", Text: "hello", Kind: LineMessage, Time: at}
+	m = step(t, m, Incoming(ln))
+	m = step(t, m, Incoming(ln)) // identical, untagged: a server repeating itself
+	if got := lineCount(m, "#salotto"); got != 2 {
+		t.Fatalf("the window holds %d line(s), want 2: an untagged repeat was suppressed", got)
 	}
 }
