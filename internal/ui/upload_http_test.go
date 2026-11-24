@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/iakat/salotto/internal/upload"
@@ -119,6 +120,49 @@ func TestAnOversizedUploadIsRefusedOverHTTP(t *testing.T) {
 	}
 }
 
+// TestADeclaredOversizeIsRefusedBeforeTheBodyArrives pins the clean refusal.
+//
+// Cutting a stream off mid-body protects the disk but punishes the client: the answer arrives
+// while the client is still writing, the connection closes under it, and what the user sees is a
+// network error rather than "file too large". When the client declares its length - which every
+// browser does for a form upload - the refusal can be sent before the body is read, so this asserts
+// that the server answers 413 *without consuming the body*.
+func TestADeclaredOversizeIsRefusedBeforeTheBodyArrives(t *testing.T) {
+	srv, _ := uploadServer(t, upload.Limits{MaxFile: 1 << 10})
+
+	const total = 8 << 20
+	counter := &countingBody{r: io.LimitReader(zeroReader{}, total)}
+	req, err := http.NewRequest("POST", srv.URL+"/uploads/", counter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A form content type, so the handler gets past the method check and reaches the length
+	// guard. The boundary is irrelevant because the body must never be parsed.
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=x")
+	req.ContentLength = total
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("a declared oversize produced a transport error instead of a refusal: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a declared %d byte upload against a 1 KiB limit returned %d, want 413", total, resp.StatusCode)
+	}
+	if got := counter.n.Load(); got > 64<<10 {
+		t.Fatalf("%d bytes of the body were read before the refusal; the point is to refuse first", got)
+	}
+}
+
+// zeroReader is an infinite supply of zeros, so the body is never materialised in the test.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
 // TestAnOversizedBodyIsNotReadToTheEnd pins the *request*-level limit, which is a different guard
 // from the store's streamed one and needs its own test.
 //
@@ -157,7 +201,7 @@ func TestAnOversizedBodyIsNotReadToTheEnd(t *testing.T) {
 	if err != nil {
 		// The server closing the connection mid-body is also a refusal; what must not happen
 		// is a clean transfer of the whole thing.
-		if counter.n < int64(total) {
+		if counter.n.Load() < int64(total) {
 			return
 		}
 		t.Fatalf("the whole %d byte body was transferred despite the limit", total)
@@ -166,20 +210,24 @@ func TestAnOversizedBodyIsNotReadToTheEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("an 8 MiB upload against a 1 KiB limit returned %d", resp.StatusCode)
 	}
-	if counter.n >= int64(total) {
+	if counter.n.Load() >= int64(total) {
 		t.Fatalf("the server read all %d bytes before refusing: the limit was applied after the body, not during it", total)
 	}
 }
 
 // countingBody reports how much of a request body the transport actually consumed.
+//
+// The counter is atomic because it is written by the transport's goroutine and read by the test:
+// a plain int64 here is a data race, and one that -race reports rather than one that quietly
+// returns a stale number. A counter a test polls must be atomic.
 type countingBody struct {
 	r io.Reader
-	n int64
+	n atomic.Int64
 }
 
 func (c *countingBody) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
-	c.n += int64(n)
+	c.n.Add(int64(n))
 	return n, err
 }
 

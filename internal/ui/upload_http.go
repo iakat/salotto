@@ -71,10 +71,25 @@ func UploadHandler(store *upload.Store, identify func(*http.Request) string) htt
 // handleUpload reads a multipart body and streams the one file through the store.
 func handleUpload(w http.ResponseWriter, r *http.Request, store *upload.Store, who string) {
 	limits := store.Limits()
+	// Refuse an oversized body before reading any of it, when the client said how big it is.
+	//
+	// This is not only an optimisation. Stopping a stream mid-body is the right thing for the
+	// disk, but it is the wrong thing for the client: the server answers and closes while the
+	// client is still writing, and the client sees a connection reset rather than the 413 that
+	// explains what happened. Checking the declared length means the refusal arrives before the
+	// body does, so the browser shows "file too large" instead of a network error.
+	//
+	// A chunked upload has no declared length, and that is what the streaming limit below is
+	// for: the two guards cover different clients rather than the same one twice.
+	if limits.MaxFile > 0 && r.ContentLength > 0 && r.ContentLength > limits.MaxFile+1<<20 {
+		// The slack over the file limit is the multipart framing and the field headers
+		// around it, which are not part of the file.
+		writeErr(w, upload.ErrTooLarge)
+		return
+	}
 	// A body limit on the *request* as well as on the store: the store stops a large file
 	// mid-stream, but the multipart reader would still copy it into a temporary file first,
-	// which is the same disk problem one layer up. The slack over the file limit is for the
-	// multipart framing around it.
+	// which is the same disk problem one layer up.
 	if limits.MaxFile > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, limits.MaxFile+1<<20)
 	}
