@@ -322,6 +322,32 @@ func TestRegistration(t *testing.T) {
 	}
 }
 
+// TestTheRegistrationBurstCarriesTheNetwork: the very first lines a client sees are the ones it
+// has the least context for. They are written by the bouncer, not relayed, so they do not pass
+// through appendNetworkTag - and a client that keys windows by name then has lines belonging to
+// no server at all. Live, that was a second "status" buffer drawn beside the real one, holding
+// only the motd, reachable by no /go and belonging to no heading.
+//
+// The tag has to be on EVERY line of the burst, not just the welcome, because a client learns
+// the network from the first line it can file and has to be able to file all of them.
+func TestTheRegistrationBurstCarriesTheNetwork(t *testing.T) {
+	fn := newFakeNet("libera")
+	_, addr := startServer(t, testConfig(fn))
+	conn, br := dialClient(t, addr)
+
+	lines := register(t, conn, br, "test")
+	if len(lines) == 0 {
+		t.Fatal("registration produced no lines")
+	}
+	for _, line := range lines {
+		// PONG and CAP answers are answers to us, not the server talking; the burst is every
+		// line with a numeric or a NOTICE in it.
+		if !strings.Contains(line, "salotto.network=") {
+			t.Errorf("a registration line goes out with no network, so a client cannot file it: %q", line)
+		}
+	}
+}
+
 func TestReplay(t *testing.T) {
 	fn := newFakeNet("libera")
 	ts := time.Date(2024, 1, 2, 3, 4, 5, 678000000, time.UTC).UnixNano()

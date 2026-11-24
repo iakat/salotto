@@ -1170,6 +1170,9 @@ func (c *client) sendRegistration() bool {
 	net := c.srv.networkName()
 	nick := c.nick
 
+	// The registration burst carries the network tag (via c.send) like every other line: these
+	// are the first lines a client receives, and a client that keys windows by name would
+	// otherwise file them under no server at all.
 	return c.send(":", srv, " 001 ", nick, " :Welcome to ", net, " ", nick, "!", c.user, "@salotto") &&
 		c.send(":", srv, " 002 ", nick, " :Your host is ", srv, ", running salotto-0.1") &&
 		c.send(":", srv, " 003 ", nick, " :This server was created ", c.srv.created) &&
@@ -1429,13 +1432,38 @@ func (c *client) notConnected() bool {
 
 func (c *client) send(parts ...string) bool {
 	b := c.scratch[:0]
-	// labeled-response: the label rides on every line the labelled command produces. It is
-	// prepended here rather than at each call site because one forgotten site is a reply the
-	// client cannot match to anything, which is precisely the bug the capability exists to
-	// prevent.
+	// One tag block, written once, holding whatever this line needs to carry.
+	//
+	// The network tag goes on everything the bouncer itself writes. Relayed lines already get
+	// it from appendNetworkTag; these are the lines that do not pass through it, and they are
+	// the ones a client has the least context for: the registration burst, PONG, the "not
+	// connected upstream" notice. A client keys windows by name, so a line with no network is
+	// a line it cannot file under any server - which is how a second, empty "status" buffer
+	// appears beside the real one.
+	//
+	// labeled-response rides in the same block: the label has to be on every line the labelled
+	// command produces, and one forgotten site is a reply the client cannot match to anything,
+	// which is precisely the bug the capability exists to prevent.
+	//
+	// Two '@' blocks in a row would be a syntax error, so they are assembled into one block
+	// rather than prepended independently.
+	// The label goes first when there is one: it is the tag a client matches the reply to, and
+	// the existing readers of this line - including the audit that proves every advertised
+	// capability changes the wire - look for it at the start of the block.
+	needSep := false
 	if c.label != "" {
 		b = append(b, '@', 'l', 'a', 'b', 'e', 'l', '=')
 		b = append(b, c.label...)
+		needSep = true
+	}
+	if net := c.srv.networkName(); net != "" {
+		if !needSep {
+			b = append(b, '@')
+		}
+		b = appendNetworkTag(b, nil, net, needSep)
+		needSep = true
+	}
+	if needSep {
 		b = append(b, ' ')
 	}
 	for _, p := range parts {

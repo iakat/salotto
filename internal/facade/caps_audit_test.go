@@ -199,8 +199,12 @@ func requireLabeledResponseWorks(t *testing.T) {
 	if !strings.Contains(out, "label=abc123") {
 		t.Fatalf("labeled-response negotiated but the label did not come back, so the client cannot match the answer:\n%q", out)
 	}
-	// The label has to be on the answer to *this* command, not merely present somewhere.
-	if !strings.HasPrefix(strings.TrimSpace(out), "@label=abc123 ") {
+	// The label has to be on the answer to *this* command, not merely present somewhere, and it
+	// has to be the first tag in the block: that is where a client looks for it. It does not have
+	// to be the ONLY tag - the bouncer's own network tag rides in the same block, and demanding a
+	// sole occupant would make the two tags mutually exclusive for no reason a client cares about.
+	block, _, _ := strings.Cut(strings.TrimSpace(out), " ")
+	if !strings.HasPrefix(block, "@label=abc123;") && block != "@label=abc123" {
 		t.Fatalf("the reply is not tagged with the label first, which is where a client looks:\n%q", out)
 	}
 }
