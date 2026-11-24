@@ -1,6 +1,7 @@
 package facade
 
 import (
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -154,7 +155,11 @@ func (c *client) handleChatHistory(rest []byte) bool {
 			// "The newest N" on a ring that holds nothing is the same question as BEFORE now.
 			fallback = len(all) == 0
 		}
+		slog.Warn("chathistory decision", "window", window, "sub", sub, "fallback", fallback, "cursor", before, "oldest", oldest, "n", len(all))
 		if fallback {
+			// Temporary instrumentation: the live probe cannot tell "the branch was not taken"
+			// from "the branch was taken and read nothing".
+			slog.Warn("chathistory fallback", "window", window, "sub", sub, "cursor", before, "oldest", oldest, "lines", len(all), "logdir", c.srv.cfg.LogDir)
 			if c.historyFromLogs(ne.name, window, sub, before, limit) {
 				return true
 			}
