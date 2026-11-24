@@ -77,6 +77,13 @@ const TagNetwork = "salotto.network"
 // still date, time, network and window, and the free-text body is still the tail.
 const TagSearch = "salotto.search"
 
+// TagKind carries a plugin's on_line "kind" override. The daemon does not interpret it: on_line
+// is allowed to say what kind of line this is, and the client decides how to draw that kind,
+// which is the same division the rest of the line already has (the client owns styling, the
+// bouncer owns delivery). It lives beside TagNetwork because both ends must spell it the same
+// way, and a typo would be a tag every client silently ignores.
+const TagKind = "salotto.kind"
+
 // MaxPrefsBytes bounds one client settings blob, and it lives here for the same reason
 // TagNetwork does: the bouncer enforces it and the client refuses locally against it, and two
 // copies of the number would drift into a client that cheerfully sends something the daemon

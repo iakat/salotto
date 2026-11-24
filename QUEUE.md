@@ -699,8 +699,23 @@ was swapped by the kubelet, the running daemon reloaded at 03:30:41 with **zero 
 no dropped upstream, and the new log line appeared. A deliberate `fail()` and then a `while
 True: pass` were both injected, both reported, and the daemon served lines throughout.
 
-Hooks cannot change traffic yet: they are given values and their return value is discarded. A
-first version that can rewrite traffic is a first version whose first bug rewrites traffic.
+Scripting hooks cannot change traffic yet: they are given values and their return value is
+discarded. A first version that can rewrite traffic is a first version whose first bug rewrites
+traffic. This remains true of `internal/script`; traffic rewriting is the plugin registry's
+separate `on_line`, below.
+
+## Part 2.5 — Plugins (asked for, built)
+
+`internal/plugin` is the registry and lifecycle on top of the same Starlark engine: a directory
+is a named plugin, `plugin.star` declares its own manifest in the same file as the code, a
+declared hook that is not implemented refuses the plugin at load, and reload builds the new
+version before swapping so a broken edit leaves the previous one running. One plugin's panic or
+deadline costs that plugin, not the line. The hot path is a nil check when no plugin directory
+is configured, and an idle registry with no `on_line` adds 0 allocations per line.
+
+| # | item | notes |
+|---|---|---|
+| P1 | **Plugin system**: named, hot-reloadable Starlark plugins | **done**: `internal/plugin`, `plugin_dir` config, `PLUGINS`, `PLUGIN RELOAD`, `PLUGIN ENABLE` and `PLUGIN DISABLE` on `*controlplane`, and `on_line` wired into `dispatchRouted` at exactly one call site. Hooks: `on_load(ctx)`, `on_line(line)` with `text`/`kind`/`drop` overrides, `on_command(ctx, argv)`. Deterministic name order, per-plugin recover and deadline, atomic registry snapshot, copy-only context and per-plugin `state`. Tests pin every listed mutation, including a broken reload keeping the old version and the alloc gate. Deliberate limits: enable/disable is in memory only (a restart forgets it), `drop` suppresses the live relay but not the ring or the log because the hook is on the relay path only, and `on_command` is implemented at the registry boundary but not wired into client command dispatch in v1. Docs: `docs/PLUGINS.md`. |
 
 ## Part 3 — Explicitly refused, with citations
 

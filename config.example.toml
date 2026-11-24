@@ -20,6 +20,10 @@ log_queue = 4096
 # Write message text without IRC colours and control bytes, like ZNC's
 # stripcontrols module. Off by default: the log records what was said.
 strip_controls = false
+# One subdirectory per plugin, each with a plugin.star that declares its own manifest and
+# hooks. Empty means no plugins are loaded and every call site is a nil check. See
+# docs/PLUGINS.md for the manifest, the three v1 hooks and the PLUGIN control commands.
+plugin_dir = ""
 log_listen = ""                  # empty disables search; loopback only without token
 log_token = ""
 ident_listen = ""                # RFC 1413 listener, e.g. ":113"; empty disables ident

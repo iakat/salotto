@@ -279,6 +279,36 @@ func (e *Engine) Reload() (loaded int) {
 	return len(order)
 }
 
+// LoadFile compiles exactly one file into the engine, replacing any script of the same name.
+//
+// LoadAll scans a directory for every *.star file, which is the wrong unit for internal/plugin:
+// a plugin is exactly one named plugin.star, and a stray helper.star beside it must not become
+// a second script in the same namespace just because it was saved into the directory. This
+// compiles the file the registry already read under the name the registry already uses. The
+// engine remains the only thing that knows how to compile and execute Starlark: plugin asks for
+// one file, it does not grow a second interpreter.
+func (e *Engine) LoadFile(name, path string, src []byte, mod time.Time) *Script {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	s := e.compileLocked(name, path, src, mod)
+	e.scripts[name] = s
+	found := false
+	for _, existing := range e.order {
+		if existing == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		e.order = append(e.order, name)
+		sort.Strings(e.order)
+	}
+	return s
+}
+
 // compileLocked compiles and runs one file. It runs the file's top level, which is where a
 // script builds its state; function definitions land in the globals but are not called.
 func (e *Engine) compileLocked(name, path string, src []byte, mod time.Time) *Script {

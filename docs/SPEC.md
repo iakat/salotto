@@ -556,7 +556,11 @@ Same framing, different carrier:
 - No bouncer-side push, no e-mail, no webhooks.
 - Server-side log search over the daily index (§2.1), loopback by default.
 - No file transfer beyond what the network carries.
-- No plugin system. A bouncer that loads plugins is a bouncer that grows state.
+- No plugin system beyond `internal/plugin`: a Starlark registry of named plugins with three
+  hooks, no second interpreter, no Go `.so` loading and no subprocess host. It is off unless
+  `plugin_dir` is configured, and only `on_line` is wired into the relay path in v1. See
+  [PLUGINS.md](PLUGINS.md). A bouncer that loads arbitrary plugins is a bouncer that grows state;
+  this one loads a sandbox with a declared, validated surface.
 - No persistence by default: a `salottod` restart loses the rings. Optional
   `--state-dir` with the rings mmapped so a restart reattaches them
   (milestone M5, off by default).

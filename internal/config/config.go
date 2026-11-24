@@ -112,6 +112,12 @@ type Config struct {
 	// ScriptHookedLines enables the on_line hook. Off by default because it runs script code
 	// on every incoming line, which is the one hook that can make the daemon slow.
 	ScriptHookedLines bool
+	// PluginDir is the directory holding one subdirectory per plugin. Empty means no plugins,
+	// which is the default: a daemon that loads code from disk by default is a daemon whose
+	// deployment changes what the process does by writing a file. The registry is separate
+	// from ScriptDir because a plugin is a named unit with a manifest and a lifecycle, not a
+	// loose script the engine happens to find.
+	PluginDir string
 
 	// StripControls mirrors ZNC's stripcontrols module: message text is written
 	// to the logs without IRC colours and control bytes. Off by default, as the
@@ -126,6 +132,7 @@ func Default() *Config {
 		Listen:          "127.0.0.1:6667",
 		ServerName:      "salotto",
 		ScriptDir:       "",
+		PluginDir:       "",
 		ScriptSteps:     0,
 		StatsListen:     "127.0.0.1:6668",
 		LogQueue:        4096,
@@ -349,6 +356,8 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.PushToken, err = parseString(value)
 	case "script_dir":
 		c.ScriptDir, err = parseString(value)
+	case "plugin_dir":
+		c.PluginDir, err = parseString(value)
 	case "script_steps":
 		c.ScriptSteps, err = parseScriptSteps(value)
 	case "script_timeout_ms":

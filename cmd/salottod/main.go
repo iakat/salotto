@@ -24,6 +24,7 @@ import (
 	"github.com/iakat/salotto/internal/ident"
 	"github.com/iakat/salotto/internal/ircline"
 	"github.com/iakat/salotto/internal/logfile"
+	"github.com/iakat/salotto/internal/plugin"
 	"github.com/iakat/salotto/internal/upstream"
 	"github.com/iakat/salotto/internal/winring"
 )
@@ -187,6 +188,25 @@ func run() int {
 			logger.Info("scripting: reloaded after a change", "scripts", n)
 		})
 	}
+	// Plugins are off unless a directory is configured, for the same reason scripting is: a
+	// daemon that loads code from disk by default is a daemon whose deployment changes what
+	// the process does by writing a file. The registry is nil in that state, and every call
+	// site below is a nil check.
+	plugReg := plugin.New(plugin.Config{
+		Dir: cfg.PluginDir,
+		Log: func(msg string) { logger.Info(msg) },
+	})
+	plugins = plugReg
+	var pluginSurface facade.Plugins
+	if plugReg != nil {
+		// Assign the interface only when there is a registry: a typed nil in an interface is
+		// not nil, and the facade would take the configured path with a nil receiver.
+		pluginSurface = plugReg
+	}
+	if plugReg != nil {
+		logger.Info("plugin registry started", "dir", cfg.PluginDir)
+	}
+
 	awayEnabled, awayReason, awayWaitSeconds := cfg.AwayEnabled()
 	srv, err := facade.New(facade.Config{
 		ServerName:  cfg.ServerName,
@@ -209,6 +229,8 @@ func run() int {
 		MaxBufferLines: cfg.MaxBufferLines,
 		Scripts:        scripts,
 		ScriptDir:      cfg.ScriptDir,
+		Plugins:        pluginSurface,
+		PluginDir:      cfg.PluginDir,
 		LogDir:         cfg.LogDir,
 		StateDir:       cfg.StateDir,
 	})
@@ -421,6 +443,12 @@ func run() int {
 // network manager for an optional feature would touch every call site for no benefit.
 var lineHook *scripting
 
+// plugins is the plugin registry, if one is configured. It is package-level for the same
+// reason lineHook is: dispatchRouted is package-level and threading an optional dependency
+// through every call site would touch the whole network manager for a feature that is nil in
+// the default deployment.
+var plugins *plugin.Registry
+
 // pushNotify posts mentions to the web front end. It is package-level for the same reason
 // lineHook is: dispatchRouted is package-level and threading an optional dependency through
 // every call site costs more than the variable does.
@@ -458,7 +486,24 @@ func runLineHook(netName string, line []byte) {
 	lineHook.onLine(netName, string(line))
 }
 
+// dispatchRouted is the one place the plugin relay hook is wired in. Plugins run before the
+// line is handed to the facade, because on_line is allowed to change what is relayed; the
+// scripting on_line stays after it, because that hook's contract is to observe and its return
+// value is still discarded.
+//
+// Dropping here drops the live relay only. The line has already been routed into its ring and
+// written to the conversation log by the time this is called, so a client that reconnects
+// still sees it in replay. That is the honest limit of a one-call-site wiring: a plugin can
+// keep a line off every attached screen, but it cannot un-log history without a second call
+// site on the buffering path, which v1 deliberately does not have.
 func dispatchRouted(srv *facade.Server, netName string, windows []string, line []byte) {
+	if plugins != nil {
+		var keep bool
+		line, keep = plugins.OnLine(netName, line)
+		if !keep {
+			return
+		}
+	}
 	dispatchRoutedFrom(srv, netName, windows, line, nil)
 	runLineHook(netName, line)
 }

@@ -66,6 +66,13 @@ type Config struct {
 	Scripts Scripts
 	// ScriptDir is the directory the engine reads, for the admin output.
 	ScriptDir string
+	// Plugins is the plugin registry, if any. Nil means no plugins are configured, which is
+	// the default and the state in which every plugin call site must change nothing. It is an
+	// interface for the same reason Scripts is: the facade must not import the interpreter or
+	// the plugin package.
+	Plugins Plugins
+	// PluginDir is the directory the registry reads, for the admin output.
+	PluginDir string
 	// UserName is the name TRAFFIC prints for the single local user. ZNC's
 	// TRAFFIC is admin-only and takes the name from the user map; this daemon
 	// has one user, so the name is configuration.
@@ -282,6 +289,8 @@ type Server struct {
 	started time.Time
 	scripts Scripts
 	sdir    string
+	plugins Plugins
+	pdir    string
 
 	// logRing keeps the last few log lines for the admin surface. Bounded on purpose: an
 	// admin command that can return an unbounded slice is a way to allocate the operator's
@@ -364,6 +373,8 @@ func New(cfg Config) (*Server, error) {
 		created:  time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 MST"),
 		scripts:  cfg.Scripts,
 		sdir:     cfg.ScriptDir,
+		plugins:  cfg.Plugins,
+		pdir:     cfg.PluginDir,
 	}
 	// One away policy for the process: every network is the same user, so an
 	// AWAY fans out over all of them exactly as simple_away's PutIRC does per

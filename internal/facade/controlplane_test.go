@@ -201,6 +201,77 @@ func TestAPanicDuringReloadIsReportedRatherThanFatal(t *testing.T) {
 	}
 }
 
+// fakePlugins is a plugin registry as far as the admin surface can tell.
+type fakePlugins struct {
+	list     []string
+	reloaded []string
+	failed   []string
+	enabled  []string
+	disabled []string
+}
+
+func (f *fakePlugins) PluginList() []string { return f.list }
+func (f *fakePlugins) PluginReload() (reloaded, failed []string) {
+	return f.reloaded, f.failed
+}
+func (f *fakePlugins) PluginEnable(name string) error {
+	f.enabled = append(f.enabled, name)
+	return nil
+}
+func (f *fakePlugins) PluginDisable(name string) error {
+	f.disabled = append(f.disabled, name)
+	return nil
+}
+
+// TestPluginsAreSaidPlainly: "no plugin registry" and "an empty plugin directory" are different
+// states, and the operator needs to know which one they configured.
+func TestPluginsAreSaidPlainly(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	out := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane PLUGINS")), "\n")
+	if !strings.Contains(out, "plugin_dir") {
+		t.Fatalf("with plugins off PLUGINS said %q", out)
+	}
+}
+
+// TestPluginRowsCarryNameVersionAndState is the wire contract from the brief: one NOTICE per
+// plugin, and the state is part of the row rather than a separate command.
+func TestPluginRowsCarryNameVersionAndState(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	s.plugins = &fakePlugins{list: []string{"highlight-words 1 enabled"}}
+	out := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane PLUGINS")), "\n")
+	if !strings.Contains(out, "highlight-words 1 enabled") {
+		t.Fatalf("PLUGINS said %q", out)
+	}
+}
+
+// TestPluginReloadReportsBothSides: a reload that only lists successes hides the one thing the
+// operator needs to see, which is the file that would not compile.
+func TestPluginReloadReportsBothSides(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	s.plugins = &fakePlugins{reloaded: []string{"good"}, failed: []string{"broken: line 2"}}
+	out := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane PLUGIN RELOAD")), "\n")
+	if !strings.Contains(out, "reloaded good") || !strings.Contains(out, "failed broken: line 2") {
+		t.Fatalf("PLUGIN RELOAD said %q", out)
+	}
+}
+
+// TestPluginEnableAndDisableReachTheRegistry: the command is not a message about a wish, it
+// has to call the registry.
+func TestPluginEnableAndDisableReachTheRegistry(t *testing.T) {
+	s, _, sub, _ := smallRings(t)
+	f := &fakePlugins{list: []string{"p 1 enabled"}}
+	s.plugins = f
+	if got := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane PLUGIN DISABLE p")), "\n"); !strings.Contains(got, "disabled") {
+		t.Fatalf("PLUGIN DISABLE said %q", got)
+	}
+	if got := strings.Join(notices(runWindowCmd(t, s, sub, "PRIVMSG *controlplane PLUGIN ENABLE p")), "\n"); !strings.Contains(got, "enabled") {
+		t.Fatalf("PLUGIN ENABLE said %q", got)
+	}
+	if len(f.disabled) != 1 || f.disabled[0] != "p" || len(f.enabled) != 1 || f.enabled[0] != "p" {
+		t.Fatalf("the registry was not called: enabled=%q disabled=%q", f.enabled, f.disabled)
+	}
+}
+
 // TestScriptLogIsReadable: a script's log() has to go somewhere the operator can see.
 func TestScriptLogIsReadable(t *testing.T) {
 	s, _, sub, _ := smallRings(t)

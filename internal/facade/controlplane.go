@@ -37,6 +37,8 @@ var controlplaneCommands = []commandDoc{
 	{"CONFIG", "", "the effective configuration, secrets withheld"},
 	{"JOINUSER", "<user> <#chan>", "refused: salotto is single-user"},
 	{"NETWORKS", "", "the runtime networks and their connection state"},
+	{"PLUGIN", "RELOAD|ENABLE <name>|DISABLE <name>", "reload, enable or disable a plugin"},
+	{"PLUGINS", "", "the loaded plugins and whether their hooks run"},
 	{"RUNTIME", "", "goroutines, heap and uptime"},
 	{"SCRIPTS", "", "the loaded scripts, their hooks and their errors"},
 	{"SCRIPTLOG", "", "the last lines the scripts logged"},
@@ -119,6 +121,10 @@ func (c *client) dispatchControlplane(verb, params string) (sent bool, refusal s
 	case "JOINUSER":
 		return c.status("JOINUSER refused: salotto is single-user; a client of this bouncer *is* the user"),
 			"single-user bouncer: a client is the user"
+	case "PLUGINS":
+		return c.cpPlugins(), ""
+	case "PLUGIN":
+		return c.cpPlugin(params)
 	case "SCRIPTS":
 		return c.cpScripts(), ""
 	case "SCRIPTLOG":
@@ -375,4 +381,106 @@ func (s *Server) scriptDirLabel() string {
 		return "nowhere"
 	}
 	return s.sdir
+}
+
+// Plugins is what the admin surface needs from the plugin registry. It is an interface for the
+// same reason Scripts is: the facade knows how to talk about plugins, not how to load Starlark,
+// and a second copy of the loading rules in this package would be the copy that goes stale.
+type Plugins interface {
+	// PluginList returns one line per plugin: "<name> <version> <enabled|disabled>".
+	PluginList() []string
+	// PluginReload re-reads the registry and reports what was reloaded and what failed.
+	PluginReload() (reloaded, failed []string)
+	// PluginEnable turns one plugin's hooks back on.
+	PluginEnable(name string) error
+	// PluginDisable keeps one plugin loaded but skips its hooks.
+	PluginDisable(name string) error
+}
+
+// cpPlugins answers PLUGINS. One NOTICE per plugin, as the wire contract says; a plugin that
+// failed to load is printed with its refusal so the operator can see the edit that broke it
+// without going to the daemon's log.
+func (c *client) cpPlugins() bool {
+	if c.srv.plugins == nil {
+		return c.status("no plugins: the plugin registry is off (set plugin_dir)")
+	}
+	rows := c.srv.plugins.PluginList()
+	if len(rows) == 0 {
+		return c.status("no plugins loaded from " + c.srv.pluginDirLabel())
+	}
+	for _, row := range rows {
+		if !c.status("  " + row) {
+			return false
+		}
+	}
+	return c.status("end of plugins")
+}
+
+// cpPlugin answers PLUGIN RELOAD, PLUGIN ENABLE <name> and PLUGIN DISABLE <name>.
+//
+// Disable is in memory only. Persisting it is a config-file feature, not this command: a
+// plugin that stays disabled across a restart must be a decision written in the configuration,
+// not a flag the daemon quietly remembers in a file nobody documented.
+func (c *client) cpPlugin(params string) (bool, string) {
+	if c.srv.plugins == nil {
+		return c.status("no plugins: the plugin registry is off (set plugin_dir)"),
+			"plugins are off"
+	}
+	fields := strings.Fields(params)
+	if len(fields) == 0 {
+		return c.status("PLUGIN needs RELOAD, ENABLE <name> or DISABLE <name>"), "missing plugin subcommand"
+	}
+	sub := strings.ToUpper(fields[0])
+	switch sub {
+	case "RELOAD":
+		if len(fields) > 1 {
+			return c.status("PLUGIN RELOAD takes no arguments"), "unexpected argument"
+		}
+		reloaded, failed := c.srv.plugins.PluginReload()
+		if len(reloaded) == 0 && len(failed) == 0 {
+			return c.status("plugin reload: nothing changed"), ""
+		}
+		if !c.status(fmt.Sprintf("plugin reload: %d reloaded, %d failed", len(reloaded), len(failed))) {
+			return false, ""
+		}
+		for _, name := range reloaded {
+			if !c.status("  reloaded " + name) {
+				return false, ""
+			}
+		}
+		for _, failure := range failed {
+			if !c.status("  failed " + failure) {
+				return false, ""
+			}
+		}
+		return c.status("end of plugin reload"), ""
+	case "ENABLE", "DISABLE":
+		if len(fields) != 2 {
+			return c.status("PLUGIN " + sub + " <name> takes exactly one plugin name"),
+				"wrong number of arguments"
+		}
+		name := fields[1]
+		if sub == "ENABLE" {
+			if err := c.srv.plugins.PluginEnable(name); err != nil {
+				return c.status("plugin " + name + " was not enabled: " + err.Error()),
+					"no such plugin"
+			}
+			return c.status("plugin " + name + " enabled"), ""
+		}
+		if err := c.srv.plugins.PluginDisable(name); err != nil {
+			return c.status("plugin " + name + " was not disabled: " + err.Error()),
+				"no such plugin"
+		}
+		return c.status("plugin " + name + " disabled (in memory only; a restart forgets it)"), ""
+	}
+	return c.status("unknown PLUGIN subcommand: " + fields[0] + ". Try PLUGIN RELOAD, ENABLE <name> or DISABLE <name>."),
+		"unknown plugin subcommand"
+}
+
+// pluginDirLabel names the plugin directory in the admin output.
+func (s *Server) pluginDirLabel() string {
+	if s.pdir == "" {
+		return "nowhere"
+	}
+	return s.pdir
 }
