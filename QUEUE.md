@@ -566,21 +566,24 @@ appears somewhere in the line.
 
 ### 2.1.1 Two networks, one channel name: the window namespace
 
-Found live while testing highlights: alice joins `#salotto` on both of her networks, and the
-client shows **one** window for it. The bouncer gets this right - windows are keyed by
-`(network, name)` upstream and each network's ring is separate - but the client's model keys
-windows by name alone, so the two channels collide. The visible consequences are small and
-confusing, which is the worst kind: a line can arrive in the network the client is not attached
-to, and the window looks merely quiet.
+A latent limitation, found while testing highlights and then **measured rather than assumed**.
 
-This is not a display problem, it is a namespace problem, and the fix has to be a qualifier on
-the window identity all the way through the model: the sidebar entry, `/go` matching, unread and
-mention keys, the settings screen's "current window", and click hit-testing. Half of that is a
-worse bug than none of it (a window that is sometimes the right one), so it is written down here
-rather than patched in the renderer.
+The bouncer keys windows by `(network, name)`, so two networks may each have a `#salotto`. The
+client's model keys windows by name alone. If a deployment ever has the same channel name on two
+networks, the two windows collapse into one and a line from the network the client is not
+attached to looks merely quiet.
 
-Until then: one channel name per deployment, or the client attaches to the first network that
-answered. The bouncer side needs nothing.
+Measured on the live two-network deployment: it does not happen, because nothing creates the
+duplicate. `#salotto` exists only on freebnc, and `targetNetwork` sends the JOIN there, so the
+other network never gets a `#salotto` and the replay carries three distinct batches
+(`ch-test-status`, `freebnc-status`, `freebnc-#salotto`) with no collision. The earlier claim in
+this file that the client "shows one window for two channels" described a state that was never
+live - what was actually wrong that round was the attach and the ANSI reset, both now fixed.
+
+So: the limitation is real but unreachable today, and the honest fix when it becomes reachable is
+a qualifier on window identity through the sidebar, `/go`, unread/mention keys and click
+hit-testing - not a renderer patch. Not doing it now, because a namespace change nothing can
+exercise is a change no test can hold, and half of it is worse than none.
 
 ### 2.2 The three things we do differently from The Lounge, by design
 
