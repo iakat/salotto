@@ -178,6 +178,20 @@ func (t *Transport) Send(line string) {
 // queue is Send without the split, so the split path and the plain path cannot grow
 // different back-pressure behaviour.
 func (t *Transport) queue(line string) {
+	// A dead connection first. A full queue and a closed socket both mean "this line is not
+	// going anywhere", and they have different causes and different answers - "wait a moment"
+	// versus "you are offline" - so reporting the queue's reason for a socket that is gone
+	// sends the user looking for congestion that does not exist.
+	select {
+	case <-t.done:
+		t.push(Incoming(Line{
+			Window: "status",
+			Text:   "not sent (not connected): " + line,
+			Kind:   LineError,
+		}))
+		return
+	default:
+	}
 	select {
 	case t.outq <- line:
 	default:
@@ -321,6 +335,15 @@ func (t *Transport) readLoop() {
 			t.handle(line)
 		}
 		if err != nil {
+			// Tell the model before closing the channel. A close is the pump's signal to stop
+			// and carries nothing else: without a message here the screen keeps its last frame,
+			// still saying connected, and the user types into a connection that is not there.
+			//
+			// No net.ErrClosed test here: Close calls fail() before it closes the socket, so
+			// done is already shut by the time this error is read, and push() drops anything
+			// sent after that. One guard is enough, and the one that also stops a panic is the
+			// one worth keeping.
+			t.push(Disconnected{Reason: err})
 			t.fail(err)
 			return
 		}
@@ -1139,6 +1162,16 @@ func (t *Transport) noteNetwork(window, network string) {
 }
 
 func (t *Transport) push(msg tea.Msg) {
+	// A closed stream is not a slow reader. Sending on t.msgs after readLoop has closed it
+	// panics the whole client, and the moment it happens is the moment a user is most likely
+	// to be typing: the bouncer has just gone, the screen has not caught up, and they hit
+	// enter. The done channel is closed by fail() before msgs is closed, so this is the test
+	// that costs nothing in the common case.
+	select {
+	case <-t.done:
+		return
+	default:
+	}
 	select {
 	case t.msgs <- msg:
 	default:

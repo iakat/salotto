@@ -155,6 +155,12 @@ func session(window, bouncer, nick string) wish.Middleware {
 			defer cancel()
 			if tr != nil {
 				go func() {
+					// The program is quit when the stream ends, but not before the last
+					// message has been handed to it: the transport sends Disconnected just
+					// before closing, and a Quit racing that Send is a session that closes
+					// without ever drawing "the bouncer connection ended". Quitting on the
+					// closed channel is still the right end - an SSH session on a dead
+					// bouncer has nothing to offer - but it has to be after the frame.
 					defer program.Quit()
 					for {
 						select {

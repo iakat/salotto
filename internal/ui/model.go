@@ -206,6 +206,19 @@ type PrefsPush struct {
 	Token string
 }
 
+// Disconnected is the message a transport sends once, when its stream ends: the bouncer went
+// away, the network failed, or somebody closed the link.
+//
+// It exists because a closed channel is not a message. The driver's pump ends when Msgs()
+// closes and nothing else happens - the model is never told - so the last frame stays on screen
+// looking live: the window list, the nicklist, the topic, all as they were. Typing a message then
+// puts it in a window and nothing sends it, and the input stays there looking sent. The status bar
+// keeps saying "connected" because it was set once at New() and never revised.
+//
+// Reason is the transport's error, shown to the user as text. It is the difference between "the
+// bouncer restarted" and "the network is down", and only the transport knows which.
+type Disconnected struct{ Reason error }
+
 // HistoryWanted is the message asking the transport for older lines than the client holds.
 //
 // It is a message rather than a direct call because the model does not own a socket: the same
@@ -752,6 +765,19 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 	// that is otherwise numbered - and a window with no number cannot be reached with /b.
 	m.ensureBuffers()
 	switch msg := msg.(type) {
+	case Disconnected:
+		// The stream is over. Saying so in the status window is the point: a screen that
+		// keeps drawing a live connection is worse than one that admits it is alone, because
+		// the user keeps typing into it.
+		m.connected = false
+		reason := "the bouncer connection ended"
+		if msg.Reason != nil {
+			reason += ": " + msg.Reason.Error()
+		}
+		m.append(Line{Window: "status", Text: reason, Kind: LineError, Time: time.Now()})
+		m.status = "disconnected"
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
@@ -920,6 +946,15 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// The kind is the kind the relayed line will have, not always LineMessage: an
 		// ACTION comes back as LineAction and confirmation compares the kind, so an action
 		// echoed as a message is a ghost that never resolves even when the text matches.
+		// Nothing can be sent without a connection, and pretending otherwise is the worst
+		// version of this bug: the line would appear in the window looking sent, and the
+		// user would wait for an answer to a message that never left. Say it in the window
+		// they typed in, because that is where they are looking.
+		if !m.connected {
+			m.append(Line{Window: m.active, Nick: "salotto", Text: "not sent (not connected): " + text, Kind: LineError, Time: time.Now()})
+			m.input = m.input[:0]
+			return m, nil
+		}
 		kind := LineMessage
 		if actionBody(text) != "" {
 			kind = LineAction
