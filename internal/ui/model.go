@@ -916,8 +916,16 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// the pending-confirmation match below compares text - so one unmarked echo
 		// would also fail to match any of the echoes coming back and leave the
 		// optimistic line on screen forever beside the real ones.
+		//
+		// The kind is the kind the relayed line will have, not always LineMessage: an
+		// ACTION comes back as LineAction and confirmation compares the kind, so an action
+		// echoed as a message is a ghost that never resolves even when the text matches.
+		kind := LineMessage
+		if actionBody(text) != "" {
+			kind = LineAction
+		}
 		for _, part := range m.echoParts(text) {
-			m.append(Line{Window: m.active, Nick: "me", Text: part, Kind: LineMessage, Pending: true, Time: time.Now()})
+			m.append(Line{Window: m.active, Nick: "me", Text: part, Kind: kind, Pending: true, Time: time.Now()})
 		}
 		m.input = m.input[:0]
 		return m, nil
@@ -1834,11 +1842,78 @@ func (m Model) WithSettings(path string) Model {
 // function and the limit - is what actually has to agree. A test asserts the two produce the
 // same strings so the mirroring cannot drift.
 func (m Model) echoParts(text string) []string {
-	head, body, ok := splitMessage("PRIVMSG " + m.active + " :" + text)
+	wire := "PRIVMSG " + m.active + " :" + text
+	head, body, ok := splitMessage(wire)
 	if !ok {
 		return []string{text}
 	}
+	// A /me is not a message whose text begins with "/me": it is a CTCP ACTION, and the
+	// transport turns it into \x01ACTION ...\x01 before it goes anywhere. Echoing the
+	// command as typed would show "/me waves" in the window - which is what this client
+	// used to do - and, because confirmation matches on text, no relayed ACTION would ever
+	// match it, so the echo sat there as a pending line forever beside the real one.
+	if body := actionBody(text); body != "" {
+		wire = "PRIVMSG " + m.active + " :" + ctcpOpen + body + ctcpClose
+		head, body, ok = splitMessage(wire)
+		if !ok {
+			return []string{text}
+		}
+		parts := messageParts(head, body, MaxSendBytes)
+		// messageParts marks each part "(i/n) " *and* leaves the CTCP wrapper on it, because
+		// that is what the wire needs. The window wants neither: the marker is shown, the
+		// wrapper is wire syntax. Strip the marker, drop the wrapper, put the marker back -
+		// stripping the wrapper first would fail on every marked part, which is exactly what
+		// the test caught when this was written the other way round.
+		for i, p := range parts {
+			mark, rest := splitMarker(p)
+			parts[i] = mark + stripAction(rest)
+		}
+		return parts
+	}
 	return messageParts(head, body, MaxSendBytes)
+}
+
+// actionBody returns the text of a /me command, or "" when the line is not one. It matches
+// the transport's rule exactly, because the two decide what the same submission means: a
+// form the model treats as an action and the transport does not (or the reverse) is an echo
+// that never confirms.
+func actionBody(text string) string {
+	if !strings.HasPrefix(text, "/") {
+		return ""
+	}
+	verb, rest, _ := strings.Cut(text[1:], " ")
+	if !strings.EqualFold(verb, "me") {
+		return ""
+	}
+	return rest
+}
+
+// stripAction removes the CTCP wrapper the wire carries, so the window shows the text the
+// way a received ACTION renders it - the transport does the same on the incoming path.
+func stripAction(s string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(s, ctcpOpen), ctcpClose)
+}
+
+// splitMarker separates the "(i/n) " continuation marker from the text behind it, returning
+// an empty marker when there is none. Splitting it off by shape rather than by a known count
+// keeps it correct for a part whose total is not the one this caller computed.
+func splitMarker(s string) (mark, rest string) {
+	if !strings.HasPrefix(s, "(") {
+		return "", s
+	}
+	i := strings.Index(s, ") ")
+	if i < 0 || i > 12 {
+		return "", s
+	}
+	// Only "(digits/digits) " is a marker; anything else that happens to contain ") " is the
+	// user's own text. The character test below is the whole of that rule: a ")" inside the
+	// span, a letter, or a stray slash all fail it, so there is no separate check for them.
+	for _, r := range s[1:i] {
+		if r != '/' && (r < '0' || r > '9') {
+			return "", s
+		}
+	}
+	return s[:i+2], s[i+2:]
 }
 
 // confirmPending finds the local echo this line confirms and rewrites it in place.
