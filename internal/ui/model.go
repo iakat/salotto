@@ -301,6 +301,11 @@ type Model struct {
 	// surprised that unchecking something in a browser changed their phone.
 	settings Settings
 
+	// settingsHint is the one-line explanation the settings screen shows under the list when
+	// the user presses a key a row cannot act on. It exists instead of a status line in the
+	// window behind, which is covered by the screen and would never be read.
+	settingsHint string
+
 	// showSettings draws the settings screen instead of the conversation. It is a mode,
 	// not a window: it has no buffer, nothing can arrive in it, and leaving it must
 	// return to exactly the window and scroll position it covered.
@@ -1719,13 +1724,16 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc, tea.KeyCtrlC:
 		m.showSettings = false
+		m.settingsHint = ""
 		return m, nil
 	case tea.KeyUp:
+		m.settingsHint = ""
 		if m.settingsRow > 0 {
 			m.settingsRow--
 		}
 		return m, nil
 	case tea.KeyDown:
+		m.settingsHint = ""
 		if m.settingsRow < len(rows)-1 {
 			m.settingsRow++
 		}
@@ -1745,6 +1753,15 @@ func (m Model) updateSettingsKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyEnter, tea.KeySpace:
+		// Only a boolean toggles. A text row is a list (highlights, mutes), and passing ""
+		// to set() is the documented way to clear it - which is right for "/fset highlight
+		// none" and catastrophic for a keystroke. A user pressing space to "open" the row
+		// used to wipe every highlight they had, and now that settings are shared at the
+		// bouncer it wiped them on every client they own.
+		if row.kind != "bool" {
+			m.settingsHint = "edit with /fset " + row.key + " <value>, or /fset " + row.key + " none to clear"
+			return m, nil
+		}
 		_ = m.settings.set(row.key, "")
 		m.saveSettings()
 		return m.prefsCmd()
@@ -2098,15 +2115,25 @@ func (m Model) settingsView() string {
 	b.WriteString(borderStyle.Render("├" + strings.Repeat("─", width-2) + "┤"))
 	b.WriteString("\n")
 	b.WriteString(borderStyle.Render("│ "))
-	hint := systemStyle.Render("space toggles, ←/→ changes, esc leaves")
+	// The hint row is the screen's only feedback channel: it is drawn over the conversation,
+	// so a status line in the window behind it would never be read. A key a row cannot act on
+	// sets m.settingsHint and it appears here rather than doing nothing.
+	text := "space toggles, ←/→ changes, esc leaves"
+	if m.settingsHint != "" {
+		text = m.settingsHint
+	}
+	hint := systemStyle.Render(text)
 	b.WriteString(hint)
 	if pad := inner - lipgloss.Width(hint); pad > 0 {
 		b.WriteString(strings.Repeat(" ", pad))
 	}
 	b.WriteString(" " + borderStyle.Render("│") + "\n")
 	b.WriteString(borderStyle.Render("╰"+strings.Repeat("─", width-2)+"╯") + "\n")
-	b.WriteString(barStyle.Render(" settings · client, not bouncer "))
-	if pad := width - lipgloss.Width(" settings · client, not bouncer ") - 2; pad > 0 {
+	// What the footer can honestly say changed when the bouncer started holding the blob: the
+	// values are shared, the rendering of them is not, and a footer claiming otherwise would be
+	// the one place the screen lies about where the state lives.
+	b.WriteString(barStyle.Render(" settings · held by the bouncer, drawn here "))
+	if pad := width - lipgloss.Width(" settings · held by the bouncer, drawn here ") - 2; pad > 0 {
 		b.WriteString(barStyle.Render(strings.Repeat(" ", pad)))
 	}
 	return b.String()
