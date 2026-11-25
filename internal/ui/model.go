@@ -2513,11 +2513,13 @@ func (m Model) mergeWindows(rest string) Model {
 	wanted := make([]string, 0, len(args)+1)
 	seen := make(map[string]bool, len(args)+1)
 	var notes []string
+	resolvedAll := true
 
 	for _, arg := range args {
 		key, ok := m.resolveMergeName(arg)
 		if !ok {
 			notes = append(notes, "no window matches "+arg)
+			resolvedAll = false
 			continue
 		}
 		switch {
@@ -2538,14 +2540,21 @@ func (m Model) mergeWindows(rest string) Model {
 		}
 	}
 
-	// One argument outside the view means "this window and that one". Two or more name the
-	// members themselves, so that /merge #a #b from status does not silently drag status in.
-	if !m.merge && len(args) == 1 && from != mergeKey && from != monitorKey {
+	// One argument outside the view means "this window and that one". The count alone was the
+	// wrong test: len(args) counts the arguments, including one that did not resolve, so
+	// "/merge nosuchwindow" from a real window still reached this rule and merged the window
+	// the user was in. A partial merge costs more than none, because the view it leaves behind
+	// has no command that names it as half-done. Only an argument that resolved gets the
+	// convenience.
+	if !m.merge && resolvedAll && len(args) == 1 && from != mergeKey && from != monitorKey {
 		if _, live := m.windows[from]; live && !seen[from] {
 			wanted = append([]string{from}, wanted...)
 		}
 	}
-	if len(wanted) == 0 {
+	// Resolving is all-or-nothing: if any name failed, report every note and leave the model
+	// alone - no window, no membership, no switch, no target. Applying the subset that did
+	// resolve is the same bug in a quieter form.
+	if len(wanted) == 0 || !resolvedAll {
 		for _, note := range notes {
 			m = m.appendSystem(note + "\n")
 		}

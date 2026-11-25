@@ -44,6 +44,19 @@ func mergedTwo(t *testing.T) Model {
 	return m
 }
 
+// salottoModel is a client sitting in #salotto with #other open beside it on one network. The
+// one-argument merge rule is about the window the user is in, so the fixture has to put them
+// in a real channel rather than in status.
+func salottoModel(t *testing.T) Model {
+	t.Helper()
+	m := New("status")
+	m, _ = m.Step(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m, _ = m.Step(Incoming(Line{Window: "status", Network: "libera", Nick: "srv", Text: "connected", Kind: LineSystem, Time: mergeNow}))
+	m, _ = m.Step(Incoming(Line{Window: "#salotto", Network: "libera", Nick: "alice", Text: "ciao", Kind: LineMessage, Time: mergeNow.Add(time.Second)}))
+	m, _ = m.Step(Incoming(Line{Window: "#other", Network: "libera", Nick: "bob", Text: "hello", Kind: LineMessage, Time: mergeNow.Add(2 * time.Second)}))
+	return m.SetActive(m.keyFor("#salotto"))
+}
+
 // mergeWindowText is one window's own buffer, joined. Deliberately the member buffer rather
 // than the drawn frame, so an echo test can say which window received the line.
 func mergeWindowText(m Model, key string) string {
@@ -284,6 +297,29 @@ func TestTheMergeIsNotABuffer(t *testing.T) {
 	}
 }
 
+// TestAOneArgumentMergeStillPullsInTheCurrentWindow.
+//
+// The convenience is the common case: the user is in a channel and names the other network's
+// same-named channel, so one argument means "this one and that one". The mutation is dropping
+// the rule entirely, which opens the merged view with only #other and leaves #salotto out -
+// the fix for a bad name must not delete what a good name does.
+func TestAOneArgumentMergeStillPullsInTheCurrentWindow(t *testing.T) {
+	m := salottoModel(t)
+	salotto, other := m.keyFor("#salotto"), m.keyFor("#other")
+
+	m = typeLine(m, "/merge #other")
+
+	if !m.merge || m.active != mergeKey {
+		t.Fatalf("/merge #other did not open the merged view: merge=%v active=%q", m.merge, m.active)
+	}
+	if !m.isMergeMember(salotto) {
+		t.Fatalf("the current window %q was not merged in: members=%v", salotto, m.mergeMembers)
+	}
+	if !m.isMergeMember(other) {
+		t.Fatalf("the named window %q was not merged in: members=%v", other, m.mergeMembers)
+	}
+}
+
 // TestMergingIsPerClientNotInTheBlob.
 //
 // Membership is this client's arrangement of its own windows, not shared state: two attached
@@ -321,5 +357,69 @@ func TestMergingIsPerClientNotInTheBlob(t *testing.T) {
 				t.Fatalf("/merge tried to persist the merge in the settings file (reported in %q): %s", key, l.Text)
 			}
 		}
+	}
+}
+
+// TestAFailedMergeCreatesNothing.
+//
+// A command that reports failure and then changes the screen is two answers to one question.
+// The mutation is creating the merged window before validating the names: the reply still says
+// "no window matches", but the user is now standing in a merge they did not ask for.
+func TestAFailedMergeCreatesNothing(t *testing.T) {
+	m := mergeModel(t)
+	before := m.active
+
+	m = typeLine(m, "/merge nosuchwindow")
+
+	if m.merge {
+		t.Fatalf("a failed /merge opened the merged view: members=%v", m.mergeMembers)
+	}
+	if _, live := m.windows[mergeKey]; live {
+		t.Fatal("a failed /merge created the merged window")
+	}
+	if m.active != before {
+		t.Fatalf("a failed /merge switched the active window from %q to %q", before, m.active)
+	}
+}
+
+// TestAFailedMergeNamesTheWindow.
+//
+// "no window matches" without the name leaves the user guessing which of several arguments was
+// the bad one. The mutation is dropping the note, which makes the command silent.
+func TestAFailedMergeNamesTheWindow(t *testing.T) {
+	m := mergeModel(t)
+
+	m = typeLine(m, "/merge nosuchwindow")
+
+	if body := conversationText(m); !strings.Contains(body, "nosuchwindow") {
+		t.Fatalf("the failure does not name the window that did not resolve:\n%s", body)
+	}
+}
+
+// TestAPartlyResolvedMergeDoesNothing.
+//
+// If one name resolves and another does not, applying the half that resolved leaves a view that
+// no command calls half-done. The mutation is applying the resolved subset: #salotto joins the
+// membership while the command reports nosuchwindow.
+func TestAPartlyResolvedMergeDoesNothing(t *testing.T) {
+	m := mergedTwo(t)
+	m, _ = m.Step(Incoming(Line{Window: "#salotto", Network: "libera", Nick: "alice", Text: "ciao", Kind: LineMessage, Time: mergeNow.Add(3 * time.Second)}))
+	salotto := m.keyFor("#salotto")
+	before := strings.Join(m.mergeMembers, ",")
+	beforeActive := m.active
+
+	m = typeLine(m, "/merge "+winName(salotto)+" nosuchwindow")
+
+	if !m.merge {
+		t.Fatal("a partly resolved /merge closed the merged view")
+	}
+	if after := strings.Join(m.mergeMembers, ","); after != before {
+		t.Fatalf("a partly resolved /merge changed membership from %q to %q", before, after)
+	}
+	if m.isMergeMember(salotto) {
+		t.Fatalf("a partly resolved /merge added the name that did resolve: members=%v", m.mergeMembers)
+	}
+	if m.active != beforeActive {
+		t.Fatalf("a partly resolved /merge switched the active window from %q to %q", beforeActive, m.active)
 	}
 }
