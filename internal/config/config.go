@@ -74,16 +74,21 @@ type Config struct {
 	// that is only the opaque client settings blob, at <state_dir>/prefs.json;
 	// empty means memory only, which is the honest default while the rings and
 	// cursors still live in RAM.
-	StateDir        string
-	LogQueue        int
-	LogListen       string
-	LogToken        string
-	IdentListen     string
-	Ident           string
-	RingSegments    int
-	RingSegmentSize int
-	MaxWindows      int
-	MaxClients      int
+	StateDir string
+	LogQueue int
+	// LogRetentionDays is how many days of day files the log sweep keeps. Zero
+	// keeps every day forever, which is the default: an upgrade must not start
+	// deleting a user's history because a default changed. A default that
+	// deletes data is the worst kind of change to ship silently.
+	LogRetentionDays int
+	LogListen        string
+	LogToken         string
+	IdentListen      string
+	Ident            string
+	RingSegments     int
+	RingSegmentSize  int
+	MaxWindows       int
+	MaxClients       int
 	// MOTDBlocked and MOTDMissing are the B15 knobs: ZNC's block_motd and
 	// missingmotd modules, which are per-user settings there but process-wide
 	// here because this daemon is single-user.
@@ -250,6 +255,11 @@ func (c *Config) Validate() error {
 	if c.LogQueue <= 0 {
 		c.LogQueue = 4096
 	}
+	if c.LogRetentionDays < 0 {
+		// Zero means "keep forever"; a negative duration would move the cutoff
+		// into the future and is a typo, not a policy.
+		return fmt.Errorf("log_retention_days must not be negative, got %d", c.LogRetentionDays)
+	}
 	if c.TLSListen != "" && c.TLSCert == "" {
 		return errors.New("tls_cert is required when tls_listen is set")
 	}
@@ -375,6 +385,10 @@ func (c *Config) parseGlobalKey(key, value string) error {
 		c.StateDir, err = parseString(value)
 	case "log_queue":
 		c.LogQueue, err = parseInt(value)
+	case "log_retention_days":
+		// Days of history to keep. Zero is the default and keeps everything;
+		// see the field comment for why a deleting default is not acceptable.
+		c.LogRetentionDays, err = parseInt(value)
 	case "log_listen":
 		c.LogListen, err = parseString(value)
 	case "log_token":

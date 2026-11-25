@@ -35,19 +35,20 @@ func parseSrc(t *testing.T, src string) (*Config, error) {
 func TestGlobalKeysAreReachable(t *testing.T) {
 	// One key at a time, at the top of the file, where global keys live.
 	globals := map[string]string{
-		"listen":            `"127.0.0.1:0"`,
-		"server_name":       `"salotto"`,
-		"stats_listen":      `""`,
-		"log_dir":           `""`,
-		"log_queue":         `16`,
-		"max_windows":       `8`,
-		"max_clients":       `4`,
-		"max_buffer_lines":  `500`,
-		"strip_controls":    `true`,
-		"motd_blocked":      `false`,
-		"motd_missing":      `false`,
-		"ring_segments":     `4`,
-		"ring_segment_size": `1024`,
+		"listen":             `"127.0.0.1:0"`,
+		"server_name":        `"salotto"`,
+		"stats_listen":       `""`,
+		"log_dir":            `""`,
+		"log_queue":          `16`,
+		"log_retention_days": `90`,
+		"max_windows":        `8`,
+		"max_clients":        `4`,
+		"max_buffer_lines":   `500`,
+		"strip_controls":     `true`,
+		"motd_blocked":       `false`,
+		"motd_missing":       `false`,
+		"ring_segments":      `4`,
+		"ring_segment_size":  `1024`,
 	}
 	// A network is required by Validate, so every case carries a minimal one; the
 	// key under test stays at the top of the file, where global keys live.

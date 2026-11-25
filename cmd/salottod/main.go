@@ -253,6 +253,18 @@ func run() int {
 			return 1
 		}
 	}
+	retention := newRetentionStatus(cfg.LogRetentionDays)
+	if cfg.LogDir != "" && cfg.LogRetentionDays > 0 {
+		// Sweep once before serving so a restart applies the new setting
+		// immediately rather than after the first six-hour tick. The ticker is
+		// started here, at the daemon's door, rather than in internal/logfile:
+		// that package is a library of writers and readers, and a library that
+		// starts goroutines behind the caller's back cannot be tested without
+		// them or stopped with the daemon.
+		retention.sweep(cfg.LogDir, logger)
+		go retention.loop(ctx, cfg.LogDir, logger)
+	}
+
 	plainLn, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		logger.Error("listen failed", "addr", cfg.Listen, "err", err)
@@ -290,7 +302,7 @@ func run() int {
 			return 1
 		}
 		statsSrv = &http.Server{
-			Handler:           statsHandler(start, mgr, hub, srv, reg, cfg.IdentListen != ""),
+			Handler:           statsHandler(start, mgr, hub, srv, reg, cfg.IdentListen != "", retention),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 	}
@@ -656,7 +668,7 @@ func validateStatsAddr(addr string) error {
 	return nil
 }
 
-func statsHandler(start time.Time, mgr *netmgr, hub *facade.Hub, srv *facade.Server, reg *ident.Registry, identEnabled bool) http.Handler {
+func statsHandler(start time.Time, mgr *netmgr, hub *facade.Hub, srv *facade.Server, reg *ident.Registry, identEnabled bool, retention *retentionStatus) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -690,6 +702,7 @@ func statsHandler(start time.Time, mgr *netmgr, hub *facade.Hub, srv *facade.Ser
 		fmt.Fprintf(&b, "clients_attached=%d\n", srv.Attached())
 		fmt.Fprintf(&b, "clients_dropped_slow=%d\n", hub.Dropped())
 		fmt.Fprintf(&b, "goroutines=%d\n", runtime.NumGoroutine())
+		retention.writeStats(&b)
 		_, _ = io.WriteString(w, b.String())
 	})
 	return mux

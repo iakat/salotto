@@ -371,6 +371,33 @@ recording because they are not obvious from a feature list:
 
 ---
 
+### 1.5 Log retention — the daemon must not fill the disk over years
+
+Measured before this item: `grep -rn 'rotat\|retention\|prune' internal/logfile/
+cmd/salottod/` returned nothing. `internal/logfile` writes
+`<log_dir>/<network>/<window>/YYYY-MM-DD.log` plus a `.idx` per day and never
+deletes either, so a daemon of forty channels writes eighty files a day,
+forever. That is unbounded disk growth on the process the owner leaves running
+for years, and the failure arrives as a full disk — taking down the bouncer,
+the push service and the search index together — not as a warning about logs.
+
+Implemented as an explicit setting: `log_retention_days` (default `0`, keep
+every day forever; an upgrade must not start deleting history because a default
+changed). A nonzero value runs one `logfile.Sweep` at startup and every six
+hours from `cmd/salottod`. Age comes from the day in the filename, never from
+mtime, because a copy, restore, backup or bind mount rewrites mtime. Today and
+yesterday are never deleted; `.log` goes before its `.idx`; empty window and
+network directories are pruned; a candidate is cleaned and checked to remain
+under the log root before removal, and a symlinked entry is skipped rather than
+resolved. The last sweep's file, byte, index and window counts are published on
+`/stats` under `log.retention.*`.
+
+Out of scope here, on purpose: compression, cold storage and per-network
+overrides. A day file is either kept or deleted, and the memory side is already
+bounded by `MaxBufferLines`.
+
+---
+
 ## Part 2 — Web UI parity with The Lounge
 
 The Lounge's shape, counted from source: 23 runtime dependencies

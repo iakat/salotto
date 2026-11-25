@@ -17,6 +17,12 @@ log_dir = ""                     # empty disables logging
 # Empty keeps the blob in memory only, so a restart forgets it.
 state_dir = ""
 log_queue = 4096
+# Days of conversation logs to keep. 0 keeps every day forever, which is the
+# default: an upgrade must not start deleting a user's history because a
+# default changed. When set, a sweep at startup and every six hours removes day
+# files older than this and their search indexes. Today and yesterday are never
+# removed, whatever the value.
+log_retention_days = 0
 # Write message text without IRC colours and control bytes, like ZNC's
 # stripcontrols module. Off by default: the log records what was said.
 strip_controls = false

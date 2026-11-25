@@ -74,6 +74,17 @@ cache miss to fill once, not an error. The startup pass and lazy queries may
 build the same index concurrently; the writer writes a temporary file and
 renames it so a reader never sees a partial index.
 
+The index is derived data and may be rebuilt. Retention is a separate, explicit
+setting: `log_retention_days` (default `0`, keep every day forever). A nonzero
+value makes `salottod` sweep at startup and then every six hours, deleting a
+day file and its `.idx` once the day is older than the setting. Age comes from
+the `YYYY-MM-DD` in the filename, never from mtime — a copy, restore, backup or
+bind mount rewrites mtime. Today and yesterday are never deleted, whatever the
+setting, and a file whose name is not exactly `YYYY-MM-DD.log` is left alone.
+A window directory that becomes empty is removed, then a network directory that
+becomes empty. The last sweep's counts are published on `/stats` as
+`log.retention.*`.
+
 Search endpoint:
 `GET /v1/log/search?network=&window=&q=&since=&until=&limit=&order=` on its
 own listener `log_listen`. `GET /v1/log/windows?network=` lists windows.
@@ -83,7 +94,8 @@ Auth: `log_token` set requires `Authorization: Bearer <token>` compared with
 loopback without token needs no auth.
 
 Config keys: `log_dir` (empty disables logging), `log_queue` (default 4096),
-`log_listen` (empty disables search), `log_token`.
+`log_retention_days` (default 0, keep forever), `log_listen` (empty disables
+search), `log_token`.
 
 ## 3. What "zero allocations" means here
 
