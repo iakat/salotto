@@ -190,6 +190,21 @@ reason: two "next interesting window" keys that disagree are each other's bug
 report. All six commands are in `modelCommands`, so `/help` and Tab derive them
 rather than spelling a second list.
 
+**The filter is a view, not a second list.** `Settings.ActiveOnly`
+(`active_only`) makes `sidebarRows` skip windows `activityOf` ranks as
+`ActivityNone`. The active window is always kept, a network's status row survives
+whenever one of its channels did, and the merge and monitor views are never
+filtered: their keys are views across buffers, so asking `activityOf` about them
+would let the only row to a view disappear. Hidden windows keep their numbers,
+their unread counts and their place in `/next`; renumbering the survivors was
+rejected because numbers are identity, and `/b 3` must not mean a different
+buffer depending on what happened to be busy. `/active` toggles, `/active on`
+and `/active off` set it, and every form replies with the resulting state. When
+the filter suppressed a row the status line ends `filtered · N hidden`, because
+an empty sidebar with no explanation is indistinguishable from a client that
+lost its windows. The setting is in the shared blob (through `saveSettings()`
+and `prefsCmd()`), so it follows the account to every attached client.
+
 **The monitor is a window, not a mode.** `/monitor [regex]` opens (or switches
 to) a window whose rows are built in `View()` from the current tail of every
 other window. It is deliberately not a slice appended to on every incoming line:
@@ -217,6 +232,8 @@ whose derived lines are gone.
 | `/next`, `/prev` | go to the next/previous window with any activity, wrapping in sidebar order |
 | `/next!`, `/prev!` | the same, but only a highlight (our nick or a `Settings.Highlights` word) stops the walk |
 | `alt-a` | the hotlist: the same walk as `/next` |
+| `/active` | toggle the activity filter and report its new state |
+| `/active on`, `/active off` | show only buffers with activity, or show every buffer again |
 | `/monitor` | open the cross-buffer tail, highlights only |
 | `/monitor <regex>` | open it with a filter on the line's text or nick |
 | `/monitor-off` | close it and return to the window it was opened from |

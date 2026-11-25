@@ -1631,6 +1631,12 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if _, arg, ok := slash(text, "b", "buffer"); ok {
 			return m.switchBuffer(arg), nil
 		}
+		// "/active" is the buffer-list filter. It resolves here because the sidebar and
+		// activityOf belong to this client, and it is a setting rather than a wire command:
+		// the bouncer keeps lines, not what one pair of eyes wants drawn.
+		if _, arg, ok := slash(text, "active"); ok {
+			return m.handleActive(arg)
+		}
 		// "/next", "/prev" and their "!" forms walk the window list the sidebar draws and
 		// stop at the next window worth reading. They resolve here rather than on the wire
 		// for the same reason /go does: the order and the activity are this client's
@@ -1898,7 +1904,7 @@ func (m Model) helpIntoWindow() Model {
 // table for the benefit of Tab would mean two lists to keep in step - the failure mode the /fset
 // screen already had once.
 var modelCommands = []string{
-	"/alias", "/b", "/close", "/fset", "/find", "/go", "/help", "/ignore", "/merge",
+	"/active", "/alias", "/b", "/close", "/fset", "/find", "/go", "/help", "/ignore", "/merge",
 	"/merge-off", "/monitor", "/monitor-off", "/next", "/next!", "/prev", "/prev!", "/search",
 	"/settings", "/t", "/unmerge", "/unignore",
 }
@@ -3108,6 +3114,27 @@ func slash(text string, names ...string) (name, rest string, ok bool) {
 	return "", "", false
 }
 
+// handleActive is /active: hide the buffers that have nothing new, or show them again.
+//
+// A bare command toggles and says what it did, because the filter's whole failure mode is
+// silence: an empty sidebar looks exactly like a client that lost its windows, and a user who
+// does not remember whether they turned the filter on has no way to tell the two apart. The
+// reply names the resulting state so it is the answer to "why is my list empty".
+//
+// It goes through saveSettings and prefsCmd for the same reason every other setting does: the
+// local file is this client's offline copy, and the bouncer's opaque blob is what makes the
+// same view appear in the browser tab and the phone. Returning before either would look correct
+// in the window it was typed in and leave every other client unfiltered - the one failure this
+// client's settings tests exist to catch.
+func (m Model) handleActive(rest string) (Model, tea.Cmd) {
+	if err := m.settings.set("active_only", rest); err != nil {
+		return m.appendSystem("usage: /active [on|off]"), nil
+	}
+	m = m.saveSettings()
+	m = m.appendSystem("active filter is " + onOff(m.settings.ActiveOnly))
+	return m.prefsCmd()
+}
+
 // handleFset sets one client setting: "/fset timestamps off", "/fset scroll_step 5", and a
 // bare "/fset" to list them, which is what makes the command discoverable.
 //
@@ -4006,7 +4033,7 @@ func (m Model) View() string {
 	l := m.layout()
 	nicks := m.nicks[m.active]
 	body := m.bodyLines(l.inner, l.contentRows)
-	winCol := m.windowColumn(l.winWidth, l.contentRows)
+	winCol, hidden := m.windowColumnWithHidden(l.winWidth, l.contentRows)
 	nickCol := nickColumn(nicks, l.nickWidth, l.contentRows, m.settings)
 
 	var b strings.Builder
@@ -4097,7 +4124,7 @@ func (m Model) View() string {
 
 	b.WriteString(borderStyle.Render("╰" + strings.Repeat("─", l.width-2) + "╯"))
 	b.WriteString("\n")
-	b.WriteString(m.statusBar())
+	b.WriteString(m.statusBarWithHidden(hidden))
 	return b.String()
 }
 
@@ -4156,6 +4183,27 @@ type sidebarRow struct {
 	badge string
 }
 
+// filterHides reports whether the activity filter leaves a window out of the sidebar.
+//
+// It is deliberately a question about a window, not about its position: filtering is not
+// sorting, and a list that reorders itself is a list where a click lands on a different window
+// than the one the user aimed at. Renumbering the survivors was rejected for the same reason -
+// the numbers are identity, so a hidden window keeps the number /b knows it by.
+//
+// The active window, the merge view and the monitor are never hidden. The first is where the
+// user is typing, so hiding it would turn /close into a guess. The other two are views across
+// buffers rather than buffers: activityOf has no meaning for them, and asking it would let a
+// quiet-looking merge disappear from the list that is the only way to reach it.
+func (m Model) filterHides(key string) bool {
+	if !m.settings.ActiveOnly || key == "" {
+		return false
+	}
+	if key == m.active || key == mergeKey || key == monitorKey {
+		return false
+	}
+	return m.activityOf(key) == ActivityNone
+}
+
 // sidebarRows is the window list as rows, in drawing order, at most n of them.
 //
 // Grouping is the default because the user asked for it, but it is a setting and the flat list
@@ -4164,8 +4212,20 @@ type sidebarRow struct {
 // a sidebar that shows the servers but not the channels under the last one is worse than the
 // list it replaced.
 func (m Model) sidebarRows(n int) []sidebarRow {
+	rows, _ := m.sidebarRowsWithHidden(n)
+	return rows
+}
+
+// sidebarRowsWithHidden is sidebarRows plus the number of rows the activity filter suppressed.
+//
+// The count is returned from the same pass that builds the list on purpose: a second walk to
+// answer "how many did I hide" is a second place for the predicate to live, and the status line
+// would then be able to disagree with the sidebar it is describing. The allocation stays in the
+// rows the caller was going to get anyway; filtered windows are skipped while iterating rather
+// than gathered into an intermediate list.
+func (m Model) sidebarRowsWithHidden(n int) ([]sidebarRow, int) {
 	if n <= 0 {
-		return nil
+		return nil, 0
 	}
 	// Not m.ensureBuffers() here: a renderer must not write to the model, and every map on the
 	// model is shared by value, so a View that numbered a window would be visible to the next
@@ -4174,29 +4234,41 @@ func (m Model) sidebarRows(n int) []sidebarRow {
 	if m.settings.GroupByServer {
 		// len > 0, not just <= n: groupedSidebarRows returns nil when no window has a known
 		// network, and an empty list is a sidebar with nothing in it rather than a grouped one.
-		if rows := m.groupedSidebarRows(); len(rows) > 0 && len(rows) <= n {
-			return rows
+		if rows, hidden := m.groupedSidebarRows(); len(rows) > 0 && len(rows) <= n {
+			return rows, hidden
 		}
 	}
 	// The flat list is m.order: the order windows were opened, which is what the sidebar has
 	// always been, so GroupByServer=false is the old client and not a third layout.
 	rows := make([]sidebarRow, 0, n)
+	hidden := 0
 	for _, name := range m.order {
+		if m.filterHides(name) {
+			hidden++
+			continue
+		}
 		if len(rows) >= n {
-			break
+			// With the filter off there is nothing left to count, so stop where the drawn
+			// list stops. With it on, the rest of m.order still has to be walked because the
+			// status line counts the suppressed windows below the fold too.
+			if !m.settings.ActiveOnly {
+				break
+			}
+			continue
 		}
 		rows = append(rows, m.windowRow(name))
 	}
-	return rows
+	return rows, hidden
 }
 
 // groupedSidebarRows builds the server headings and the windows under them: servers sorted by
-// name, windows sorted by name within their server.
+// name, windows sorted by name within their server. The second return value is how many rows
+// the activity filter suppressed, for the status line.
 //
 // Sorting is the user's "it should be ordered": a list in arrival order is a list whose shape
 // changes every time the client reconnects, because replay arrives in whatever order the
 // bouncer's rings were walked. A sorted list is the same list on every reconnect.
-func (m Model) groupedSidebarRows() []sidebarRow {
+func (m Model) groupedSidebarRows() ([]sidebarRow, int) {
 	// Which windows belong to which server. A window whose network is not known is not put
 	// under a made-up heading: it goes in the ungrouped block at the end, drawn exactly as it
 	// would be in the flat list.
@@ -4216,7 +4288,7 @@ func (m Model) groupedSidebarRows() []sidebarRow {
 	if len(groups) == 0 {
 		// Nothing to group by - a plain IRCd, or a bouncer that does not tag its lines. The
 		// flat list is the honest answer; a heading per window would be noise.
-		return nil
+		return nil, 0
 	}
 
 	nets := make([]string, 0, len(groups))
@@ -4228,6 +4300,7 @@ func (m Model) groupedSidebarRows() []sidebarRow {
 	})
 
 	rows := make([]sidebarRow, 0, len(m.order)+len(nets))
+	hidden := 0
 	for _, net := range nets {
 		names := groups[net]
 		sort.Slice(names, func(i, j int) bool {
@@ -4240,41 +4313,73 @@ func (m Model) groupedSidebarRows() []sidebarRow {
 		//
 		// Only status, not any window: every other window under a server is a conversation
 		// and belongs at the indented level where its siblings are.
-		head := sidebarRow{heading: true, text: net}
+		statusKey := ""
 		rest := names[:0]
 		for _, key := range names {
-			if head.window == "" && winName(key) == "status" {
-				// The row is built by windowRow and then relabelled: the buffer number and the
-				// unread badge belong to the status window, and a row assembled by hand here
-				// would be the one row in the sidebar that quietly lost both.
-				row := m.windowRow(key)
-				row.heading = true
-				row.status = true
-				row.text = net
-				head = row
-				// The number is prefixed to the server name, so "libera" reads as "2 libera" -
-				// /b 2 still reaches it, which is the whole point of a number.
-				if m.settings.BufferNumbers {
-					if n := m.bufferNo[key]; n > 0 {
-						head.text = strconv.Itoa(n) + " " + net
-					}
-				}
+			if statusKey == "" && winName(key) == "status" {
+				statusKey = key
 				continue
 			}
 			rest = append(rest, key)
 		}
-		rows = append(rows, head)
-		for _, name := range rest {
-			rows = append(rows, m.windowRow(name))
+		// Filter the channels into the same backing array. A quiet channel is skipped, and
+		// the heading decision below is made from what survived rather than from what was
+		// there before, so a server with nothing under it cannot be drawn as an empty shell.
+		kept := rest[:0]
+		for _, key := range rest {
+			if m.filterHides(key) {
+				hidden++
+				continue
+			}
+			kept = append(kept, key)
+		}
+		// The status row is structural whenever the group survives: it is the heading that
+		// says which server the channels under it belong to, so dropping it because the
+		// status buffer itself is quiet would leave a channel on no server. It is hidden only
+		// when no channel under it survived and it has no activity of its own - unless it is
+		// the active window, in which case filterHides already said no.
+		statusHidden := statusKey != "" && m.filterHides(statusKey)
+		if len(kept) == 0 && (statusKey == "" || statusHidden) {
+			if statusHidden {
+				hidden++
+			}
+			continue
+		}
+		if statusKey != "" {
+			// The row is built by windowRow and then relabelled: the buffer number and the
+			// unread badge belong to the status window, and a row assembled by hand here
+			// would be the one row in the sidebar that quietly lost both. It keeps its
+			// number even when the filter is what made its group survive.
+			row := m.windowRow(statusKey)
+			row.heading = true
+			row.status = true
+			row.text = net
+			if m.settings.BufferNumbers {
+				if n := m.bufferNo[statusKey]; n > 0 {
+					row.text = strconv.Itoa(n) + " " + net
+				}
+			}
+			rows = append(rows, row)
+		} else {
+			// No status window exists for this server yet; a plain heading is all there is
+			// to say where its channels belong, and it is kept while any of them survived.
+			rows = append(rows, sidebarRow{heading: true, text: net})
+		}
+		for _, key := range kept {
+			rows = append(rows, m.windowRow(key))
 		}
 	}
 	sort.Slice(loose, func(i, j int) bool {
 		return strings.ToLower(loose[i]) < strings.ToLower(loose[j])
 	})
 	for _, name := range loose {
+		if m.filterHides(name) {
+			hidden++
+			continue
+		}
 		rows = append(rows, m.windowRow(name))
 	}
-	return rows
+	return rows, hidden
 }
 
 // networkOf reports which network a window key is on, "" when it is not known.
@@ -4327,10 +4432,20 @@ func (m Model) windowRow(key string) sidebarRow {
 // belongs to the model - a window list drawn by the page was the second renderer that
 // drifted.
 func (m Model) windowColumn(width, n int) []string {
+	out, _ := m.windowColumnWithHidden(width, n)
+	return out
+}
+
+// windowColumnWithHidden draws the window list and reports how many rows the activity filter
+// suppressed. View needs the count for the status line, and returning it from the same pass
+// that draws the list is what keeps the sentence "N hidden" about the list actually on screen.
+func (m Model) windowColumnWithHidden(width, n int) ([]string, int) {
 	if width <= 2 || n <= 0 {
-		return nil
+		// No sidebar is drawn, so nothing was hidden from it: a status line that counted
+		// suppressed rows here would describe a list the user cannot see.
+		return nil, 0
 	}
-	rows := m.sidebarRows(n)
+	rows, hidden := m.sidebarRowsWithHidden(n)
 	// Whether the list is grouped, decided by whether any heading is actually drawn: a
 	// grouped list whose headings did not fit is the flat list, and indenting it would make
 	// the same windows look different for no reason the user can see.
@@ -4407,7 +4522,7 @@ func (m Model) windowColumn(width, n int) []string {
 			out = append(out, bodyStyle.Render(line))
 		}
 	}
-	return out
+	return out, hidden
 }
 
 // WindowAt reports which window a click at character cell (x, y) landed on, "" if the
@@ -4986,6 +5101,24 @@ func wrapText(text string, width int) []string {
 }
 
 func (m Model) statusBar() string {
+	// View already built the sidebar and passes its hidden count to statusBarWithHidden. This
+	// entry point is for callers that want the bar alone; it walks the same rows so the line
+	// still describes a filtered sidebar rather than silently dropping the count.
+	hidden := 0
+	if m.settings.ActiveOnly {
+		l := m.layout()
+		_, hidden = m.windowColumnWithHidden(l.winWidth, l.contentRows)
+	}
+	return m.statusBarWithHidden(hidden)
+}
+
+// statusBarWithHidden is the status line, told how many rows the activity filter suppressed.
+//
+// An empty filtered sidebar with no explanation looks like a client that lost its windows, so
+// the count is part of the line whenever the filter hid something. It is a count rather than
+// a second list: the user can see which rows remain, and "3 hidden" is the one fact the
+// remaining rows cannot carry.
+func (m Model) statusBarWithHidden(hidden int) string {
 	state := "offline"
 	if m.connected {
 		state = "connected"
@@ -4993,6 +5126,9 @@ func (m Model) statusBar() string {
 	extra := ""
 	if m.status != "" {
 		extra = " · " + m.status
+	}
+	if m.settings.ActiveOnly && hidden > 0 {
+		extra += fmt.Sprintf(" · filtered · %d hidden", hidden)
 	}
 	return barStyle.Width(max(m.width, 20)).Render(fmt.Sprintf(" %s · %s%s", winName(m.active), state, extra))
 }

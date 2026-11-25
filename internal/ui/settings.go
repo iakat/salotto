@@ -75,6 +75,16 @@ type Settings struct {
 	// argument to /b. On by default: the numbers are the only stable name a buffer has, and
 	// they cost one column.
 	BufferNumbers bool `json:"buffer_numbers"`
+	// ActiveOnly hides buffers with no activity from the sidebar. It is a filter over the
+	// same rows, not a second list: a hidden window keeps its number, its unread count and
+	// its place in /next, because reassigning numbers from the drawn positions would make
+	// "/b 3" mean a different buffer depending on what happened to be busy.
+	//
+	// The active window and the merge and monitor views are never hidden: the first is
+	// where the user is, and the other two are not buffers at all, so activityOf has no
+	// meaning for them. A network's status row survives whenever one of its channels does,
+	// because a channel drawn without its server is a channel on no server.
+	ActiveOnly bool `json:"active_only"`
 
 	// LastWindow is the window this client was looking at, as a window key, empty when it has
 	// no opinion.
@@ -151,6 +161,7 @@ func (s Settings) rows() []settingRow {
 		{"hotlist", "hotlist", onOff(s.Hotlist), "bool"},
 		{"group_by_server", "group by server", onOff(s.GroupByServer), "bool"},
 		{"buffer_numbers", "buffer numbers", onOff(s.BufferNumbers), "bool"},
+		{"active_only", "active only", onOff(s.ActiveOnly), "bool"},
 		{"scroll_step", "scroll step", strconv.Itoa(s.ScrollStep), "int"},
 		{"highlight", "highlights", listOrNone(s.Highlights), "text"},
 		{"mute", "mutes", listOrNone(s.Mutes), "text"},
@@ -233,6 +244,8 @@ func canonical(key string) string {
 		return "group_by_server"
 	case "numbers", "buffer_number", "buffers", "buffer_no":
 		return "buffer_numbers"
+	case "active", "only_active", "filter_active", "activity_filter":
+		return "active_only"
 	}
 	return key
 }
@@ -271,6 +284,8 @@ func (s *Settings) set(key, value string) error {
 		return boolean(&s.GroupByServer)
 	case "buffer_numbers":
 		return boolean(&s.BufferNumbers)
+	case "active_only":
+		return boolean(&s.ActiveOnly)
 	case "scroll_step", "scroll":
 		n, err := strconv.Atoi(value)
 		if err != nil || n < 1 || n > 50 {
