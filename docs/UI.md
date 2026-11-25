@@ -128,6 +128,37 @@ every map at once and keeps the buffer number the user has already learnt. When 
 hold the same name the buffer list prints `status (libera)`, and that spelling is a valid `/go`
 target, so the list never names a window nobody can type back in.
 
+## A nick is a link
+
+Clicking a name in the conversation or in the member list opens the query with that person, or
+switches to it if it already exists. The click goes through `SetActive`, the same door `/msg`
+takes, so there is one query-window creation path and an existing query is not cleared on the
+way in.
+
+The hit test cannot re-derive the layout. Wrapping depends on the nick's width, the timestamp
+and the styles, so a click handler that measured the `Line` again would disagree with the frame
+the first time any of those changed. `bodyIndex(width, n)` is therefore produced by the same
+loop as `bodyLines`, from the same `lineLinesIndexed` calls, with one `bodyRow` per drawn row:
+the line it came from and the nick's column span on its first row. `View()` keeps calling
+`bodyLines`; only the click handler builds the index, because a slice per frame is allocation
+the relay path must not pay for.
+
+A row with no conversation behind it is a miss: a timestamp, a continuation row of a wrapped
+message, a join or part event, a collapsed ignore run and the padding under a short buffer all
+have no one to query. So does our own nick - a query addressed to yourself can only talk to
+you - which is why the model learns its own names from `Line.Own` and `LineSelfJoin` rather
+than guessing from the member list. The member list is one drawn column, so the nick list
+itself is the index; the `@`/`+` prefix is part of the label and not part of the name, and a
+click on it is a miss.
+
+There is no mouse-move highlighting and no pointer cursor. A hover state costs a redraw on
+every motion event for every attached client, and terminals disagree about whether they deliver
+motion at all; a click is one event and the hit test is what it needs.
+
+A nick in the monitor or merged view is a dead zone: those rows are derived from other windows
+and carry a source-window prefix that the index does not model, and a wrong nick is worse than
+a click that does nothing.
+
 ## Activity, `/next`, and the chat monitor
 
 The sidebar already said which windows had something new; it did not say which

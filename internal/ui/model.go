@@ -540,6 +540,13 @@ type Model struct {
 	// sharing one - a shared number is a /b that lands somewhere the user did not ask for.
 	bufferNo map[string]int
 
+	// selfNicks is every nick this client has seen speaking as us, folded for lookup. It is
+	// learned from Line.Own and LineSelfJoin rather than guessed from the membership list,
+	// because the model is not told the account's nick in any other place. The click handler
+	// consults it so that clicking our own name cannot open a query window addressed to
+	// ourselves, which would be a window that can only ever talk to its owner.
+	selfNicks map[string]bool
+
 	input   []rune
 	scroll  int
 	focused bool
@@ -758,14 +765,15 @@ func New(window string) Model {
 		// The defaults, not the zero value: a zero Settings is a client with timestamps,
 		// day rules and nick colours all off, which is a client nobody would recognise as
 		// the configurable one.
-		settings: DefaultSettings(),
-		unread:   make(map[string]int),
-		mention:  make(map[string]bool),
-		nicks:    make(map[string][]Nick),
-		topics:   make(map[string]string),
-		modes:    make(map[string]string),
-		netOf:    make(map[string]string),
-		bufferNo: make(map[string]int),
+		settings:  DefaultSettings(),
+		unread:    make(map[string]int),
+		mention:   make(map[string]bool),
+		nicks:     make(map[string][]Nick),
+		topics:    make(map[string]string),
+		modes:     make(map[string]string),
+		netOf:     make(map[string]string),
+		bufferNo:  make(map[string]int),
+		selfNicks: make(map[string]bool),
 	}
 	m.windows[window] = nil
 	// The first window is number 1, which is what weechat does and what makes the numbers
@@ -1265,6 +1273,13 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 			if win := m.WindowAt(msg.X, msg.Y); win != "" {
 				return m.SetActive(win), nil
 			}
+			// A nick is the other thing on screen that means a person. The hit test reads
+			// the same rows the renderer drew, so a wrapped line, a timestamp or a long nick
+			// cannot make the click land on a neighbour; see NickAt for why the cursor does
+			// not change on hover.
+			if nick := m.NickAt(msg.X, msg.Y); nick != "" {
+				return m.openQuery(nick), nil
+			}
 		}
 		return m, nil
 
@@ -1355,6 +1370,13 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// Our own line coming back from the bouncer confirms the pending echo instead of
 		// being drawn beside it. A bouncer echoes the sender - that is how a second
 		// client sees the same conversation - so anything else shows every message twice.
+		// A line from us teaches the click handler which nick is ours. It is recorded here,
+		// before the self-join switch, because a join is also us and the member list will
+		// contain that nick. Without it, clicking our own name in the list would open a
+		// query window nobody can use.
+		if line.Own || line.Kind == LineSelfJoin {
+			m.noteOwnNick(line.Nick)
+		}
 		if line.Kind == LineSelfJoin {
 			// Switch to the channel we just joined. This is what every IRC client does, and
 			// not doing it is why a message sent after /join turned into "421 Unknown
@@ -1450,7 +1472,7 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		if target, ok := retargetWindow(text); ok && !isStatusTarget(target) {
 			m.append(Line{Window: target, Nick: "me", Text: messageBody(text),
 				Kind: LineMessage, Pending: true, Time: time.Now()})
-			m = m.SetActive(target)
+			m = m.openQuery(target)
 			m.input = m.input[:0]
 			return m, nil
 		}
@@ -2994,6 +3016,27 @@ func (m Model) hides(l Line) bool {
 	return l.Mask != "" && l.Mask != l.Nick && m.ignored(l.Mask)
 }
 
+// noteOwnNick records a nick that spoke as us. The transport marks those lines Own, and our own
+// JOIN is LineSelfJoin, so both are evidence that this nick belongs to this client. Nothing else
+// in the model is told the account's nick: the click handler needs it to refuse a query addressed
+// to ourselves, and guessing from the member list would make every other user look like us.
+func (m *Model) noteOwnNick(nick string) {
+	if nick == "" {
+		return
+	}
+	if m.selfNicks == nil {
+		m.selfNicks = make(map[string]bool, 2)
+	}
+	m.selfNicks[foldNick(nick)] = true
+}
+
+// isSelfNick reports whether nick is one we have seen speaking as us. It is folded because
+// IRC nicknames are case-insensitive, and a click on "Alice" must not open a query to
+// "alice" when Alice is the user.
+func (m Model) isSelfNick(nick string) bool {
+	return m.selfNicks[foldNick(nick)]
+}
+
 // globMatchFold reports whether name matches pattern, with '*' matching any run of characters
 // and '?' exactly one rune, case-insensitively. It walks the strings with byte offsets and never
 // builds a slice, so the cost of a mask is one pass over the nick rather than one allocation per
@@ -3510,6 +3553,21 @@ func actionBody(text string) string {
 		return ""
 	}
 	return rest
+}
+
+// openQuery opens or switches to the query window for a nick. It is the one door a query is
+// created through: /msg reaches it after drawing its own echo, and a click on a nick reaches
+// it with no echo. Going through SetActive matters because that is what makes the window
+// known, numbers it, clears its badge and remembers it; a second creation path would be a
+// window that looks open and is missing one of those.
+//
+// It refuses a status target for the same reason /msg does: "*status" is the bouncer's own
+// window, not a person, and a query named after it would eat the answer.
+func (m Model) openQuery(target string) Model {
+	if target == "" || isStatusTarget(target) {
+		return m
+	}
+	return m.SetActive(target)
 }
 
 // retargetWindow reports the window a line is addressed to when that is not the active one.
@@ -4432,10 +4490,49 @@ func truncateTo(text string, width int) string {
 // around it. Keeping a body-only renderer was what let the page grow a second window
 // list and a second nicklist beside this one.
 
+// bodyRow is the clickable description of one drawn conversation row: which line it came
+// from and where that line's nick sits on the row.
+//
+// It exists beside bodyLines because a hit test that re-derived wrapping would be a second
+// copy of the layout, and the copies would disagree the first time a timestamp, a nick width
+// or a style changed. Wrapping depends on all three, so the click handler cannot safely work
+// it out again from the Line alone.
+type bodyRow struct {
+	// line is the index into the window's Line slice that produced this row, or -1 for a
+	// row with no line behind it (a collapsed run of ignored lines, or the empty rows that
+	// bottom-align a short buffer). A row with no line has nobody to query.
+	line int
+	// nickStart and nickEnd are display columns in the conversation column, end exclusive.
+	// They are 0, 0 when this row carries no nick: a continuation row of a wrapped message
+	// has the body's indent there, and a join or a day rule has no one to talk to.
+	nickStart, nickEnd int
+}
+
 // bodyLines renders the scrollback: wrapped to width, bottom-aligned, exactly n lines.
 // A chat window means the newest lines, and a long line means a second line and not an
 // ellipsis - truncating is what made the browser cut sentences off at the right edge.
+//
+// View() calls this and nothing else. The click handler calls bodyIndex, which runs the same
+// loop with the index switched on; building the index on every redraw would be allocation the
+// alloc gate exists to keep out of the relay path.
 func (m Model) bodyLines(width, n int) []string {
+	out, _ := m.bodyRender(width, n, false)
+	return out
+}
+
+// bodyIndex is bodyLines with the parallel row index kept. It is only for the click handler:
+// building it per redraw costs a slice of bodyRow for every frame, and the relay path must
+// not pay for an interaction it does not use.
+func (m Model) bodyIndex(width, n int) []bodyRow {
+	_, index := m.bodyRender(width, n, true)
+	return index
+}
+
+// bodyRender is the one loop that produces both the rows and, when wanted, the index. Keeping
+// them in one loop is the whole point: a second function that walked the lines again would
+// count wrapped rows differently the first time the renderer changed, and the click would
+// open a conversation with the wrong person or none at all.
+func (m Model) bodyRender(width, n int, wantIndex bool) ([]string, []bodyRow) {
 	if n < 1 {
 		n = 1
 	}
@@ -4443,21 +4540,26 @@ func (m Model) bodyLines(width, n int) []string {
 		width = 1
 	}
 	if m.searchPending || len(m.searchHits) > 0 {
-		return m.searchLines(width, n)
+		// A search result list is a picker, not a conversation: its rows are hits, not
+		// lines, and there is no nick to click. Returning no index is the dead zone the
+		// cursor already lives in while the picker is open.
+		return m.searchLines(width, n), nil
 	}
 	// The monitor is a derived view of every window, so it is built here, at draw time, from
 	// the Line values the model already holds. A monitor buffer appended to on every incoming
 	// line would be a second copy of the scrollback: doubled memory for a long-running
 	// daemon, and two copies that drift the moment a window is closed or cleared.
 	if m.active == monitorKey {
-		return m.monitorLines(width, n)
+		return m.monitorLines(width, n), nil
 	}
 	// The merged view has no slice of its own either. It is built here, from the members'
 	// keys, for the monitor's reason: a copied transcript goes stale when a member closes,
 	// and two sources of truth for scrollback is the bug class this codebase already paid
-	// for once.
+	// for once. Both derived views have their own prefixed rows, so neither gets an index
+	// here; a click on a nick in them is a dead zone, which is better than opening a query
+	// for the wrong person.
 	if m.active == mergeKey {
-		return m.mergeLines(width, n)
+		return m.mergeLines(width, n), nil
 	}
 	lines := m.windows[m.active]
 	end := len(lines) - m.scroll
@@ -4474,6 +4576,19 @@ func (m Model) bodyLines(width, n int) []string {
 		start = 0
 	}
 	out := make([]string, 0, n)
+	var index []bodyRow
+	if wantIndex {
+		index = make([]bodyRow, 0, n)
+	}
+	appendRows := func(rows []string, row bodyRow) {
+		out = append(out, rows...)
+		if !wantIndex {
+			return
+		}
+		for range rows {
+			index = append(index, row)
+		}
+	}
 	// Hidden lines collapse in runs. The alternative - dropping them instead of drawing a
 	// row - makes a channel scroll past in silence, which a user reads as a broken client:
 	// they add the nick a second time and wonder why nothing changed. The alternative of one
@@ -4487,10 +4602,13 @@ func (m Model) bodyLines(width, n int) []string {
 		if hidden == 0 {
 			return
 		}
-		out = append(out, hiddenLinesRow(hidden, hiddenNick, hiddenMixed, width)...)
+		// A collapsed run is not a conversation. Its row gets no line and no nick, so a
+		// click on it does nothing rather than opening a query to the first hidden person.
+		appendRows(hiddenLinesRow(hidden, hiddenNick, hiddenMixed, width), bodyRow{line: -1})
 		hidden, hiddenNick, hiddenMixed = 0, "", false
 	}
-	for _, l := range lines[start:end] {
+	for i := start; i < end; i++ {
+		l := lines[i]
 		if m.hides(l) {
 			if hidden == 0 {
 				hiddenNick = l.Nick
@@ -4501,16 +4619,31 @@ func (m Model) bodyLines(width, n int) []string {
 			continue
 		}
 		flushHidden()
-		out = append(out, lineLines(l, width, m.settings)...)
+		rows, nickStart, nickEnd := lineLinesIndexed(l, width, m.settings)
+		for j := range rows {
+			row := bodyRow{line: i}
+			if j == 0 {
+				row.nickStart, row.nickEnd = nickStart, nickEnd
+			}
+			appendRows(rows[j:j+1], row)
+		}
 	}
 	flushHidden()
 	if len(out) > n {
 		out = out[len(out)-n:]
+		if wantIndex {
+			// The index has to lose exactly the rows the view lost. Trimming one and not
+			// the other is how a click lands on the line above the one under the pointer.
+			index = index[len(index)-n:]
+		}
 	}
 	for len(out) < n {
 		out = append(out, "")
+		if wantIndex {
+			index = append(index, bodyRow{line: -1})
+		}
 	}
-	return out
+	return out, index
 }
 
 // hiddenLinesRow is the single row a run of ignored lines becomes: a count, who it was, and
@@ -4536,11 +4669,26 @@ func hiddenLinesRow(count int, nick string, mixed bool, width int) []string {
 // style; continuation lines are indented under the text so a wrapped message still
 // reads as one message.
 func lineLines(l Line, width int, st Settings) []string {
+	out, _, _ := lineLinesIndexed(l, width, st)
+	return out
+}
+
+// lineLinesIndexed is lineLines plus the display span the nick occupies on the first drawn
+// row, end exclusive. The span is computed here, beside the rows, so the click handler can
+// read it instead of re-deriving prefixes and wrapping from the Line - a second derivation
+// would be a second layout, and it would go wrong on the first long nick or style change.
+//
+// Continuation rows carry no nick: the indent under a wrapped message is the body's, and
+// treating every row as clickable would turn a click on a word deep inside a paragraph into
+// an accidental query. Line kinds that have a nick but not a conversation - a join, a part,
+// a topic change - also get 0, 0, because the person named there is not who you would be
+// talking to if you clicked.
+func lineLinesIndexed(l Line, width int, st Settings) ([]string, int, int) {
 	// A timestamp is prefixed to every line that has one, and the wrap width shrinks by
 	// exactly the prefix: a line that is wrapped before its timestamp is added is a line
 	// that overflows the frame by six columns on every busy channel.
 	if l.Kind == LineDay {
-		return dayRule(l, width)
+		return dayRule(l, width), 0, 0
 	}
 	stamp := ""
 	if !l.Time.IsZero() {
@@ -4553,18 +4701,54 @@ func lineLines(l Line, width int, st Settings) []string {
 			width += lipgloss.Width(l.Time.Format("15:04:05")) + 1
 		}
 	}
+	out := lineLinesStyled(l, width, st)
+	start, end := nickSpan(l)
 	if stamp != "" {
-		out := lineLinesStyled(l, width, st)
+		stampWidth := lipgloss.Width(stamp)
 		for i := range out {
 			if i == 0 {
 				out[i] = timeStyle.Render(stamp) + out[i]
 				continue
 			}
-			out[i] = timeStyle.Render(strings.Repeat(" ", lipgloss.Width(stamp))) + out[i]
+			out[i] = timeStyle.Render(strings.Repeat(" ", stampWidth)) + out[i]
 		}
-		return out
+		// The timestamp is drawn before the nick and is not part of it: clicking the time
+		// must be a miss, or a user aiming at the clock opens a conversation.
+		start += stampWidth
+		end += stampWidth
 	}
-	return lineLinesStyled(l, width, st)
+	if start < end && len(out) > 0 {
+		// A nick wider than the first row is split by the wrapper. Only the visible part
+		// can be clicked, and the rest is a dead zone rather than an overflow into the
+		// padding beside the row.
+		rowWidth := lipgloss.Width(out[0])
+		if start >= rowWidth {
+			start, end = 0, 0
+		} else if end > rowWidth {
+			end = rowWidth
+		}
+	}
+	return out, start, end
+}
+
+// nickSpan is where the nick starts and ends inside the styled part of a line, before the
+// timestamp is added. The prefixes here are the same ones lineLinesStyled draws, so the two
+// cannot disagree about whether a row is "<nick> " or "* nick ". Every kind that draws a nick
+// gets a span; which kinds are allowed to open a query is NickAt's decision, not the
+// renderer's.
+func nickSpan(l Line) (int, int) {
+	if l.Nick == "" {
+		return 0, 0
+	}
+	n := lipgloss.Width(l.Nick)
+	switch l.Kind {
+	case LineMessage, LineNotice:
+		return 1, 1 + n
+	case LineAction, LineJoin, LineSelfJoin, LinePart, LineQuit, LineNick, LineAway, LineTopic:
+		// These all draw a one-cell event glyph and a space before the nick.
+		return 2, 2 + n
+	}
+	return 0, 0
 }
 
 // lineLinesStyled is the per-kind renderer, without the timestamp. It is separate so the
