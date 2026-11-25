@@ -216,7 +216,17 @@ type ChannelModes struct {
 }
 
 // Sent is the message a transport sends when the user submitted a line.
-type Sent struct{ Text string }
+//
+// Window is where the line belongs when that is not the active window. A merged view is the
+// case it exists for: the user is looking at "merge", but the sentence is for the target
+// member, and the transport - which reads only a window name - must be told that name. It is
+// not a second send path: the model still produces the one Sent that a normal window produces,
+// and an empty Window keeps the pre-merge meaning ("the active window") for every existing
+// caller.
+type Sent struct {
+	Text   string
+	Window string
+}
 
 // Prefs is the settings blob the bouncer holds, decoded from its PREF line.
 //
@@ -398,11 +408,25 @@ const (
 // back to the name the user reads.
 const monitorKey = "salotto:monitor"
 
+// mergeKey is the identity of the merged window.
+//
+// Same reason as monitorKey: it is not a name any line can produce, because a nick cannot
+// contain a colon and a channel name must begin with '&', '#', '+' or '!'. A window called
+// "merge" therefore cannot be swallowed by the merged view, and winName translates the key
+// back to the word the user reads.
+const mergeKey = "salotto:merge"
+
 // monitorTail is how many lines are walked at the end of each window when the monitor is
 // built. A monitor answers "what just happened", not "what was said last week": /search is
 // the archaeology tool, and walking a whole ring on every redraw would make a redraw cost the
 // scrollback.
 const monitorTail = 200
+
+// mergeTail is the same bound for a merged view. Both are cross-window readers with the same
+// question, and walking further would make every redraw cost the scrollback the merge exists
+// to let the user read. The honest limit is that the merged view shows the newest 200 lines of
+// each member; the member's own window is where deeper history lives.
+const mergeTail = monitorTail
 
 // Model is the whole UI. It is a tea.Model and nothing more: three drivers
 // instantiate it, none of them subclass it.
@@ -459,6 +483,24 @@ type Model struct {
 	monitorPattern string
 	monitorRE      *regexp.Regexp
 	monitorReturn  string
+
+	// merge is whether the merged window is open, mergeMembers are the window keys it reads,
+	// mergeTarget is the member a typed line goes to, and mergeReturn is the window /merge-off
+	// goes back to.
+	//
+	// It has no slice of its own for the monitor's reason, repeated because this is the second
+	// derived view and the temptation is exactly the same: a copied line slice goes stale the
+	// moment a member is closed, and two sources of truth for scrollback is the bug class this
+	// codebase already paid for once. Rows are rebuilt from the members when View runs.
+	//
+	// Membership is per client and in memory. It is deliberately not in the settings blob: two
+	// attached clients merging different windows is a normal thing to do, and a merge that
+	// follows a user between a browser tab and a terminal is a surprise, not a feature. The
+	// members are keys rather than names so two networks' same-named channels stay two members.
+	merge        bool
+	mergeMembers []string
+	mergeTarget  string
+	mergeReturn  string
 
 	// nicks is the membership of each channel, replaced wholesale by a Nicklist
 	// message. It is separate from windows because membership is not scrollback:
@@ -623,6 +665,11 @@ func winName(key string) string {
 		// reads is still "monitor", which is the name every other client gives it.
 		return "monitor"
 	}
+	if key == mergeKey {
+		// The merged view reads as "merge" in the sidebar and the title, and the arrow the
+		// title adds names its target. The key stays unreachable by any nick or channel.
+		return "merge"
+	}
 	_, name := keyWindow(key)
 	return name
 }
@@ -769,8 +816,9 @@ func (m *Model) assignBuffer(window string) int {
 	}
 	// The monitor is a window but not a buffer. A number is what puts a window in the /b
 	// list, and the monitor is a view across buffers, so numbering it would offer a jump
-	// target that is not a place a conversation happened.
-	if window == monitorKey {
+	// target that is not a place a conversation happened. The merged view is the same kind
+	// of thing for the same reason: it is a way of reading several buffers, not one.
+	if window == monitorKey || window == mergeKey {
 		return 0
 	}
 	if n, ok := m.bufferNo[window]; ok {
@@ -848,6 +896,25 @@ func (m Model) SetActive(name string) Model {
 		m.scroll = 0
 		return m
 	}
+	// The merged view is a view too, and the same rules apply: it may be selected while it is
+	// open - a click on its row, or ctrl-n - but selecting it must not create an empty view,
+	// and it is never recorded as the last window because its members will not all be there
+	// next time. Looking at the merged view does clear each member, because those lines are on
+	// screen: a badge for a sentence the user is reading would be the count disagreeing with
+	// the view.
+	if name == mergeKey {
+		if !m.merge {
+			return m
+		}
+		m.active = name
+		m.windowChosen = true
+		m.scroll = 0
+		for _, key := range m.mergeMembers {
+			delete(m.unread, key)
+			delete(m.mention, key)
+		}
+		return m
+	}
 	if _, seen := m.windows[name]; !seen {
 		m.windows[name] = nil
 		m.order = append(m.order, name)
@@ -864,6 +931,35 @@ func (m Model) SetActive(name string) Model {
 	delete(m.mention, name)
 	m.rememberWindow()
 	return m
+}
+
+// SendTarget is where a line typed in the active window belongs, as a window key.
+//
+// Most of the time it is the active window. In the merged view it is the target member, and
+// that is the whole design of buffer merge: an interleaved view has several plausible
+// recipients, and guessing is a message to the wrong channel, which a user cannot undo. The
+// target is named in the title and cycled with Ctrl-T, and this one method is what the
+// transport sync and the Sent message both read, so the title and the wire cannot disagree.
+func (m Model) SendTarget() string {
+	if m.active == mergeKey && m.mergeTarget != "" {
+		return m.mergeTarget
+	}
+	return m.active
+}
+
+// sendWindow resolves the window a Sent belongs to: the hint when it still names a live
+// window, the send target otherwise. It is deliberately not "whichever member the user last
+// visited": that alternative would make the same keystroke type into a different window
+// depending on history the user cannot see, and an interleaved view's history is exactly the
+// thing that is not visible in the input line.
+func (m Model) sendWindow(hint string) string {
+	if hint != "" {
+		key := m.keyFor(hint)
+		if _, live := m.windows[key]; live {
+			return key
+		}
+	}
+	return m.SendTarget()
 }
 
 // rememberWindow records the window being looked at in the settings blob, so a client that
@@ -966,6 +1062,30 @@ func (m *Model) migrateKey(from, to string) {
 		if _, taken := m.bufferNo[to]; !taken {
 			m.bufferNo[to] = n
 		}
+	}
+	// The merged view holds member keys, so a rekey has to move them too: a stale bare key
+	// would make the merge draw nothing for a member whose lines are now under the qualified
+	// key. Duplicates are collapsed because the same window under two keys is still one
+	// member, and Ctrl-T would otherwise visit it twice.
+	if len(m.mergeMembers) > 0 {
+		moved := make([]string, 0, len(m.mergeMembers))
+		seen := make(map[string]bool, len(m.mergeMembers))
+		for _, member := range m.mergeMembers {
+			if member == from {
+				member = to
+			}
+			if !seen[member] {
+				seen[member] = true
+				moved = append(moved, member)
+			}
+		}
+		m.mergeMembers = moved
+	}
+	if m.mergeTarget == from {
+		m.mergeTarget = to
+	}
+	if m.mergeReturn == from {
+		m.mergeReturn = to
 	}
 	if m.active == from {
 		m.active = to
@@ -1302,6 +1422,12 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		if text == "" {
 			return m, nil
 		}
+		// The window this line belongs to. A merged view is the reason it is not simply
+		// m.active: the user is reading "merge", but the sentence is for the target member,
+		// and the local echo has to land in that member's buffer - the merged view has no
+		// buffer of its own to echo into. An empty hint keeps the old meaning, the active
+		// window, because every driver and test that predates the merge sends one.
+		window := m.sendWindow(msg.Window)
 		// A command is not conversation, so it is not drawn as a line of ours.
 		//
 		// Everything that reaches here used to be echoed, which included every command that goes
@@ -1377,7 +1503,7 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		// user would wait for an answer to a message that never left. Say it in the window
 		// they typed in, because that is where they are looking.
 		if !m.connected {
-			m.append(Line{Window: m.active, Nick: "salotto", Text: "not sent (not connected): " + text, Kind: LineError, Time: time.Now()})
+			m.append(Line{Window: window, Nick: "salotto", Text: "not sent (not connected): " + text, Kind: LineError, Time: time.Now()})
 			m.input = m.input[:0]
 			return m, nil
 		}
@@ -1385,8 +1511,8 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		if actionBody(text) != "" {
 			kind = LineAction
 		}
-		for _, part := range m.echoParts(echo) {
-			m.append(Line{Window: m.active, Nick: "me", Text: part, Kind: kind, Pending: true, Time: time.Now()})
+		for _, part := range m.echoPartsFor(window, echo) {
+			m.append(Line{Window: window, Nick: "me", Text: part, Kind: kind, Pending: true, Time: time.Now()})
 		}
 		m.input = m.input[:0]
 		return m, nil
@@ -1511,6 +1637,22 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if _, _, ok := slash(text, "monitor-off"); ok {
 			return m.closeMonitor(), nil
 		}
+		// A merged view is the same shape as the monitor: several windows read as one,
+		// rebuilt from their keys when View runs. The commands are the model's for the same
+		// reason /go is - the window list and its keys belong to this client, and a bouncer
+		// has no opinion about how a client arranges its own windows.
+		if _, rest, ok := slash(text, "merge"); ok {
+			return m.mergeWindows(rest), nil
+		}
+		if _, _, ok := slash(text, "merge-off"); ok {
+			return m.closeMerge(), nil
+		}
+		if _, rest, ok := slash(text, "unmerge"); ok {
+			return m.unmergeWindow(rest), nil
+		}
+		if _, _, ok := slash(text, "t"); ok {
+			return m.cycleMergeTarget(), nil
+		}
 		// "/search pattern" searches across every window in memory and shows the hits as a
 		// list of jumps. It is resolved here for the same reason /go is: the scrollback lives
 		// in the client, so a command sent upstream could only return what the bouncer's
@@ -1532,6 +1674,17 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		// mistake a user cannot take back. Refuse it where they are looking instead.
 		if m.active == monitorKey {
 			return m.appendSystem("the monitor is read-only; nothing was sent"), nil
+		}
+		// A merged view does have a recipient, and it is named in the title. The Sent carries
+		// the target's key rather than the merged key because the transport speaks IRC and
+		// "merge" is not a channel; sending the merged key would put the line into a channel
+		// called merge, which is the wrong-recipient mistake the target exists to prevent.
+		if m.active == mergeKey {
+			if m.mergeTarget == "" || !m.isMergeMember(m.mergeTarget) {
+				return m.appendSystem("the merged view has no target; nothing was sent"), nil
+			}
+			target := m.mergeTarget
+			return m, func() tea.Msg { return Sent{Text: text, Window: target} }
 		}
 		return m, func() tea.Msg { return Sent{Text: text} }
 
@@ -1573,6 +1726,11 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	case tea.KeyCtrlP:
 		return m.cycle(-1), nil
+
+	case tea.KeyCtrlT:
+		// The target is the one thing a merged view cannot guess, so cycling it is a key of
+		// its own rather than a command buried in /help. It is a no-op outside the merged view.
+		return m.cycleMergeTarget(), nil
 
 	case tea.KeyRunes:
 		// Alt-A jumps to the next window with unread activity, which is what weechat calls
@@ -1718,8 +1876,9 @@ func (m Model) helpIntoWindow() Model {
 // table for the benefit of Tab would mean two lists to keep in step - the failure mode the /fset
 // screen already had once.
 var modelCommands = []string{
-	"/alias", "/b", "/close", "/fset", "/find", "/go", "/help", "/ignore", "/monitor",
-	"/monitor-off", "/next", "/next!", "/prev", "/prev!", "/search", "/settings", "/unignore",
+	"/alias", "/b", "/close", "/fset", "/find", "/go", "/help", "/ignore", "/merge",
+	"/merge-off", "/monitor", "/monitor-off", "/next", "/next!", "/prev", "/prev!", "/search",
+	"/settings", "/t", "/unmerge", "/unignore",
 }
 
 // wireCommands are passed through to the bouncer with the leading slash stripped. They are listed
@@ -1942,8 +2101,9 @@ func (m Model) bufferList() string {
 	entries := make([]entry, 0, len(m.windows))
 	for key := range m.windows {
 		// The monitor has no number and is not a buffer; listing it here would offer "/b 0"
-		// as a way to reach a view, which is not what /b is for.
-		if key == monitorKey {
+		// as a way to reach a view, which is not what /b is for. The merged view is the same
+		// kind of thing and is skipped for the same reason.
+		if key == monitorKey || key == mergeKey {
 			continue
 		}
 		// The name, not the key; but when two networks hold the same name the list has to
@@ -2091,6 +2251,35 @@ func (m Model) closeActive() Model {
 	if name == monitorKey {
 		return m.closeMonitor()
 	}
+	// In the merged view /close closes the target member, not the view. The target is the
+	// member the view is offering as the recipient, so it is the one "this one is done"
+	// means; dissolving the view is /merge-off. Making /close mean "close the view" here
+	// would let the key that closes a buffer silently throw away the merge.
+	if name == mergeKey {
+		target := m.mergeTarget
+		if target == "" {
+			return m.closeMerge()
+		}
+		label := m.mergeTargetLabel()
+		last := len(m.mergeMembers) <= 1
+		m = m.detachMergeMember(target)
+		m = m.dropWindow(target)
+		if last || !m.merge {
+			if _, live := m.windows[m.active]; !live {
+				return m.SetActive(m.firstRealWindow())
+			}
+			return m
+		}
+		m.active = mergeKey
+		m.scroll = 0
+		return m.appendSystem("closed " + label + "; target → " + m.mergeTargetLabel() + "\n")
+	}
+	// A member closed from its own window leaves the merge too. Keeping the key would leave
+	// the merged view drawing nothing for a window that no longer exists, and Ctrl-T would
+	// land on a target the next line cannot reach.
+	if m.merge && m.isMergeMember(name) {
+		m = m.detachMergeMember(name)
+	}
 	if len(m.order) <= 1 {
 		return m
 	}
@@ -2117,6 +2306,30 @@ func (m Model) closeActive() Model {
 	}
 	m.active = m.order[idx]
 	m.scroll = 0
+	return m
+}
+
+// dropWindow removes a window's state without choosing what to do about the active window.
+// /close in the merged view needs that split: the target is closed while the merged view stays
+// active, so the neighbour-picking half of closeActive would be choosing an active window that
+// is immediately overwritten.
+func (m Model) dropWindow(name string) Model {
+	if name == "" || name == mergeKey || name == monitorKey {
+		return m
+	}
+	out := make([]string, 0, len(m.order))
+	for _, w := range m.order {
+		if w != name {
+			out = append(out, w)
+		}
+	}
+	delete(m.windows, name)
+	delete(m.unread, name)
+	delete(m.mention, name)
+	delete(m.nicks, name)
+	delete(m.topics, name)
+	delete(m.modes, name)
+	m.order = out
 	return m
 }
 
@@ -2213,6 +2426,394 @@ func (m Model) firstRealWindow() string {
 		}
 	}
 	return "status"
+}
+
+// isMergeMember reports whether a key is in the merged view. The members are keys rather than
+// names because two networks can both hold "#salotto", and a membership list of names would
+// merge whichever one happened to be looked up first.
+func (m Model) isMergeMember(key string) bool {
+	for _, member := range m.mergeMembers {
+		if member == key {
+			return true
+		}
+	}
+	return false
+}
+
+// visible reports whether the user is looking at a window right now: the active window, or a
+// member of the merged view while that view is active. A line the user can see arrive is not
+// unread, and a mention they can see is not a reason for a badge on a window they are already
+// reading. Without this, every message sent from the merged view would badge its own target.
+func (m Model) visible(key string) bool {
+	if key == m.active {
+		return true
+	}
+	return m.active == mergeKey && m.merge && m.isMergeMember(key)
+}
+
+// mergeOrder is the members in the order the sidebar draws them, which is the order Ctrl-T
+// cycles. It goes through navigationOrder rather than m.order for the monitor's reason:
+// /next and the sidebar already share one order, and a third order for the merge would make
+// the same list look different depending on which key the user pressed.
+func (m Model) mergeOrder() []string {
+	out := make([]string, 0, len(m.mergeMembers))
+	for _, key := range m.navigationOrder() {
+		if m.isMergeMember(key) {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// mergeTargetLabel is the target's display name for the title. A duplicate name carries its
+// network, as the buffer list does, because two merged channels can both be called "#salotto"
+// and a title that cannot say which one is the next message's recipient is not naming it.
+func (m Model) mergeTargetLabel() string {
+	if m.mergeTarget == "" {
+		return "no target"
+	}
+	label := winName(m.mergeTarget)
+	if net, _ := keyWindow(m.mergeTarget); net != "" && m.duplicateName(m.mergeTarget) {
+		label += " (" + net + ")"
+	}
+	return label
+}
+
+// resolveMergeName turns a /merge or /unmerge argument into a window key. A number is a
+// buffer number first, because "/merge 2" is what the sidebar teaches a user to type; keyFor
+// has never known numbers, and leaving it to create a window called "2" would be a merge of a
+// window that does not exist.
+func (m Model) resolveMergeName(name string) (key string, ok bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", false
+	}
+	if n, err := strconv.Atoi(name); err == nil {
+		if key, found := m.bufferByName(n); found {
+			return key, true
+		}
+	}
+	key = m.keyFor(name)
+	if key == mergeKey || key == monitorKey {
+		return key, true
+	}
+	_, live := m.windows[key]
+	return key, live
+}
+
+// mergeWindows is /merge. It creates the view if it is absent and switches to it. One
+// argument merges the current window with that one, which is the common case: the user is in
+// a channel and wants the other network's same-named channel beside it.
+func (m Model) mergeWindows(rest string) Model {
+	args := strings.Fields(rest)
+	if len(args) == 0 {
+		return m.appendSystem("usage: /merge <window> [<window> ...]\n")
+	}
+	from := m.active
+	wanted := make([]string, 0, len(args)+1)
+	seen := make(map[string]bool, len(args)+1)
+	var notes []string
+
+	for _, arg := range args {
+		key, ok := m.resolveMergeName(arg)
+		if !ok {
+			notes = append(notes, "no window matches "+arg)
+			continue
+		}
+		switch {
+		case key == mergeKey:
+			notes = append(notes, "the merged view cannot be merged into itself")
+		case key == monitorKey:
+			notes = append(notes, "the monitor is a view; it cannot be merged")
+		case m.merge && m.isMergeMember(key):
+			// A name that resolves to a member already in the merge is a no-op with an
+			// answer, not a second row: two references to one window would draw every line
+			// twice and make the target cycle visit one member in two positions.
+			notes = append(notes, "already merged: "+winName(key))
+		case seen[key]:
+			notes = append(notes, "named twice: "+winName(key))
+		default:
+			seen[key] = true
+			wanted = append(wanted, key)
+		}
+	}
+
+	// One argument outside the view means "this window and that one". Two or more name the
+	// members themselves, so that /merge #a #b from status does not silently drag status in.
+	if !m.merge && len(args) == 1 && from != mergeKey && from != monitorKey {
+		if _, live := m.windows[from]; live && !seen[from] {
+			wanted = append([]string{from}, wanted...)
+		}
+	}
+	if len(wanted) == 0 {
+		for _, note := range notes {
+			m = m.appendSystem(note + "\n")
+		}
+		return m
+	}
+
+	if !m.merge {
+		if m.windows == nil {
+			m.windows = make(map[string][]Line, 4)
+		}
+		if _, seenKey := m.windows[mergeKey]; !seenKey {
+			m.windows[mergeKey] = nil
+			m.order = append(m.order, mergeKey)
+		}
+		m.merge = true
+		if from != mergeKey {
+			m.mergeReturn = from
+		}
+		m.mergeMembers = wanted
+	} else {
+		m.mergeMembers = append(m.mergeMembers, wanted...)
+	}
+
+	// The target is the window the user came from when that window is a member - a one-argument
+	// merge continues the conversation they were already in - and the first member in sidebar
+	// order otherwise. Never the merged key: that has no channel behind it.
+	if !m.isMergeMember(m.mergeTarget) {
+		m.mergeTarget = ""
+		if from != mergeKey && m.isMergeMember(from) {
+			m.mergeTarget = from
+		} else if order := m.mergeOrder(); len(order) > 0 {
+			m.mergeTarget = order[0]
+		}
+	}
+
+	// Looking at the merged view is looking at these windows: their lines are on screen, so
+	// their badges would be counting something the user can already read. The switch is direct
+	// rather than through SetActive because the merged view is a view and must never become
+	// last_window in the settings blob.
+	m.active = mergeKey
+	m.windowChosen = true
+	m.scroll = 0
+	delete(m.unread, mergeKey)
+	delete(m.mention, mergeKey)
+	for _, key := range m.mergeMembers {
+		delete(m.unread, key)
+		delete(m.mention, key)
+	}
+	for _, note := range notes {
+		m = m.appendSystem(note + "\n")
+	}
+	return m
+}
+
+// unmergeWindow is /unmerge: remove one member. The view closes itself when the last member
+// goes, because a merged view with no members is a window the user cannot type into and cannot
+// leave by any means except /close.
+func (m Model) unmergeWindow(rest string) Model {
+	if !m.merge {
+		return m.appendSystem("no merged view\n")
+	}
+	name := strings.TrimSpace(rest)
+	if name == "" {
+		return m.appendSystem("usage: /unmerge <window>\n")
+	}
+	key, ok := m.resolveMergeName(name)
+	if !ok {
+		return m.appendSystem("no window matches " + name + "\n")
+	}
+	if !m.isMergeMember(key) {
+		return m.appendSystem(winName(key) + " is not merged\n")
+	}
+	label := winName(key)
+	m = m.detachMergeMember(key)
+	if !m.merge {
+		return m.appendSystem("unmerged " + label + "; no members left, the merged view closed\n")
+	}
+	return m.appendSystem("unmerged " + label + "\n")
+}
+
+// detachMergeMember removes one key, moving the target to the next surviving member in sidebar
+// order when the target itself is the one leaving. A dangling target would be worse than a
+// wrong one: "merge → #salotto" pointing at a window that no longer exists is a title that
+// promises a recipient the next line cannot reach.
+func (m Model) detachMergeMember(key string) Model {
+	if !m.merge {
+		return m
+	}
+	order := m.mergeOrder()
+	pos := -1
+	for i, member := range order {
+		if member == key {
+			pos = i
+			break
+		}
+	}
+	out := make([]string, 0, len(m.mergeMembers))
+	for _, member := range m.mergeMembers {
+		if member != key {
+			out = append(out, member)
+		}
+	}
+	m.mergeMembers = out
+	if len(out) == 0 {
+		return m.closeMerge()
+	}
+	if m.mergeTarget == key || !m.isMergeMember(m.mergeTarget) {
+		m.mergeTarget = out[0]
+		if pos >= 0 {
+			for step := 1; step <= len(order); step++ {
+				candidate := order[(pos+step)%len(order)]
+				if candidate != key && m.isMergeMember(candidate) {
+					m.mergeTarget = candidate
+					break
+				}
+			}
+		}
+	}
+	return m
+}
+
+// cycleMergeTarget is Ctrl-T and /t. It advances the target through the members in sidebar
+// order and says so in the merged scrollback, because the title is one line and the user's
+// finger is on the key: a silent change would be a message to the next channel with only a
+// title they did not read as evidence.
+func (m Model) cycleMergeTarget() Model {
+	if !m.merge || m.active != mergeKey {
+		return m
+	}
+	order := m.mergeOrder()
+	if len(order) == 0 {
+		return m
+	}
+	next := order[0]
+	for i, key := range order {
+		if key == m.mergeTarget {
+			next = order[(i+1)%len(order)]
+			break
+		}
+	}
+	m.mergeTarget = next
+	m.scroll = 0
+	m.append(Line{Window: mergeKey, Nick: "salotto", Kind: LineSystem,
+		Text: "target → " + m.mergeTargetLabel(), Time: time.Now()})
+	return m
+}
+
+// closeMerge removes the merged window and returns to the window it was opened from. The
+// derived rows go with the window and nothing else does: there is no copied history to keep
+// in step, which is why closing and reopening cannot leave the view showing a stale line from
+// a member that has moved on.
+func (m Model) closeMerge() Model {
+	if !m.merge {
+		return m
+	}
+	wasActive := m.active == mergeKey
+	back := m.mergeReturn
+	m.merge = false
+	m.mergeMembers = nil
+	m.mergeTarget = ""
+	m.mergeReturn = ""
+	delete(m.windows, mergeKey)
+	delete(m.unread, mergeKey)
+	delete(m.mention, mergeKey)
+	delete(m.nicks, mergeKey)
+	delete(m.topics, mergeKey)
+	delete(m.modes, mergeKey)
+	out := make([]string, 0, len(m.order))
+	for _, key := range m.order {
+		if key != mergeKey {
+			out = append(out, key)
+		}
+	}
+	m.order = out
+	if !wasActive {
+		return m
+	}
+	if back != "" && back != mergeKey {
+		if _, live := m.windows[back]; live {
+			return m.SetActive(back)
+		}
+	}
+	return m.SetActive(m.firstRealWindow())
+}
+
+// mergeMessages is the merged view's content, derived from its members at call time.
+//
+// It is deliberately not a second slice of history. Appending every incoming line to a
+// "merged" buffer would double the memory a long-running scrollback already costs, and the
+// copy would disagree the moment a member was closed: the view would keep drawing a line the
+// member no longer holds. Building from the members means the two can never contradict each
+// other, and /merge-off cannot leave a stale transcript behind.
+//
+// Only the tail of each member is walked (mergeTail lines), because this view answers "what
+// just happened" across the members; the member's own window and /search are where older
+// lines live.
+func (m Model) mergeMessages() []Line {
+	out := make([]Line, 0, mergeTail)
+	for _, key := range m.mergeMembers {
+		if key == mergeKey {
+			continue
+		}
+		lines := m.windows[key]
+		start := len(lines) - mergeTail
+		if start < 0 {
+			start = 0
+		}
+		out = append(out, lines[start:]...)
+	}
+	// The merged window's own buffer holds the client's notices to it - the target change, a
+	// refusal - which are not chat from a member and must be shown, or the confirmation would
+	// be invisible. It is a notice log, never a copy of anybody's conversation.
+	own := m.windows[mergeKey]
+	start := len(own) - mergeTail
+	if start < 0 {
+		start = 0
+	}
+	out = append(out, own[start:]...)
+	// One stream across members, ordered by when it happened. Lines with no time keep their
+	// member order and sort last, which is where the client's own notices belong.
+	sort.SliceStable(out, func(i, j int) bool {
+		ti, tj := out[i].Time, out[j].Time
+		if ti.IsZero() {
+			return false
+		}
+		if tj.IsZero() {
+			return true
+		}
+		return ti.Before(tj)
+	})
+	return out
+}
+
+// mergeLines renders the merged view: each member's rows interleaved by time, every row
+// labelled with the window it came from. The label is not decoration: the reason to read
+// several windows as one is to know where a sentence came from, and a line without its window
+// is a quote with no attribution. The merge's own notices are not labelled - "target → #a"
+// already says where it belongs.
+func (m Model) mergeLines(width, n int) []string {
+	if n < 1 {
+		n = 1
+	}
+	if width < 1 {
+		width = 1
+	}
+	msgs := m.mergeMessages()
+	end := len(msgs) - m.scroll
+	if end > len(msgs) {
+		end = len(msgs)
+	}
+	if end < 0 {
+		end = 0
+	}
+	out := make([]string, 0, n)
+	for _, l := range msgs[:end] {
+		shown := l
+		if l.Window != mergeKey {
+			shown.Text = "[" + winName(l.Window) + "] " + l.Text
+		}
+		out = append(out, lineLines(shown, width, m.settings)...)
+	}
+	if len(out) > n {
+		out = out[len(out)-n:]
+	}
+	for len(out) < n {
+		out = append(out, "")
+	}
+	return out
 }
 
 // monitorWants reports whether a line belongs in the monitor under the current filter.
@@ -2610,7 +3211,10 @@ func (m Model) navigationOrder() []string {
 	out := make([]string, 0, len(rows))
 	seen := make(map[string]bool, len(rows))
 	for _, row := range rows {
-		if row.window == "" || seen[row.window] {
+		if row.window == "" || row.window == mergeKey || seen[row.window] {
+			// The merged view is drawn in the sidebar but is not part of the /next walk:
+			// jumping into a view that is a way of reading several buffers would be a jump
+			// to no conversation in particular, and the activity ranking has no row for it.
 			continue
 		}
 		seen[row.window] = true
@@ -2845,7 +3449,15 @@ func (m Model) WithSettings(path string) Model {
 // function and the limit - is what actually has to agree. A test asserts the two produce the
 // same strings so the mirroring cannot drift.
 func (m Model) echoParts(text string) []string {
-	wire := "PRIVMSG " + m.active + " :" + text
+	return m.echoPartsFor(m.active, text)
+}
+
+// echoPartsFor is echoParts for a named window. The merged view needs it because the wire
+// line is assembled for the target member's name, and getting the name wrong changes where
+// the split falls: the point of the mirror is that the local echo is exactly what Send will
+// carry, and that is a property of the destination, not of the window being looked at.
+func (m Model) echoPartsFor(window, text string) []string {
+	wire := "PRIVMSG " + window + " :" + text
 	head, body, ok := splitMessage(wire)
 	if !ok {
 		return []string{text}
@@ -2856,7 +3468,7 @@ func (m Model) echoParts(text string) []string {
 	// used to do - and, because confirmation matches on text, no relayed ACTION would ever
 	// match it, so the echo sat there as a pending line forever beside the real one.
 	if body := actionBody(text); body != "" {
-		wire = "PRIVMSG " + m.active + " :" + ctcpOpen + body + ctcpClose
+		wire = "PRIVMSG " + window + " :" + ctcpOpen + body + ctcpClose
 		head, body, ok = splitMessage(wire)
 		if !ok {
 			return []string{text}
@@ -3054,7 +3666,7 @@ func (m *Model) append(l Line) {
 	// a badge for a sentence the user cannot see is a count that leads nowhere. The line is
 	// still in the buffer, so unhiding it brings the conversation back; only the drawn form and
 	// the activity are suppressed.
-	if l.Window != m.active && l.Kind != LineGap && l.Kind != LinePreview && !m.muted(l.Nick) && !m.hides(l) {
+	if !m.visible(l.Window) && l.Kind != LineGap && l.Kind != LinePreview && !m.muted(l.Nick) && !m.hides(l) {
 		if m.unread == nil {
 			m.unread = make(map[string]int)
 		}
@@ -3336,7 +3948,14 @@ func (m Model) View() string {
 	// it. Modes first: they are short and survive truncation where a long topic does
 	// not.
 	b.WriteString(borderStyle.Render("╭─ "))
-	b.WriteString(titleStyle.Render(winName(m.active)))
+	title := winName(m.active)
+	if m.active == mergeKey {
+		// The target is the one thing an interleaved view cannot infer, so it is part of
+		// the title rather than a status line the user has to look for. "merge → #salotto"
+		// answers "where will this line go" at the same glance as "what am I reading".
+		title = "merge → " + m.mergeTargetLabel()
+	}
+	b.WriteString(titleStyle.Render(title))
 	if m.scroll > 0 {
 		b.WriteString(systemStyle.Render(fmt.Sprintf(" (scroll %d)", m.scroll)))
 	}
@@ -3612,8 +4231,9 @@ func (m Model) windowRow(key string) sidebarRow {
 	text := winName(key)
 	// The monitor is a view across buffers, not a buffer: no number, so /b cannot reach it,
 	// and no count, because it has no unread lines of its own and a badge here would be a
-	// second, disagreeing answer to "how much is new".
-	if key == monitorKey {
+	// second, disagreeing answer to "how much is new". The merged view is the same kind of
+	// window and gets the same treatment.
+	if key == monitorKey || key == mergeKey {
 		return sidebarRow{window: key, text: text}
 	}
 	if m.settings.BufferNumbers {
@@ -3822,6 +4442,13 @@ func (m Model) bodyLines(width, n int) []string {
 	// daemon, and two copies that drift the moment a window is closed or cleared.
 	if m.active == monitorKey {
 		return m.monitorLines(width, n)
+	}
+	// The merged view has no slice of its own either. It is built here, from the members'
+	// keys, for the monitor's reason: a copied transcript goes stale when a member closes,
+	// and two sources of truth for scrollback is the bug class this codebase already paid
+	// for once.
+	if m.active == mergeKey {
+		return m.mergeLines(width, n)
 	}
 	lines := m.windows[m.active]
 	end := len(lines) - m.scroll
@@ -4174,7 +4801,7 @@ func (m Model) statusBar() string {
 	if m.status != "" {
 		extra = " · " + m.status
 	}
-	return barStyle.Width(max(m.width, 20)).Render(fmt.Sprintf(" %s · %s%s", m.active, state, extra))
+	return barStyle.Width(max(m.width, 20)).Render(fmt.Sprintf(" %s · %s%s", winName(m.active), state, extra))
 }
 
 func max(a, b int) int {

@@ -200,6 +200,53 @@ numbered a window or wrote an activity would write through the maps every
 `Step` shares, which is a race with the transport and a state change caused by
 looking at the screen.
 
+## Buffer merge: several windows read as one, one target named
+
+A merged view is a window, not a mode, and it is the monitor's shape again: a
+key (`salotto:merge`) that no nick or channel can produce, and rows built in
+`View()` from the members' keys. There is deliberately no `merged []Line`.
+Copying every incoming line into it would double the memory of a long-running
+scrollback, and the copy would disagree the moment a member was closed - the
+view would keep drawing a line the member no longer held. Only the last 200
+lines of each member are walked, with the same bound as the monitor, and the
+rows are stable-sorted by their `Time` so a conversation is one stream rather
+than two buffers glued together. Every chat row is prefixed with its source
+window; a line in a cross-window view without its window is a quote with no
+attribution.
+
+An interleaved view has several plausible recipients, so it names one. Exactly
+one member is the **target**, and the title reads `merge → <target>` - the
+answer to "where will this line go" at the same glance as "what am I reading".
+`Ctrl-T` (or `/t`) advances the target through the members in the order the
+sidebar draws them, wraps, and writes `target → <name>` into the merged
+scrollback: changing the recipient silently would be a message to the wrong
+channel with only an unread title as evidence. Enter is not a second send path.
+The model puts the target's key in `Sent.Window` and echoes into that member's
+buffer; `Program` points the transport at the same target for the one line, so
+the title and the wire cannot disagree.
+
+`/close` in the merged view closes the target member and moves the target to the
+next survivor; closing the last member closes the merged view rather than
+leaving a window that cannot be typed in. Closing a member from its own window
+also removes it from the merge. Membership is per client and in memory, never
+in the settings blob: two attached clients merging different windows is a
+normal thing to do, and a merge that followed a user between a browser tab and
+a terminal would be a surprise. The merged window has no buffer number and no
+badge, is not listed by `/b`, and is outside the `/next` walk and the activity
+ranking - it is a way of reading buffers, not one of them.
+
+| key / command | what it does |
+|---|---|
+| `/merge <window> [<window> ...]` | merge these, creating the view if absent, and switch to it; one argument merges the current window with that one |
+| `/merge-off` | dissolve the merge and return to the previous window |
+| `/unmerge <window>` | remove one member; the view closes when the last one goes |
+| `/t` | cycle the target and name it in the merged scrollback |
+| `Ctrl-T` | the same cycle without typing a command |
+
+Names resolve through `keyFor`, so `/merge #salotto`, `/merge 2` and
+`/merge status` all work. A name that resolves to a member already in the merge
+is a no-op with a message rather than a duplicate row.
+
 ## Reconnecting without doubling the scrollback
 
 The transport owns the retry loop, not the drivers. Three front ends, one of them spawning a

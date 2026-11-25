@@ -185,7 +185,18 @@ func (p *Program) step(msg tea.Msg, resolve, sync bool) tea.Cmd {
 	// and all that is left is the wire. It is handled here, before the model sees it, so the
 	// line is sent exactly once whether it arrives from a runtime or from step() itself.
 	if sent, ok := msg.(Sent); ok {
+		// A merged view is the reason Sent can name a window that is not the active one: the
+		// user is reading "merge" but the sentence is for its target. The transport speaks
+		// bare window names, so point it at the target for the one line and then put it back;
+		// sending the merged key would be PRIVMSG salotto:merge, a channel that cannot exist
+		// and a message nobody receives.
+		if p.tr != nil && sent.Window != "" {
+			p.tr.SetActive(winName(sent.Window))
+		}
 		p.submit(sent.Text)
+		if p.tr != nil {
+			p.tr.SetActive(winName(p.sendTarget()))
+		}
 	}
 
 	// Settings are the shared truth at the bouncer. The model produces the token
@@ -349,7 +360,19 @@ func (p *Program) SyncActive() {
 	}
 	// The transport sees the bare window name. It speaks IRC, which has no idea what a
 	// "network/name" key is - the bouncer resolves a channel across its networks itself.
-	p.tr.SetActive(winName(p.WindowName()))
+	//
+	// The send target, not Active: in the merged view Active is "salotto:merge", which is not
+	// a channel, while the line belongs to the target member named in the title. One method
+	// answers for both this and the Sent produced by Enter, so the title and the wire cannot
+	// name different windows.
+	p.tr.SetActive(winName(p.sendTarget()))
+}
+
+// sendTarget is Model.SendTarget under the lock, for the transport sync.
+func (p *Program) sendTarget() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.model.SendTarget()
 }
 
 // View renders the current model.
