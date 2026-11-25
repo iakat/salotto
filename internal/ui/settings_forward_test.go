@@ -205,7 +205,7 @@ func TestAnUnexportedFieldIsNotOnTheWire(t *testing.T) {
 func TestAKnownKeyIsNotTreatedAsForeign(t *testing.T) {
 	known := knownKeys()
 	for _, k := range []string{"timestamps", "seconds", "date_rule", "nick_colors", "hotlist",
-		"scroll_step", "aliases", "mutes", "highlights", "group_by_server", "buffer_numbers"} {
+		"scroll_step", "aliases", "mutes", "ignore", "highlights", "group_by_server", "buffer_numbers"} {
 		if !known[k] {
 			t.Fatalf("%q is a field of Settings but knownKeys does not list it", k)
 		}

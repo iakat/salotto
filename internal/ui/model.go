@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -38,6 +39,12 @@ type Line struct {
 	Nick   string
 	Text   string
 	Kind   LineKind
+
+	// Mask is the full prefix the line came from: "nick!user@host". Nick is what the window
+	// draws, but a mask is what some ignore rules are about - "*!*@spam.example" is a rule
+	// about a host, not about a name - so the transport keeps the part the renderer discards.
+	// Empty means the transport did not have a prefix (a synthetic line, or a server notice).
+	Mask string
 
 	// Time is when the line happened. It comes from the server-time tag when the server
 	// or the bouncer sent one, and from the clock otherwise.
@@ -1247,14 +1254,14 @@ func (m Model) Step(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		if !line.Pending {
 			if m.confirmPending(line) {
-				if line.Mention {
+				if line.Mention && !m.hides(line) {
 					m = m.NoteMention(line.Window)
 				}
 				return m, nil
 			}
 		}
 		m.append(line)
-		if line.Mention {
+		if line.Mention && !m.hides(line) {
 			m = m.NoteMention(line.Window)
 		}
 		return m, nil
@@ -1437,6 +1444,12 @@ func (m Model) updateKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		if name, rest, ok := slash(text, "fset", "set"); ok {
 			return m.handleFset(name, rest)
+		}
+		if _, rest, ok := slash(text, "ignore"); ok {
+			return m.handleIgnore(rest)
+		}
+		if _, rest, ok := slash(text, "unignore"); ok {
+			return m.handleUnignore(rest)
 		}
 		if _, rest, ok := slash(text, "alias"); ok {
 			return m.handleAlias(rest)
@@ -1705,8 +1718,8 @@ func (m Model) helpIntoWindow() Model {
 // table for the benefit of Tab would mean two lists to keep in step - the failure mode the /fset
 // screen already had once.
 var modelCommands = []string{
-	"/alias", "/b", "/close", "/fset", "/find", "/go", "/help", "/monitor",
-	"/monitor-off", "/next", "/next!", "/prev", "/prev!", "/search", "/settings",
+	"/alias", "/b", "/close", "/fset", "/find", "/go", "/help", "/ignore", "/monitor",
+	"/monitor-off", "/next", "/next!", "/prev", "/prev!", "/search", "/settings", "/unignore",
 }
 
 // wireCommands are passed through to the bouncer with the leading slash stripped. They are listed
@@ -2312,6 +2325,114 @@ func (m Model) muted(nick string) bool {
 	return false
 }
 
+// ignored reports whether a name is on this client's ignore list. It is the one matcher for the
+// feature: the draw path, the activity path and the commands all come through here, so an
+// ignore that hides a line cannot disagree with the one that keeps a window quiet.
+//
+// A mask is a name exactly, or a glob with '*' for any run of characters and '?' for one. hides
+// calls this with the nick and, when the transport kept one, with the full nick!user@host
+// prefix, which is what makes a host rule possible. The exact case is the common one and is
+// checked with EqualFold, which is foldNick applied to both sides without allocating on every
+// drawn line. A blank mask is skipped rather than allowed to match everything.
+func (m Model) ignored(nick string) bool {
+	if nick == "" {
+		return false
+	}
+	for _, mask := range m.settings.Ignore {
+		mask = strings.TrimSpace(mask)
+		if mask == "" {
+			continue
+		}
+		if !strings.ContainsAny(mask, "*?") {
+			if strings.EqualFold(mask, nick) {
+				return true
+			}
+			continue
+		}
+		if globMatchFold(mask, nick) {
+			return true
+		}
+	}
+	return false
+}
+
+// hides reports whether a line belongs to a nick this client has ignored and must therefore be
+// collapsed at draw time.
+//
+// Our own lines win over the list: ignoring a nick that happens to be ours would make half the
+// conversation vanish and the other half look like an answer to nothing. Line.Own is set by the
+// transport, Pending covers the optimistic echo before the bouncer confirms it, and
+// LineSelfJoin is our own join. A row with no nick - the date rule, a gap, a link preview - is
+// never hidden either, because there is nobody to blame it on.
+func (m Model) hides(l Line) bool {
+	if l.Own || l.Pending || l.Kind == LineSelfJoin {
+		return false
+	}
+	switch l.Kind {
+	case LineGap, LinePreview:
+		return false
+	}
+	if l.Nick == "" {
+		return false
+	}
+	if m.ignored(l.Nick) {
+		return true
+	}
+	// A rule about a user or host is written as a full mask, and the renderer only keeps the
+	// nick. The exact-nick check above is the fast path; this second call is the one that makes
+	// "*!*@spam.example" a rule about the host rather than a pattern that can never match.
+	return l.Mask != "" && l.Mask != l.Nick && m.ignored(l.Mask)
+}
+
+// globMatchFold reports whether name matches pattern, with '*' matching any run of characters
+// and '?' exactly one rune, case-insensitively. It walks the strings with byte offsets and never
+// builds a slice, so the cost of a mask is one pass over the nick rather than one allocation per
+// drawn line.
+//
+// The fold is strings.EqualFold, the same fold foldNick names, applied per rune without
+// building a lowercased copy of either string; the masks and nicknames IRC permits are ASCII,
+// where that is the whole rule.
+func globMatchFold(pattern, name string) bool {
+	p, n := 0, 0
+	star, starName := -1, 0
+	for n < len(name) {
+		if p < len(pattern) {
+			switch pattern[p] {
+			case '*':
+				star = p
+				p++
+				starName = n
+				continue
+			case '?':
+				_, size := utf8.DecodeRuneInString(name[n:])
+				p++
+				n += size
+				continue
+			}
+			_, psize := utf8.DecodeRuneInString(pattern[p:])
+			_, nsize := utf8.DecodeRuneInString(name[n:])
+			if strings.EqualFold(pattern[p:p+psize], name[n:n+nsize]) {
+				p += psize
+				n += nsize
+				continue
+			}
+		}
+		if star < 0 {
+			return false
+		}
+		// The star has to eat one more rune of name and the match resumes just after it.
+		// Trying every split is what makes "bot*" match "botulism" and "bot" alike.
+		_, size := utf8.DecodeRuneInString(name[starName:])
+		starName += size
+		p = star + 1
+		n = starName
+	}
+	for p < len(pattern) && pattern[p] == '*' {
+		p++
+	}
+	return p == len(pattern)
+}
+
 // highlighted reports whether text contains one of this client's highlight words.
 func (m Model) highlighted(text string) bool {
 	return matchedBy(text, m.settings.Highlights)
@@ -2375,6 +2496,55 @@ func (m Model) handleAlias(rest string) (Model, tea.Cmd) {
 	}
 	m = m.saveSettings()
 	m = m.appendSystem("alias set: " + rest)
+	return m.prefsCmd()
+}
+
+// handleIgnore lists the ignore list with no argument and adds one mask with an argument.
+//
+// Listing on a bare invocation is the discoverable half: a user who has forgotten what they
+// ignored needs to see it, and an ignore they cannot find is indistinguishable from a channel
+// that has gone quiet. Adding is idempotent through addWord, so typing the same nick twice does
+// not leave two rules that mean one thing.
+//
+// Every mutation goes through saveSettings and prefsCmd: the local file is the offline copy and
+// the bouncer blob is what makes the ignore appear on the phone and the browser tab. A mutator
+// that returned before saving would look correct in the window it was typed in and do nothing
+// anywhere else - the one failure mode this feature's tests exist to catch.
+func (m Model) handleIgnore(rest string) (Model, tea.Cmd) {
+	if rest == "" {
+		if len(m.settings.Ignore) == 0 {
+			return m.appendSystem("ignore list is empty"), nil
+		}
+		return m.appendSystem("ignore list: " + strings.Join(m.settings.Ignore, " ")), nil
+	}
+	m.settings.Ignore = addWord(m.settings.Ignore, rest)
+	m = m.saveSettings()
+	m = m.appendSystem("ignoring " + rest)
+	return m.prefsCmd()
+}
+
+// handleUnignore removes one exact mask, or clears the whole list when called bare.
+//
+// Removal is exact and case-insensitive, never a glob match: "/unignore bob*" must not quietly
+// clear every rule that starts with bob, because that is a clear typed by accident and the list
+// that vanished is not recoverable from the window. Clearing the list with no argument says how
+// many entries went, for the same reason - a command that empties a list in silence is a command
+// whose damage the user notices a week later.
+func (m Model) handleUnignore(rest string) (Model, tea.Cmd) {
+	if rest == "" {
+		removed := len(m.settings.Ignore)
+		m.settings.Ignore = nil
+		m = m.saveSettings()
+		m = m.appendSystem(fmt.Sprintf("cleared %d ignore entries", removed))
+		return m.prefsCmd()
+	}
+	next, ok := dropWord(m.settings.Ignore, rest)
+	if !ok {
+		return m.appendSystem(rest + " is not on the ignore list"), nil
+	}
+	m.settings.Ignore = next
+	m = m.saveSettings()
+	m = m.appendSystem("no longer ignoring " + rest)
 	return m.prefsCmd()
 }
 
@@ -2879,7 +3049,12 @@ func (m *Model) append(l Line) {
 	// a channel that looks idle while somebody is addressing you - "why did nobody answer"
 	// is a worse failure than "that person is noisy". Mute suppresses the signal, never
 	// the text.
-	if l.Window != m.active && l.Kind != LineGap && l.Kind != LinePreview && !m.muted(l.Nick) {
+	//
+	// An ignored nick does not count either, because its lines are collapsed rather than read:
+	// a badge for a sentence the user cannot see is a count that leads nowhere. The line is
+	// still in the buffer, so unhiding it brings the conversation back; only the drawn form and
+	// the activity are suppressed.
+	if l.Window != m.active && l.Kind != LineGap && l.Kind != LinePreview && !m.muted(l.Nick) && !m.hides(l) {
 		if m.unread == nil {
 			m.unread = make(map[string]int)
 		}
@@ -3663,9 +3838,36 @@ func (m Model) bodyLines(width, n int) []string {
 		start = 0
 	}
 	out := make([]string, 0, n)
+	// Hidden lines collapse in runs. The alternative - dropping them instead of drawing a
+	// row - makes a channel scroll past in silence, which a user reads as a broken client:
+	// they add the nick a second time and wonder why nothing changed. The alternative of one
+	// row per hidden line makes a collapsed buffer as tall as the original and defeats the
+	// point of collapsing; the timestamp is not given a row of its own for the same reason.
+	//
+	// The run is counted here, over the same slice that is about to be drawn, so a hidden
+	// line cannot be counted by one path and drawn by another.
+	hidden, hiddenNick, hiddenMixed := 0, "", false
+	flushHidden := func() {
+		if hidden == 0 {
+			return
+		}
+		out = append(out, hiddenLinesRow(hidden, hiddenNick, hiddenMixed, width)...)
+		hidden, hiddenNick, hiddenMixed = 0, "", false
+	}
 	for _, l := range lines[start:end] {
+		if m.hides(l) {
+			if hidden == 0 {
+				hiddenNick = l.Nick
+			} else if !strings.EqualFold(hiddenNick, l.Nick) {
+				hiddenMixed = true
+			}
+			hidden++
+			continue
+		}
+		flushHidden()
 		out = append(out, lineLines(l, width, m.settings)...)
 	}
+	flushHidden()
 	if len(out) > n {
 		out = out[len(out)-n:]
 	}
@@ -3673,6 +3875,25 @@ func (m Model) bodyLines(width, n int) []string {
 		out = append(out, "")
 	}
 	return out
+}
+
+// hiddenLinesRow is the single row a run of ignored lines becomes: a count, who it was, and
+// the word hidden. It carries no timestamp because a hidden line's timestamp would put a row
+// above every run, which is the height the collapse exists to save - and a count without a
+// timestamp is still honest about when the run happened relative to its neighbours.
+//
+// A mixed run (two ignored nicks in a row) omits the name rather than naming the first one and
+// lying about the rest. Mixed runs are rare; the count is the part a user needs.
+func hiddenLinesRow(count int, nick string, mixed bool, width int) []string {
+	noun := "lines"
+	if count == 1 {
+		noun = "line"
+	}
+	text := fmt.Sprintf("… %d %s hidden", count, noun)
+	if !mixed && nick != "" {
+		text = fmt.Sprintf("… %d %s from %s hidden", count, noun, nick)
+	}
+	return wrapStyled(systemStyle, text, width, "")
 }
 
 // lineLines renders one line, wrapped to width. Each kind decides its own prefix and

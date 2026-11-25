@@ -574,12 +574,28 @@ func (t *Transport) handle(raw []byte) {
 	// proved matters: the bouncer sends 376 *before* the replay, so a client that decided "the
 	// replay is over at 376" closed its duplicate check before a single replayed line arrived.
 	batch := ircline.TagText(ircline.TagValue(tags, []byte("batch")))
+	prefix, rest := ircline.Prefix(rest)
+	from := ircline.Nick(prefix)
+	verb := strings.ToUpper(string(ircline.Verb(rest)))
+	params := string(ircline.Params(rest))
 	push := func(l Line) {
 		if l.Time.IsZero() {
 			l.Time = stamp
 		}
 		if l.Network == "" {
 			l.Network = network
+		}
+		// Every line that came from one of our nicks is ours, not only a message. A presence
+		// event carries our nick too, and an ignore rule for that nick must not hide our own
+		// quit or rename: the one line that explains why the connection went quiet is the worst
+		// one to swallow. Message construction sets Own itself so this is a no-op for it.
+		if l.Nick != "" {
+			l.Own = l.Own || t.isSelf(l.Nick)
+		}
+		// Keep the whole prefix, not only the nick: an ignore rule may target a user or a
+		// host, and the display is the only place that is allowed to throw that away.
+		if l.Mask == "" && from != "" {
+			l.Mask = string(prefix)
 		}
 		if batch != "" {
 			l.Replayed = true
@@ -588,11 +604,6 @@ func (t *Transport) handle(raw []byte) {
 		t.noteNetwork(l.Window, l.Network)
 		t.push(Incoming(l))
 	}
-
-	prefix, rest := ircline.Prefix(rest)
-	from := ircline.Nick(prefix)
-	verb := strings.ToUpper(string(ircline.Verb(rest)))
-	params := string(ircline.Params(rest))
 
 	// PREF is the bouncer's opaque settings blob. It is intercepted before any
 	// routing can draw it: base64 in a status window would be a protocol line

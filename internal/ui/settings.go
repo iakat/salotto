@@ -49,6 +49,16 @@ type Settings struct {
 	// you, and "why did nobody answer" is a worse failure than "that person is noisy".
 	// Mute suppresses the signal, not the text.
 	Mutes []string `json:"mutes"`
+	// Ignore are nicks whose lines are not drawn. They are a separate list from Mutes on
+	// purpose: mute answers "do not interrupt me" and ignore answers "do not show me", and a
+	// single list would force every user who wants a bot silent to also lose its answers. A
+	// nick may be on either list, both, or neither.
+	//
+	// The entries are nicks or masks with `*` and `?`, so "*!*@spam.example" and "bot*" work.
+	// They travel in the same opaque settings blob as everything else, which is why ignore
+	// ships without the bouncer learning the word: the daemon only stores and fans out a
+	// document it does not interpret.
+	Ignore []string `json:"ignore"`
 	// Highlights are extra words that light a window up as if they were our nick. The
 	// use is a project name, a nickname you answer to, a word you are waiting for - not
 	// a second mention system, which is why it shares the mention colour rather than
@@ -144,6 +154,7 @@ func (s Settings) rows() []settingRow {
 		{"scroll_step", "scroll step", strconv.Itoa(s.ScrollStep), "int"},
 		{"highlight", "highlights", listOrNone(s.Highlights), "text"},
 		{"mute", "mutes", listOrNone(s.Mutes), "text"},
+		{"ignore", "ignores", listOrNone(s.Ignore), "text"},
 	}
 }
 
@@ -216,6 +227,8 @@ func canonical(key string) string {
 		return "highlight"
 	case "mutes":
 		return "mute"
+	case "ignores":
+		return "ignore"
 	case "groups", "group", "servers", "group_by_server", "groupby":
 		return "group_by_server"
 	case "numbers", "buffer_number", "buffers", "buffer_no":
@@ -300,6 +313,22 @@ func (s *Settings) set(key, value string) error {
 			return nil
 		}
 		s.Mutes = addWord(s.Mutes, value)
+		return nil
+	case "ignore", "ignores":
+		switch strings.ToLower(value) {
+		case "", "none", "clear":
+			s.Ignore = nil
+			return nil
+		}
+		if word, remove := strings.CutPrefix(value, "-"); remove {
+			next, ok := dropWord(s.Ignore, word)
+			if !ok {
+				return fmt.Errorf("%s is not in the ignore list", word)
+			}
+			s.Ignore = next
+			return nil
+		}
+		s.Ignore = addWord(s.Ignore, value)
 		return nil
 	default:
 		return fmt.Errorf("no setting called %s", key)
@@ -560,6 +589,19 @@ var nickPalette = []string{
 	"186", "117", "175", "121", "215", "156", "210", "153",
 }
 
+// foldNick is the client's nickname case folding. IRC compares nicknames case-insensitively,
+// so anything that decides "is this the same person" folds the same way; a second fold would
+// make "/ignore Bob" hide Bob's lines but leave bob's on screen, which reads as an ignore that
+// works intermittently.
+//
+// The matcher's exact path uses strings.EqualFold rather than comparing two calls to this
+// function: EqualFold is the same fold without two allocations, and the matcher runs once per
+// drawn line. The glob path folds runes with the same rule (ASCII nicknames and masks are the
+// only ones IRC permits).
+func foldNick(nick string) string {
+	return strings.ToLower(nick)
+}
+
 // nickColor is the colour for a nickname: a stable hash into the palette. Stability is the
 // whole point - a colour that changed per render would be noise, and one that changed per
 // reconnect would make people unable to recognise each other.
@@ -567,7 +609,7 @@ func nickColor(nick string) lipgloss.Style {
 	// Case-folded: on IRC "Alice" and "alice" are the same person, and giving them two
 	// colours is a bug a user sees every day.
 	h := fnv.New32a()
-	_, _ = h.Write([]byte(strings.ToLower(nick)))
+	_, _ = h.Write([]byte(foldNick(nick)))
 	return lipgloss.NewStyle().Foreground(lipgloss.Color(nickPalette[h.Sum32()%uint32(len(nickPalette))]))
 }
 

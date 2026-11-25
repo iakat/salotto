@@ -192,6 +192,7 @@ func TestAliasSpellingsReadBackToo(t *testing.T) {
 		{"scroll", "scroll_step"},
 		{"highlights", "highlight"},
 		{"mutes", "mute"},
+		{"ignores", "ignore"},
 	} {
 		alias, row := pair[0], pair[1]
 		other := DefaultSettings()

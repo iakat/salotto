@@ -189,6 +189,10 @@ whose derived lines are gone.
 | `/monitor` | open the cross-buffer tail, highlights only |
 | `/monitor <regex>` | open it with a filter on the line's text or nick |
 | `/monitor-off` | close it and return to the window it was opened from |
+| `/ignore` | list the nicks and masks whose lines are collapsed |
+| `/ignore <mask>` | add an exact nick or a `*` / `?` mask to the ignore list |
+| `/unignore <mask>` | remove that exact mask from the ignore list |
+| `/unignore` | clear the ignore list and report how many entries went |
 
 `View()` does not mutate the model. The monitor is assembled from values the
 model already holds and the rank is computed from counters; a renderer that
@@ -422,6 +426,34 @@ Adding was the only operation the screen had, so a list could only grow: the sin
 (`-alice`), answers when the word was not there, and `none` still clears everything - two
 different statements, deliberately still spelled differently. Both go through `Settings.set`, so
 the screen and `/fset` cannot drift into accepting different spellings of the same thing.
+
+## Ignoring a nick hides its lines, not its existence
+
+`/ignore` is the list beside mute, and deliberately not the same list. Mute answers "do not
+interrupt me": the line is drawn and the window does not light up. Ignore answers "do not show
+me": the line stays in the buffer, the window stays quiet, and the conversation draws one
+collapsed row where the run was - `… 12 lines from bob hidden`.
+
+Dropping the line silently was the obvious alternative and the wrong one. A channel that scrolls
+past with nothing in it reads as a broken client rather than a filtered one; the user adds the
+nick a second time and wonders why nothing changed. The count is how they notice they are missing
+an answer, and consecutive hidden lines share one row (with no timestamp of their own) so a
+collapsed buffer is shorter than the original rather than exactly as tall. Our own lines are
+never hidden, even when our nick is on the list, and neither is a row that has no nick - a date
+rule, a gap, a link preview.
+
+`/ignore` with no argument prints the list, `/ignore <mask>` adds and confirms. `/unignore <mask>`
+removes that exact mask, never a pattern match: `/unignore bob*` must not quietly clear every rule
+that starts with bob. A bare `/unignore` clears the whole list and says how many entries went,
+because a command that empties a list in silence is one that gets typed by accident and cannot be
+undone. Masks match a nick exactly or as a glob with `*` and `?`, case-insensitively through the
+client's one nickname fold, so `*!*@spam.example` and `bot*` both work.
+
+Both commands resolve in the model, like `/next` and `/monitor`: the bouncer has no opinion about
+what this client draws. The list itself is part of the settings document, which the bouncer stores
+and fans out without parsing, so an ignore set in the terminal reaches the browser tab and the
+phone through the same `saveSettings()` / `PREF SET` path as every other setting. No wire verb, no
+`internal/facade` change.
 
 ## A command is not a message, but a message can be spelled as a command
 

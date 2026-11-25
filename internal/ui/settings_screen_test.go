@@ -33,15 +33,17 @@ func settingsRowFor(t *testing.T, m Model, key string) Model {
 // rather than doing nothing visible. (It used to point at "/fset" - the editor replaced that,
 // and the pointer would now be a worse answer than the one the screen can give itself.)
 func TestSpaceOnATextRowDoesNotWipeIt(t *testing.T) {
-	for _, key := range []string{"highlight", "mute"} {
+	for _, key := range []string{"highlight", "mute", "ignore"} {
 		t.Run(key, func(t *testing.T) {
 			m := New("#test")
 			m.settings.Highlights = []string{"salotto", "hermes"}
 			m.settings.Mutes = []string{"noisy"}
+			m.settings.Ignore = []string{"spam"}
 			m.showSettings = true
 			m = settingsRowFor(t, m, key)
 			before := m.settings.Highlights
 			beforeMutes := m.settings.Mutes
+			beforeIgnore := m.settings.Ignore
 
 			for _, k := range []tea.KeyMsg{
 				{Type: tea.KeySpace},
@@ -50,9 +52,10 @@ func TestSpaceOnATextRowDoesNotWipeIt(t *testing.T) {
 				m, _ = m.Step(k)
 			}
 
-			if len(m.settings.Highlights) != len(before) || len(m.settings.Mutes) != len(beforeMutes) {
-				t.Fatalf("a keystroke on %q cleared a list: highlights %v -> %v, mutes %v -> %v",
-					key, before, m.settings.Highlights, beforeMutes, m.settings.Mutes)
+			if len(m.settings.Highlights) != len(before) || len(m.settings.Mutes) != len(beforeMutes) ||
+				len(m.settings.Ignore) != len(beforeIgnore) {
+				t.Fatalf("a keystroke on %q cleared a list: highlights %v -> %v, mutes %v -> %v, ignore %v -> %v",
+					key, before, m.settings.Highlights, beforeMutes, m.settings.Mutes, beforeIgnore, m.settings.Ignore)
 			}
 			// An empty edit says the list is unchanged, which is the honest answer now that the
 			// screen can edit in place.
